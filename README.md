@@ -641,6 +641,166 @@ mlx-fun serve --model ... --domain-map domain_report.json --domain-steering-mode
 mlx-fun steer --model ... --safety-map safety_report.json --mode safe --prompt "..."
 ```
 
+### Statistics Operations: Diff, Merge, Purge
+
+Work with multiple collected saliency files to compare, combine, and filter statistics.
+
+#### Compare Two Saliency Files
+
+Compute differences between two collected saliency files to understand how expert routing varies across datasets:
+
+```bash
+mlx-fun stats-diff \
+    --file1 data/reap_saliency_agent_minimax_m25.npz \
+    --file2 data/reap_saliency_solidity_functions_minimax_m25.npz \
+    --metric freq \
+    --output diff_report.json
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--file1` | *(required)* | Path to first saliency `.npz` file |
+| `--file2` | *(required)* | Path to second saliency `.npz` file |
+| `--metric` | `reap` | Saliency metric: `reap`, `ean`, `freq`, `weighted_freq` |
+| `--output` | *(none)* | Optional path to save diff report as JSON |
+
+The output shows:
+- **Difference statistics**: mean, std, min, max of differences
+- **Distribution**: count of positive (file1 > file2), negative (file2 > file1), and zero differences
+- **Top differences**: 10 experts with largest positive and negative differences
+
+Save the report with `--output` for programmatic analysis or export.
+
+**Use cases:**
+- Compare routing patterns between different domains (e.g., code vs general text)
+- Identify domain-specific experts (large positive/negative differences)
+- Validate that merging preserved the expected statistics
+- Debug routing behavior across different calibration datasets
+
+#### Merge Multiple Saliency Files
+
+Combine statistics from multiple datasets into a single accumulator with different merge strategies:
+
+```bash
+# Normalized merge (default) - equal weight per dataset
+mlx-fun stats-merge \
+    --files data/reap_saliency_agent_minimax_m25.npz \
+    --files data/reap_saliency_solidity_functions_minimax_m25.npz \
+    --output data/merged_saliency.npz \
+    --mode normalized
+
+# Sum merge - raw sum, larger datasets dominate
+mlx-fun stats-merge \
+    --files data/run1.npz --files data/run2.npz --files data/run3.npz \
+    --output data/merged_raw.npz \
+    --mode sum
+
+# Max merge - keep peak activations across all files
+mlx-fun stats-merge \
+    --files data/morning_stats.npz --files data/evening_stats.npz \
+    --output data/merged_peak.npz \
+    --mode max
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--files` | *(required)* | Paths to saliency `.npz` files to merge (repeat for each file) |
+| `--output` | *(required)* | Output path for merged `.npz` file |
+| `--mode` | `normalized` | Merge strategy: `sum`, `normalized`, or `max` |
+
+**Merge Modes:**
+
+| Mode | Description | Best For |
+|------|-------------|----------|
+| **sum** | Raw sum of all arrays. Equivalent to collecting from all datasets together. Larger datasets dominate the result. | Aggregating multiple runs from the same data source, when you want the full combined statistics |
+| **normalized** (default) | Normalize each file by its total samples before merging. Each dataset contributes equally regardless of sample count. | Combining datasets of different sizes (e.g., 10K samples + 1K samples) where you want balanced representation |
+| **max** | Keep the maximum activation per expert across all files. Shows peak expert behavior. | Identifying the strongest expert activations across different conditions, finding peak usage patterns |
+
+**Example Comparison:**
+
+```bash
+# Dataset A has 10,000 samples, Dataset B has 1,000 samples
+
+# sum mode: Result is 11x more influenced by Dataset A
+mlx-fun stats-merge --files A.npz --files B.npz --output sum.npz --mode sum
+# Total samples: ~253M (biased toward larger dataset)
+
+# normalized mode: Each dataset contributes 50%
+mlx-fun stats-merge --files A.npz --files B.npz --output norm.npz --mode normalized
+# Total samples: 1 (equal weight per dataset)
+
+# max mode: Shows the highest activation per expert across both
+mlx-fun stats-merge --files A.npz --files B.npz --output peak.npz --mode max
+# Total samples: ~167M (peak activations only)
+```
+
+**Use cases:**
+- **sum**: Combine multiple calibration runs from the same data source, aggregate online collection sessions over time
+- **normalized**: Merge statistics from datasets of different sizes (code + natural language) for balanced representation, when you want each domain to contribute equally regardless of sample count
+- **max**: Identify peak expert activations across different conditions, find experts that are consistently strong across multiple datasets
+
+**Validation:**
+- All files must have identical dimensions (same num_layers and num_experts)
+- Only files from the same model architecture can be merged
+- The merge operation is commutative and associative for all modes
+
+#### Purge Low-Activation Data
+
+Filter out experts with minimal activation to focus pruning on meaningful patterns:
+
+```bash
+mlx-fun stats-purge \
+    --input data/merged_saliency.npz \
+    --output data/purged_saliency.npz \
+    --min-freq 100 \
+    --min-count 10
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--input` | *(required)* | Path to input saliency `.npz` file |
+| `--output` | *(required)* | Output path for purged `.npz` file |
+| `--min-freq` | *(none)* | Minimum activation frequency to keep (experts with lower freq are zeroed out) |
+| `--min-count` | *(none)* | Minimum reap_count to keep (experts with fewer samples are zeroed out) |
+| `--max-norm` | *(none)* | Maximum activation norm (warning: only reports, doesn't cap) |
+
+The purging operation zeros out data for experts that don't meet the specified thresholds. This can help:
+- Remove noise from barely-activated experts
+- Focus pruning decisions on experts with meaningful activation patterns
+- Reduce the influence of statistical outliers
+- Create cleaner statistics for downstream analysis
+
+**Output:**
+- Reports total expert-layer pairs, number purged, and number kept
+- Shows breakdown by filter type (freq, count, norm)
+- The purged file maintains the same dimensions (zeroed entries instead of removed)
+
+**Note:** At least one filter option (`--min-freq`, `--min-count`, or `--max-norm`) must be specified.
+
+#### Web Dashboard: Diff Analysis Tab
+
+The Gradio web UI includes a **Diff Analysis** tab for visual comparison of two saliency files:
+
+```bash
+# Terminal 1: Start the REAP server (optional - tab works independently)
+mlx-fun serve --model mlx-community/MiniMax-M1-40k-4bit --port 8080
+
+# Terminal 2: Launch the dashboard
+mlx-fun ui --server-url http://127.0.0.1:8080
+```
+
+The Diff Analysis tab provides:
+- **File inputs**: Paths to two `.npz` files (with placeholder examples)
+- **Metric selector**: Choose Frequency, Weighted Frequency, REAP, or EAN
+- **Difference heatmap**: Visual representation using diverging colormap
+  - **Red** = positive differences (file1 has higher activation)
+  - **Blue** = negative differences (file2 has higher activation)
+  - **White** = no difference
+- **Statistics summary**: Mean, std, range, and distribution of differences
+- **JSON export**: Full difference report for programmatic use
+
+This is useful for quick visual comparisons without needing to run CLI commands.
+
 ### Web Dashboard
 
 Launch a Gradio-based web UI to monitor and control a running REAP server:

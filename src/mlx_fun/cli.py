@@ -780,6 +780,166 @@ def amplify(model, domain_map, output, scale, threshold):
     click.echo("Done!")
 
 
+@main.command("stats-diff")
+@click.option("--file1", required=True, help="Path to first saliency .npz file.")
+@click.option("--file2", required=True, help="Path to second saliency .npz file.")
+@click.option("--metric", default="reap", type=click.Choice(["reap", "ean", "freq", "weighted_freq"]),
+              help="Saliency metric to compare.")
+@click.option("--output", default=None, help="Optional path to save diff report as JSON.")
+def stats_diff(file1, file2, metric, output):
+    """Compare two collected saliency files and show differences.
+
+    Computes the difference between two SaliencyAccumulator files, showing
+    which experts have higher or lower saliency in each file.
+    """
+    from .saliency import SaliencyAccumulator
+    from .stats_ops import compute_diff_stats, save_diff_report
+
+    click.echo(f"Loading file1: {file1}")
+    acc1 = SaliencyAccumulator.load(file1)
+    click.echo(f"  Layers: {acc1.num_layers}, Experts: {acc1.num_experts}")
+
+    click.echo(f"Loading file2: {file2}")
+    acc2 = SaliencyAccumulator.load(file2)
+    click.echo(f"  Layers: {acc2.num_layers}, Experts: {acc2.num_experts}")
+
+    if acc1.num_layers != acc2.num_layers or acc1.num_experts != acc2.num_experts:
+        click.echo("Error: Files have incompatible dimensions", err=True)
+        return
+
+    click.echo(f"\nComputing differences (metric={metric})...")
+    report = compute_diff_stats(acc1, acc2, metric)
+
+    # Display summary
+    click.echo("\n" + "="*60)
+    click.echo("DIFFERENCES SUMMARY")
+    click.echo("="*60)
+    click.echo(f"Metric: {report['metric']}")
+    click.echo(f"Dimensions: {report['num_layers']} layers × {report['num_experts']} experts")
+    click.echo(f"\nDifference statistics:")
+    click.echo(f"  Mean:   {report['diff_mean']:.4f}")
+    click.echo(f"  Std:    {report['diff_std']:.4f}")
+    click.echo(f"  Min:    {report['diff_min']:.4f}")
+    click.echo(f"  Max:    {report['diff_max']:.4f}")
+    click.echo(f"  AbsMax: {report['diff_abs_max']:.4f}")
+    click.echo(f"\nDistribution:")
+    click.echo(f"  Positive (file1 > file2): {report['positive_count']} experts")
+    click.echo(f"  Negative (file2 > file1): {report['negative_count']} experts")
+    click.echo(f"  Zero (equal):              {report['zero_count']} experts")
+
+    # Show top differences
+    click.echo(f"\nTop 10 experts where file1 > file2:")
+    for i, entry in enumerate(report['top_positive'], 1):
+        click.echo(f"  {i}. Layer {entry['layer_idx']}, Expert {entry['expert_idx']}: {entry['diff_value']:.4f}")
+
+    click.echo(f"\nTop 10 experts where file2 > file1:")
+    for i, entry in enumerate(report['top_negative'], 1):
+        click.echo(f"  {i}. Layer {entry['layer_idx']}, Expert {entry['expert_idx']}: {entry['diff_value']:.4f}")
+
+    # Save report if requested
+    if output:
+        save_diff_report(report, output)
+        click.echo(f"\nDiff report saved to: {output}")
+
+
+@main.command("stats-merge")
+@click.option("--files", required=True, multiple=True, help="Paths to saliency .npz files to merge.")
+@click.option("--output", required=True, help="Output path for merged .npz file.")
+@click.option("--mode", default="normalized", type=click.Choice(["sum", "normalized", "max"]),
+              help="Merge mode: 'sum' (raw sum, larger datasets dominate), 'normalized' (equal weight per dataset), 'max' (peak activations).")
+def stats_merge(files, output, mode):
+    """Merge multiple collected saliency files into one.
+
+    Combines statistics from multiple datasets into a single accumulator.
+    
+    Modes:
+    - sum: Raw sum of all arrays. Equivalent to collecting from all datasets together.
+          Larger datasets dominate the result.
+    - normalized (default): Normalize each file by its total samples before merging.
+          Each dataset contributes equally regardless of sample count.
+    - max: Keep the maximum activation per expert across all files.
+          Shows peak activation patterns across datasets.
+    """
+    from .saliency import SaliencyAccumulator
+    from .stats_ops import merge_saliency
+
+    if len(files) < 2:
+        click.echo("Error: At least 2 files are required for merging", err=True)
+        return
+
+    click.echo(f"Merging {len(files)} files with mode '{mode}'...")
+    for i, f in enumerate(files, 1):
+        click.echo(f"  {i}. {f}")
+
+    try:
+        merged = merge_saliency(list(files), mode=mode)
+    except ValueError as e:
+        click.echo(f"Error: {e}", err=True)
+        return
+
+    click.echo(f"\nMerged accumulator:")
+    click.echo(f"  Layers: {merged.num_layers}")
+    click.echo(f"  Experts: {merged.num_experts}")
+    click.echo(f"  Total samples (freq sum): {merged.freq.sum():.0f}")
+
+    merged.save(output)
+    click.echo(f"\nMerged stats saved to: {output}")
+
+
+@main.command("stats-purge")
+@click.option("--input", required=True, help="Path to input saliency .npz file.")
+@click.option("--output", required=True, help="Output path for purged .npz file.")
+@click.option("--min-freq", default=None, type=int,
+              help="Minimum activation frequency to keep (default: no filter).")
+@click.option("--min-count", default=None, type=int,
+              help="Minimum reap_count to keep (default: no filter).")
+@click.option("--max-norm", default=None, type=float,
+              help="Maximum activation norm (warning: only reports, doesn't cap).")
+def stats_purge(input, output, min_freq, min_count, max_norm):
+    """Purge/filter low-activation or outlying data from a saliency file.
+
+    Removes data for experts that don't meet minimum activation criteria.
+    This can help focus pruning on experts with meaningful activation patterns.
+    """
+    from .saliency import SaliencyAccumulator
+    from .stats_ops import purge_saliency
+
+    if min_freq is None and min_count is None and max_norm is None:
+        click.echo("Error: At least one filter option must be specified", err=True)
+        return
+
+    click.echo(f"Loading input: {input}")
+    acc = SaliencyAccumulator.load(input)
+    click.echo(f"  Layers: {acc.num_layers}, Experts: {acc.num_experts}")
+
+    click.echo(f"\nApplying filters:")
+    if min_freq is not None:
+        click.echo(f"  min_freq: {min_freq}")
+    if min_count is not None:
+        click.echo(f"  min_count: {min_count}")
+    if max_norm is not None:
+        click.echo(f"  max_norm: {max_norm}")
+
+    purged, stats = purge_saliency(
+        acc,
+        min_freq=min_freq,
+        min_count=min_count,
+        max_norm=max_norm,
+        keep_metadata=True,
+    )
+
+    click.echo(f"\nPurge statistics:")
+    click.echo(f"  Total expert-layer pairs: {stats['total_experts']}")
+    click.echo(f"  Purged by freq < {min_freq}: {stats['purged_by_freq']}")
+    click.echo(f"  Purged by count < {min_count}: {stats['purged_by_count']}")
+    click.echo(f"  Capped by norm > {max_norm}: {stats['capped_by_norm']}")
+    click.echo(f"  Total purged: {stats['total_purged']}")
+    click.echo(f"  Kept: {stats['kept_count']}")
+
+    purged.save(output)
+    click.echo(f"\nPurged stats saved to: {output}")
+
+
 @main.command()
 @click.option("--server-url", default="http://127.0.0.1:8080",
               help="URL of the running REAP server.")

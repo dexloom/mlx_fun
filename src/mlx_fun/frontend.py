@@ -152,7 +152,7 @@ def make_freq_heatmap(
     Returns:
         matplotlib Figure.
     """
-    fig, ax = plt.subplots(figsize=(14, max(6, freq.shape[0] * 0.25)))
+    fig, ax = plt.subplots(figsize=(10, max(4, freq.shape[0] * 0.2)))
 
     # Use log scale if range is large
     vmax = freq.max()
@@ -186,7 +186,7 @@ def make_weighted_freq_heatmap(
     title: str = "Router-Weighted Frequency",
 ) -> plt.Figure:
     """Create a heatmap of router-weighted frequencies."""
-    fig, ax = plt.subplots(figsize=(14, max(6, weighted_freq.shape[0] * 0.25)))
+    fig, ax = plt.subplots(figsize=(10, max(4, weighted_freq.shape[0] * 0.2)))
 
     im = ax.imshow(
         weighted_freq,
@@ -207,16 +207,79 @@ def make_per_layer_bar(
     freq: np.ndarray,
     layer_idx: int,
 ) -> plt.Figure:
-    """Create a bar chart for one layer's expert frequencies."""
+    """Create a horizontal bar chart for one layer's expert frequencies."""
     n_experts = freq.shape[1]
-    fig, ax = plt.subplots(figsize=(max(8, n_experts * 0.15), 4))
+    fig, ax = plt.subplots(figsize=(5, max(5, n_experts * 0.1)))
 
     values = freq[layer_idx]
     colors = plt.cm.YlOrRd(values / max(values.max(), 1))
-    ax.bar(range(n_experts), values, color=colors)
-    ax.set_xlabel("Expert Index")
-    ax.set_ylabel("Activation Count")
-    ax.set_title(f"Layer {layer_idx} Expert Activations")
+    ax.barh(range(n_experts), values, color=colors, height=0.6)
+    ax.set_xlabel("Activation Count", fontsize=8)
+    ax.set_ylabel("Expert Index", fontsize=8)
+    ax.set_title(f"Layer {layer_idx} Expert Activations", fontsize=9)
+    
+    # Show every 10th tick label on Y-axis
+    ax.set_yticks(range(n_experts))
+    ax.set_yticklabels([str(i) if i % 10 == 0 else '' for i in range(n_experts)], fontsize=7)
+    ax.tick_params(axis='x', labelsize=7)
+    
+    fig.tight_layout()
+    return fig
+
+
+def make_diff_heatmap(
+    freq1: np.ndarray,
+    freq2: np.ndarray,
+    title: str = "Expert Activation Difference",
+) -> plt.Figure:
+    """Create a heatmap showing the difference between two frequency arrays.
+
+    Uses a diverging colormap (RdBu_r) where:
+    - Red = positive differences (file1 > file2)
+    - Blue = negative differences (file2 > file1)
+    - White = no difference
+
+    Args:
+        freq1: (num_layers, num_experts) array from first file.
+        freq2: (num_layers, num_experts) array from second file.
+        title: Plot title.
+
+    Returns:
+        matplotlib Figure.
+    """
+    diff = freq1 - freq2
+    fig, ax = plt.subplots(figsize=(10, max(4, diff.shape[0] * 0.2)))
+
+    # Use diverging colormap centered at 0
+    max_abs = np.abs(diff).max()
+    if max_abs > 0:
+        im = ax.imshow(
+            diff,
+            aspect="auto",
+            cmap="RdBu_r",  # Red-blue reversed: red=positive, blue=negative
+            vmin=-max_abs,
+            vmax=max_abs,
+            interpolation="nearest",
+        )
+    else:
+        # All zeros - use a neutral color
+        im = ax.imshow(
+            diff,
+            aspect="auto",
+            cmap="gray",
+            interpolation="nearest",
+        )
+
+    ax.set_xlabel("Expert Index", fontsize=10)
+    ax.set_ylabel("MoE Layer Index", fontsize=10)
+    ax.set_title(title, fontsize=11)
+    
+    # Add colorbar with label
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label(f"Difference ({title.split('(')[1].split(')')[0] if '(' in title else 'file1 - file2'})",
+                   fontsize=9)
+    cbar.ax.tick_params(labelsize=8)
+    
     fig.tight_layout()
     return fig
 
@@ -331,15 +394,15 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
             with gr.Row():
                 info_md = gr.Markdown("Click **Refresh Stats** to load data.")
             with gr.Row():
-                heatmap_plot = gr.Plot(label="Expert Activation Heatmap")
-            with gr.Row():
-                layer_select = gr.Slider(
-                    minimum=0, maximum=0, step=1, value=0,
-                    label="Layer Index (for bar chart)",
-                    interactive=True,
-                )
-            with gr.Row():
-                bar_plot = gr.Plot(label="Per-Layer Expert Activations")
+                with gr.Column(scale=1):
+                    heatmap_plot = gr.Plot(label="Expert Activation Heatmap")
+                with gr.Column(scale=1):
+                    layer_select = gr.Slider(
+                        minimum=0, maximum=0, step=1, value=0,
+                        label="Layer Index (for bar chart)",
+                        interactive=True,
+                    )
+                    bar_plot = gr.Plot(label="Per-Layer Expert Activations")
 
             # Store stats in a state variable
             stats_state = gr.State(None)
@@ -524,6 +587,133 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                     return {"error": str(e)}
 
             remove_steer_btn.click(remove_steering, outputs=[steer_result])
+
+        # -------------------------------------------------------------------
+        # Diff Analysis tab
+        # -------------------------------------------------------------------
+        with gr.Tab("Diff Analysis"):
+            gr.Markdown("### Compare Two Saliency Files")
+            gr.Markdown(
+                "Visualize differences between two collected saliency files. "
+                "Red areas indicate file1 has higher activation, blue indicates file2 has higher activation."
+            )
+
+            with gr.Row():
+                file1_input = gr.Textbox(
+                    label="File 1 Path (.npz)",
+                    placeholder="data/reap_saliency_agent_minimax_m25.npz",
+                    scale=1,
+                )
+                file2_input = gr.Textbox(
+                    label="File 2 Path (.npz)",
+                    placeholder="data/reap_saliency_solidity_functions_minimax_m25.npz",
+                    scale=1,
+                )
+
+            with gr.Row():
+                metric_choice_diff = gr.Radio(
+                    ["Frequency", "Weighted Frequency", "REAP", "EAN"],
+                    value="Frequency",
+                    label="Metric to Compare",
+                )
+                compare_btn = gr.Button("Compare Files", variant="primary")
+
+            with gr.Row():
+                diff_info_md = gr.Markdown("Select files and click **Compare Files** to see differences.")
+
+            with gr.Row():
+                diff_heatmap_plot = gr.Plot(label="Difference Heatmap")
+
+            with gr.Row():
+                diff_stats_json = gr.JSON(label="Difference Statistics")
+
+            def compare_files(file1, file2, metric):
+                """Load two .npz files and compute differences."""
+                from .saliency import SaliencyAccumulator
+                from .stats_ops import compute_diff_stats
+
+                # Normalize metric names
+                metric_map = {
+                    "Frequency": "freq",
+                    "Weighted Frequency": "weighted_freq",
+                    "REAP": "reap",
+                    "EAN": "ean",
+                }
+                metric_key = metric_map.get(metric, "freq")
+
+                # Load files
+                try:
+                    acc1 = SaliencyAccumulator.load(file1)
+                    acc2 = SaliencyAccumulator.load(file2)
+                except Exception as e:
+                    return (
+                        f"**Error loading files:** {e}",
+                        None,
+                        {"error": str(e)},
+                    )
+
+                # Check compatibility
+                if acc1.num_layers != acc2.num_layers or acc1.num_experts != acc2.num_experts:
+                    return (
+                        f"**Error:** Files have incompatible dimensions. "
+                        f"File1: ({acc1.num_layers}, {acc1.num_experts}), "
+                        f"File2: ({acc2.num_layers}, {acc2.num_experts})",
+                        None,
+                        {"error": "Incompatible dimensions"},
+                    )
+
+                # Compute differences
+                try:
+                    report = compute_diff_stats(acc1, acc2, metric_key)
+                except Exception as e:
+                    return (
+                        f"**Error computing differences:** {e}",
+                        None,
+                        {"error": str(e)},
+                    )
+
+                # Get arrays for visualization
+                if metric_key == "freq":
+                    arr1 = acc1.freq
+                    arr2 = acc2.freq
+                elif metric_key == "weighted_freq":
+                    arr1 = acc1.weighted_freq_sum
+                    arr2 = acc2.weighted_freq_sum
+                elif metric_key == "reap":
+                    arr1 = acc1.compute_scores("reap")
+                    arr2 = acc2.compute_scores("reap")
+                else:  # ean
+                    arr1 = acc1.compute_scores("ean")
+                    arr2 = acc2.compute_scores("ean")
+
+                # Create heatmap
+                heatmap = make_diff_heatmap(
+                    arr1,
+                    arr2,
+                    title=f"Expert Activation Difference ({metric})",
+                )
+
+                # Format info text
+                info = (
+                    f"**Metric:** {metric} | "
+                    f"**Dimensions:** {report['num_layers']} layers × {report['num_experts']} experts\n\n"
+                    f"**Difference Statistics:**\n"
+                    f"- Mean: {report['diff_mean']:.4f}\n"
+                    f"- Std: {report['diff_std']:.4f}\n"
+                    f"- Range: [{report['diff_min']:.4f}, {report['diff_max']:.4f}]\n\n"
+                    f"**Distribution:**\n"
+                    f"- Positive (file1 > file2): {report['positive_count']} experts\n"
+                    f"- Negative (file2 > file1): {report['negative_count']} experts\n"
+                    f"- Zero: {report['zero_count']} experts"
+                )
+
+                return info, heatmap, report
+
+            compare_btn.click(
+                compare_files,
+                inputs=[file1_input, file2_input, metric_choice_diff],
+                outputs=[diff_info_md, diff_heatmap_plot, diff_stats_json],
+            )
 
         # -------------------------------------------------------------------
         # Controls tab

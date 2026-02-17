@@ -1,0 +1,81 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Run Minimax Server",
+            "type": "shell",
+            "command": "uv",
+            "args": [
+                "run",
+                "mlx-fun",
+                "serve",
+                "--model",
+                "/Users/sombrax/.lmstudio/models/sombra/MiniMax-2.5-MXFP8",
+                "--host",
+                "192.168.1.184",
+                "--port",
+                "1111",
+                "--mode",
+                "lightweight",
+                "--max-tokens",
+                "512",
+                "--chat-template",
+                "$(cat /Users/sombrax/VibeCoding/mlx_server/templates/minimax_25.jinja)"
+            ],
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "new",
+                "focus": true,
+                "close": false,
+                "group": "minimax-server"
+            },
+            "isBackground": true,
+            "problemMatcher": {
+                "pattern": {
+                    "regexp": "^.*"
+                },
+                "background": {
+                    "activeOnStart": true,
+                    "beginsPattern": "^.*",
+                    "endsPattern": "^.*"
+                }
+            }
+        },
+        {
+            "label": "Start Frontend",
+            "type": "shell",
+            "command": "uv",
+            "args": [
+                "run",
+                "mlx-fun",
+                "ui",
+                "--server-url",
+                "http://192.168.1.184:1111",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "7860"
+            ],
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "new",
+                "focus": true,
+                "close": false,
+                "group": "minimax-frontend"
+            },
+            "isBackground": true,
+            "problemMatcher": {
+                "pattern": {
+                    "regexp": "^.*"
+                },
+                "background": {
+                    "activeOnStart": true,
+                    "beginsPattern": "^.*",
+                    "endsPattern": "^.*"
+                }
+            }
+        }
+    ]
+}

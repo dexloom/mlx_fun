@@ -563,7 +563,7 @@ class ReapModelProvider:
         self.is_distributed = group.size() > 1
 
         # Check batchability
-        from mlx_lm.utils import make_prompt_cache
+        from mlx_lm.server import make_prompt_cache
         self.is_batchable = all(
             hasattr(c, "merge") for c in make_prompt_cache(self.model)
         )

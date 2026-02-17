@@ -237,7 +237,6 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
 
     with gr.Blocks(
         title="MLX-FUN Dashboard",
-        theme=gr.themes.Soft(),
     ) as app:
 
         gr.Markdown("# MLX-FUN Dashboard")
@@ -250,7 +249,6 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
             chatbot = gr.Chatbot(
                 label="Chat",
                 height=500,
-                type="messages",
             )
             with gr.Row():
                 msg_input = gr.Textbox(
@@ -612,4 +610,5 @@ def launch_frontend(
         server_name=host,
         server_port=port,
         share=share,
+        theme=gr.themes.Soft(),
     )

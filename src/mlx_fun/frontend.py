@@ -43,35 +43,31 @@ import requests
 # ---------------------------------------------------------------------------
 
 def get_local_storage_script() -> str:
-    """Return JavaScript for localStorage persistence of file inputs and filters."""
+    """Return JavaScript for localStorage persistence of file names and filters.
+    
+    This script:
+    1. Saves original file names when files are selected via gr.File()
+    2. Displays previously selected file names as hints on page reload
+    3. Persists filter values (min/max rank, n to prune)
+    """
     return """
     <script>
     (function() {
-        const STORAGE_KEYS = {
-            files: [
-                'mlx_merge_file1', 'mlx_merge_file2', 'mlx_merge_file3', 'mlx_merge_file4',
-                'mlx_diff_file1', 'mlx_diff_file2'
-            ],
-            filters: [
-                'mlx_filter_min_rank', 'mlx_filter_max_rank', 'mlx_filter_top_n'
-            ]
+        // Storage keys for file names and filters
+        const FILE_STORAGE_KEYS = {
+            'merge_file1': 'mlx_fun_merge_file1',
+            'merge_file2': 'mlx_fun_merge_file2',
+            'merge_file3': 'mlx_fun_merge_file3',
+            'merge_file4': 'mlx_fun_merge_file4',
+            'diff_file1': 'mlx_fun_diff_file1',
+            'diff_file2': 'mlx_fun_diff_file2'
         };
         
-        function getElementByElemId(elemId) {
-            // Try direct ID first
-            let container = document.getElementById(elemId);
-            if (container) {
-                const input = container.querySelector('input[type="text"], textarea');
-                if (input) return input;
-            }
-            // Try data-testid
-            let testContainer = document.querySelector(`[data-testid="${elemId}"]`);
-            if (testContainer) {
-                const input = testContainer.querySelector('input[type="text"], textarea');
-                if (input) return input;
-            }
-            return null;
-        }
+        const FILTER_STORAGE_KEYS = {
+            'rank_min_filter': 'mlx_fun_filter_min_rank',
+            'rank_max_filter': 'mlx_fun_filter_max_rank',
+            'top_n_filter': 'mlx_fun_filter_top_n'
+        };
         
         function saveToStorage(key, value) {
             try {
@@ -90,28 +86,65 @@ def get_local_storage_script() -> str:
             }
         }
         
-        function setupPersistence() {
-            // Map of element IDs to storage keys
-            const elemToStorage = {
-                'merge_file1': 'mlx_merge_file1',
-                'merge_file2': 'mlx_merge_file2',
-                'merge_file3': 'mlx_merge_file3',
-                'merge_file4': 'mlx_merge_file4',
-                'diff_file1': 'mlx_diff_file1',
-                'diff_file2': 'mlx_diff_file2',
-                'rank_min_filter': 'mlx_filter_min_rank',
-                'rank_max_filter': 'mlx_filter_max_rank',
-                'top_n_filter': 'mlx_filter_top_n'
-            };
-            
-            Object.entries(elemToStorage).forEach(([elemId, storageKey]) => {
-                const input = getElementByElemId(elemId);
+        function findFileInput(elemId) {
+            // Find the file input container by elem_id
+            let container = document.getElementById(elemId);
+            if (!container) {
+                container = document.querySelector(`[data-testid="${elemId}"]`);
+            }
+            if (!container) {
+                // Try finding by id in shadow DOM-like structure
+                container = document.querySelector(`#${elemId}`);
+            }
+            return container;
+        }
+        
+        function findFilterInput(elemId) {
+            // Try direct ID first
+            let container = document.getElementById(elemId);
+            if (container) {
+                const input = container.querySelector('input[type="text"], input[type="number"], textarea');
+                if (input) return input;
+            }
+            // Try data-testid
+            let testContainer = document.querySelector(`[data-testid="${elemId}"]`);
+            if (testContainer) {
+                const input = testContainer.querySelector('input[type="text"], input[type="number"], textarea');
+                if (input) return input;
+            }
+            return null;
+        }
+        
+        function setupFilePersistence() {
+            // Handle file inputs - save original filename when file is selected
+            Object.entries(FILE_STORAGE_KEYS).forEach(([elemId, storageKey]) => {
+                const container = findFileInput(elemId);
+                if (container) {
+                    // Find the file input element within the container
+                    const fileInput = container.querySelector('input[type="file"]');
+                    if (fileInput) {
+                        fileInput.addEventListener('change', (e) => {
+                            const files = e.target.files;
+                            if (files && files.length > 0) {
+                                // Save the original filename
+                                const fileName = files[0].name;
+                                saveToStorage(storageKey, fileName);
+                                updateSavedFilesDisplay();
+                            }
+                        });
+                    }
+                }
+            });
+        }
+        
+        function setupFilterPersistence() {
+            Object.entries(FILTER_STORAGE_KEYS).forEach(([elemId, storageKey]) => {
+                const input = findFilterInput(elemId);
                 if (input) {
                     // Load saved value
                     const saved = loadFromStorage(storageKey);
                     if (saved && !input.value) {
                         input.value = saved;
-                        // Trigger input event to notify Gradio
                         input.dispatchEvent(new Event('input', { bubbles: true }));
                     }
                     
@@ -121,6 +154,33 @@ def get_local_storage_script() -> str:
                     });
                 }
             });
+        }
+        
+        function updateSavedFilesDisplay() {
+            // Update the saved files display element if it exists
+            const displayEl = document.getElementById('saved_files_display');
+            if (!displayEl) return;
+            
+            const savedFiles = [];
+            Object.entries(FILE_STORAGE_KEYS).forEach(([elemId, storageKey]) => {
+                const fileName = loadFromStorage(storageKey);
+                if (fileName) {
+                    savedFiles.push(`${elemId}: ${fileName}`);
+                }
+            });
+            
+            if (savedFiles.length > 0) {
+                displayEl.innerHTML = '<strong>Previously selected files:</strong><br>' +
+                    savedFiles.map(f => '• ' + f).join('<br>');
+            } else {
+                displayEl.innerHTML = '';
+            }
+        }
+        
+        function setupPersistence() {
+            setupFilePersistence();
+            setupFilterPersistence();
+            updateSavedFilesDisplay();
         }
         
         // Run after a short delay to ensure Gradio has rendered
@@ -133,7 +193,7 @@ def get_local_storage_script() -> str:
         // Also run when Gradio updates the DOM
         if (typeof MutationObserver !== 'undefined') {
             const observer = new MutationObserver(() => {
-                setTimeout(setupPersistence, 100);
+                setTimeout(setupPersistence, 200);
             });
             observer.observe(document.body, { childList: true, subtree: true });
         }
@@ -142,13 +202,6 @@ def get_local_storage_script() -> str:
     """
 
 
-def get_data_directory_files() -> List[str]:
-    """Get list of .npz files in the data directory."""
-    data_dir = Path("data")
-    if not data_dir.exists():
-        return []
-    npz_files = sorted(data_dir.glob("*.npz"))
-    return [str(f) for f in npz_files]
 
 
 # ---------------------------------------------------------------------------
@@ -765,74 +818,39 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
             gr.HTML(get_local_storage_script())
 
             with gr.Row():
-                gr.Markdown("#### Input Files")
+                gr.Markdown("#### Input Files (select .npz files from your computer)")
             
-            # Get available .npz files from data directory
-            data_files = get_data_directory_files()
+            # Display area for previously selected files (populated by JavaScript)
+            saved_files_display = gr.HTML("", elem_id="saved_files_display")
             
-            # File 1 with Clear and Browse buttons
+            # File inputs using native OS file dialog
             with gr.Row():
-                merge_file1 = gr.Textbox(
-                    label="File 1 Path (.npz)",
-                    placeholder="data/1.npz",
-                    scale=3,
+                merge_file1 = gr.File(
+                    label="File 1 (.npz) - Required",
+                    file_types=[".npz"],
+                    type="filepath",
                     elem_id="merge_file1",
                 )
-                merge_file1_dropdown = gr.Dropdown(
-                    choices=data_files,
-                    label="Browse data/",
-                    scale=2,
-                    interactive=True,
-                )
-                merge_file1_clear = gr.Button("Clear", scale=1, variant="secondary")
-            
-            # File 2 with Clear and Browse buttons
-            with gr.Row():
-                merge_file2 = gr.Textbox(
-                    label="File 2 Path (.npz)",
-                    placeholder="data/2.npz",
-                    scale=3,
+                merge_file2 = gr.File(
+                    label="File 2 (.npz) - Required",
+                    file_types=[".npz"],
+                    type="filepath",
                     elem_id="merge_file2",
                 )
-                merge_file2_dropdown = gr.Dropdown(
-                    choices=data_files,
-                    label="Browse data/",
-                    scale=2,
-                    interactive=True,
-                )
-                merge_file2_clear = gr.Button("Clear", scale=1, variant="secondary")
-
-            # File 3 with Clear and Browse buttons
+            
             with gr.Row():
-                merge_file3 = gr.Textbox(
-                    label="File 3 Path (.npz, optional)",
-                    placeholder="data/3.npz",
-                    scale=3,
+                merge_file3 = gr.File(
+                    label="File 3 (.npz) - Optional",
+                    file_types=[".npz"],
+                    type="filepath",
                     elem_id="merge_file3",
                 )
-                merge_file3_dropdown = gr.Dropdown(
-                    choices=data_files,
-                    label="Browse data/",
-                    scale=2,
-                    interactive=True,
-                )
-                merge_file3_clear = gr.Button("Clear", scale=1, variant="secondary")
-
-            # File 4 with Clear and Browse buttons
-            with gr.Row():
-                merge_file4 = gr.Textbox(
-                    label="File 4 Path (.npz, optional)",
-                    placeholder="",
-                    scale=3,
+                merge_file4 = gr.File(
+                    label="File 4 (.npz) - Optional",
+                    file_types=[".npz"],
+                    type="filepath",
                     elem_id="merge_file4",
                 )
-                merge_file4_dropdown = gr.Dropdown(
-                    choices=data_files,
-                    label="Browse data/",
-                    scale=2,
-                    interactive=True,
-                )
-                merge_file4_clear = gr.Button("Clear", scale=1, variant="secondary")
 
             with gr.Row():
                 metric_choice_merge = gr.Radio(
@@ -914,33 +932,18 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
             # Export file output
             export_file = gr.File(label="Exported CSV", visible=False)
 
-            # Wire up dropdowns to textboxes
-            merge_file1_dropdown.change(
-                lambda x: x, inputs=[merge_file1_dropdown], outputs=[merge_file1]
-            )
-            merge_file2_dropdown.change(
-                lambda x: x, inputs=[merge_file2_dropdown], outputs=[merge_file2]
-            )
-            merge_file3_dropdown.change(
-                lambda x: x, inputs=[merge_file3_dropdown], outputs=[merge_file3]
-            )
-            merge_file4_dropdown.change(
-                lambda x: x, inputs=[merge_file4_dropdown], outputs=[merge_file4]
-            )
-            
-            # Wire up clear buttons
-            merge_file1_clear.click(lambda: "", outputs=[merge_file1])
-            merge_file2_clear.click(lambda: "", outputs=[merge_file2])
-            merge_file3_clear.click(lambda: "", outputs=[merge_file3])
-            merge_file4_clear.click(lambda: "", outputs=[merge_file4])
-
             def merge_files_rank(f1, f2, f3, f4, metric):
-                """Merge input files using rank-based aggregation and return data for filtering."""
+                """Merge input files using rank-based aggregation and return data for filtering.
+                
+                Args:
+                    f1-f4: File paths from gr.File() components. Can be None if not selected.
+                    metric: Metric name for ranking.
+                """
                 from .saliency import SaliencyAccumulator
                 from .stats_ops import merge_saliency
 
-                # Collect non-empty file paths
-                files = [f for f in [f1, f2, f3, f4] if f and f.strip()]
+                # Collect non-empty file paths (gr.File returns None when no file selected)
+                files = [f for f in [f1, f2, f3, f4] if f is not None]
 
                 if len(files) < 2:
                     return (
@@ -1473,41 +1476,21 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 "Visualize differences between two collected saliency files. "
                 "Red areas indicate file1 has higher activation, blue indicates file2 has higher activation."
             )
-            
-            # Get available .npz files from data directory
-            data_files_diff = get_data_directory_files()
 
-            # File 1 with Clear and Browse buttons
+            # File inputs using native OS file dialog
             with gr.Row():
-                file1_input = gr.Textbox(
-                    label="File 1 Path (.npz)",
-                    placeholder="data/1.npz",
-                    scale=3,
+                file1_input = gr.File(
+                    label="File 1 (.npz)",
+                    file_types=[".npz"],
+                    type="filepath",
                     elem_id="diff_file1",
                 )
-                file1_dropdown = gr.Dropdown(
-                    choices=data_files_diff,
-                    label="Browse data/",
-                    scale=2,
-                    interactive=True,
-                )
-                file1_clear = gr.Button("Clear", scale=1, variant="secondary")
-
-            # File 2 with Clear and Browse buttons
-            with gr.Row():
-                file2_input = gr.Textbox(
-                    label="File 2 Path (.npz)",
-                    placeholder="data/2.npz",
-                    scale=3,
+                file2_input = gr.File(
+                    label="File 2 (.npz)",
+                    file_types=[".npz"],
+                    type="filepath",
                     elem_id="diff_file2",
                 )
-                file2_dropdown = gr.Dropdown(
-                    choices=data_files_diff,
-                    label="Browse data/",
-                    scale=2,
-                    interactive=True,
-                )
-                file2_clear = gr.Button("Clear", scale=1, variant="secondary")
 
             with gr.Row():
                 metric_choice_diff = gr.Radio(
@@ -1516,18 +1499,6 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                     label="Metric to Compare",
                 )
                 compare_btn = gr.Button("Compare Files", variant="primary")
-            
-            # Wire up dropdowns to textboxes
-            file1_dropdown.change(
-                lambda x: x, inputs=[file1_dropdown], outputs=[file1_input]
-            )
-            file2_dropdown.change(
-                lambda x: x, inputs=[file2_dropdown], outputs=[file2_input]
-            )
-            
-            # Wire up clear buttons
-            file1_clear.click(lambda: "", outputs=[file1_input])
-            file2_clear.click(lambda: "", outputs=[file2_input])
 
             with gr.Row():
                 diff_info_md = gr.Markdown("Select files and click **Compare Files** to see differences.")
@@ -1539,9 +1510,22 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 diff_stats_json = gr.JSON(label="Difference Statistics")
 
             def compare_files(file1, file2, metric):
-                """Load two .npz files and compute differences."""
+                """Load two .npz files and compute differences.
+                
+                Args:
+                    file1, file2: File paths from gr.File() components. Can be None.
+                    metric: Metric name for comparison.
+                """
                 from .saliency import SaliencyAccumulator
                 from .stats_ops import compute_diff_stats
+
+                # Check that both files are selected (gr.File returns None if not selected)
+                if file1 is None or file2 is None:
+                    return (
+                        "**Error:** Please select both files to compare.",
+                        None,
+                        {"error": "Both files required"},
+                    )
 
                 # Normalize metric names
                 metric_map = {

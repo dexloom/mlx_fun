@@ -64,8 +64,21 @@ class OnlineAccumulator:
             self._token_count += n
 
     def get_stats(self) -> dict:
-        """Return current accumulator state as JSON-serializable dict."""
+        """Return current accumulator state as JSON-serializable dict.
+        
+        Includes both raw accumulator arrays and computed scores for easy
+        comparison with stats-diff, stats-merge, and stats-purge operations.
+        """
         with self._lock:
+            # Compute scores for all metrics
+            reap_scores = self._acc.compute_scores("reap").tolist()
+            ean_scores = self._acc.compute_scores("ean").tolist()
+            freq_scores = self._acc.compute_scores("freq").tolist()
+            weighted_freq_scores = self._acc.compute_scores("weighted_freq").tolist()
+            
+            # Total samples (important for normalized merge mode)
+            total_samples = float(self._acc.freq.sum())
+            
             return {
                 "freq": self._acc.freq.tolist(),
                 "weighted_freq_sum": self._acc.weighted_freq_sum.tolist(),
@@ -76,6 +89,13 @@ class OnlineAccumulator:
                 "num_experts": self._acc.num_experts,
                 "request_count": self._request_count,
                 "token_count": self._token_count,
+                "total_samples": total_samples,
+                "computed_scores": {
+                    "reap": reap_scores,
+                    "ean": ean_scores,
+                    "freq": freq_scores,
+                    "weighted_freq": weighted_freq_scores,
+                },
             }
 
     def save(self, path: str):

@@ -401,13 +401,38 @@ The server exposes additional REAP endpoints for monitoring and exporting statis
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/v1/reap/stats` | Full expert frequency/score data as JSON |
+| `GET` | `/v1/reap/stats` | Full expert frequency/score data as JSON, including computed scores and total samples |
 | `GET` | `/v1/reap/info` | Model info: layer/expert counts, request/token totals, steering status |
 | `POST` | `/v1/reap/save` | Save accumulator to `.npz` file. Body: `{"path": "output.npz"}` |
 | `POST` | `/v1/reap/reset` | Reset all counters to zero |
 | `GET` | `/v1/reap/steer` | Get current steering config |
 | `POST` | `/v1/reap/steer` | Update steering config (see below) |
 | `DELETE` | `/v1/reap/steer` | Remove all steering (reset biases) |
+
+**Enhanced `/v1/reap/stats` response:**
+
+```json
+{
+  "freq": [[...], [...]],           // Raw frequency counts (num_layers × num_experts)
+  "weighted_freq_sum": [[...], [...]], // Raw weighted frequency sums
+  "reap_sum": [[...], [...]],       // Raw REAP sums (activation_norm × router_weight)
+  "ean_sum": [[...], [...]],         // Raw Expert Activation Norm sums
+  "reap_count": [[...], [...]],     // Sample counts per expert
+  "num_layers": 62,
+  "num_experts": 256,
+  "request_count": 150,
+  "token_count": 75000,
+  "total_samples": 12687240.0,      // Total samples (important for normalized merge mode)
+  "computed_scores": {
+    "reap": [[...], [...]],         // Computed REAP scores (divide sum by count)
+    "ean": [[...], [...]],          // Computed EAN scores
+    "freq": [[...], [...]],         // Computed frequency scores (same as freq array)
+    "weighted_freq": [[...], [...]]  // Computed weighted frequency scores
+  }
+}
+```
+
+The `computed_scores` field provides ready-to-use scores for comparison with `mlx-fun stats-diff`. The `total_samples` field is essential for the `normalized` merge mode in `mlx-fun stats-merge`.
 
 ```bash
 # Check stats after some traffic

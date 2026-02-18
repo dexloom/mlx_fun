@@ -279,7 +279,9 @@ This runs each calibration sample through the model with hooks installed on ever
 
 ### Step 2: Prune Experts
 
-Select and remove the least important experts:
+Select and remove the least important experts. Two modes are available:
+
+**Mode 1: Using saliency file (traditional)**
 
 ```bash
 mlx-fun prune \
@@ -291,12 +293,24 @@ mlx-fun prune \
     --strategy bottom
 ```
 
+**Mode 2: Using expert list from frontend (recommended)**
+
+After filtering experts in the web UI, export the `filtered_experts.json` file and use it directly:
+
+```bash
+mlx-fun prune \
+    --model mlx-community/MiniMax-M1-40k-4bit \
+    --expert-list filtered_experts.json \
+    --output ./pruned_model
+```
+
 | Flag | Default | Description |
 |---|---|---|
 | `--model` | *(required)* | Same model used for collection |
-| `--saliency` | *(required)* | Path to `.npz` from collect step |
+| `--saliency` | *(required if no --expert-list)* | Path to `.npz` from collect step |
+| `--expert-list` | *(none)* | Path to `.json` or `.csv` from frontend export. Bypasses `--n-prune` calculation. |
 | `--output` | *(required)* | Output directory for pruned model |
-| `--n-prune` | *(required)* | Number of experts to remove (per layer or total with `--model-wide`) |
+| `--n-prune` | *(required if no --expert-list)* | Number of experts to remove (per layer or total with `--model-wide`) |
 | `--metric` | `reap` | Saliency metric: `reap`, `ean`, `freq`, `weighted_freq` |
 | `--strategy` | `bottom` | Pruning strategy: `bottom` (remove lowest) or `strided` (distribute evenly) |
 | `--model-wide` | `false` | Select N experts globally across all layers instead of per-layer |
@@ -345,7 +359,11 @@ mlx-fun prune --model ... --saliency ... --output ... --n-prune 16 \
 
 ### Step 2b: Merge Experts (REAM Alternative)
 
-Instead of pruning, you can merge experts using REAM. This requires the same saliency `.npz` file from the collect step, plus calibration data for computing expert similarity:
+Instead of pruning, you can merge experts using REAM. Two modes are available:
+
+**Mode 1: Using saliency file (traditional)**
+
+This requires the saliency `.npz` file from the collect step, plus calibration data for computing expert similarity:
 
 ```bash
 mlx-fun merge \
@@ -361,13 +379,26 @@ mlx-fun merge \
     --seed 42
 ```
 
+**Mode 2: Using expert list from frontend (recommended)**
+
+After filtering experts in the web UI, export the `filtered_experts.json` file and use it directly:
+
+```bash
+mlx-fun merge \
+    --model mlx-community/MiniMax-M1-40k-4bit \
+    --expert-list filtered_experts.json \
+    --dataset ./data/solidity_calibration.jsonl \
+    --output ./merged_model
+```
+
 | Flag | Default | Description |
 |---|---|---|
 | `--model` | *(required)* | Same model used for collection |
-| `--saliency` | *(required)* | Path to `.npz` from collect step |
+| `--saliency` | *(required if no --expert-list)* | Path to `.npz` from collect step |
+| `--expert-list` | *(none)* | Path to `.json` or `.csv` from frontend export. Bypasses `--n-prune` calculation. |
 | `--dataset` | *(required)* | Calibration data for similarity/alignment computation |
 | `--output` | *(required)* | Output directory for merged model |
-| `--n-prune` | *(required)* | Number of experts to prune (per layer or total with `--model-wide`) |
+| `--n-prune` | *(required if no --expert-list)* | Number of experts to prune (per layer or total with `--model-wide`) |
 | `--metric` | `reap` | Saliency metric: `reap`, `ean`, `freq`, `weighted_freq` |
 | `--model-wide` | `false` | Select N experts globally across all layers instead of per-layer |
 | `--min-experts-per-layer` | `1` | Minimum experts to keep per layer when using `--model-wide` |
@@ -881,14 +912,44 @@ mlx-fun ui --server-url http://127.0.0.1:8080
 | `--port` | `7860` | Frontend port |
 | `--share` | *(off)* | Create a public Gradio share link |
 
-The dashboard provides four tabs:
+The dashboard provides multiple tabs:
 
 | Tab | Features |
 |-----|----------|
 | **Chat** | Talk to the model via streaming chat, configurable system prompt / temperature / max tokens |
 | **Dashboard** | Expert activation heatmaps (frequency or weighted frequency), per-layer bar charts with layer selector |
 | **Steering** | Apply steering from a safety report (safe/unsafe) or custom JSON config, view/remove active steering |
+| **Merge Mode Comparison** | Compare different merge strategies, filter experts by rank, export expert lists for CLI |
+| **Diff Analysis** | Compare two saliency files side-by-side with difference heatmap |
 | **Controls** | Server info, save saliency data to file, reset counters, raw stats JSON |
+
+#### Merge Mode Comparison Tab
+
+The **Merge Mode Comparison** tab enables interactive expert filtering and export:
+
+1. **Load saliency files** — Select 2-4 `.npz` files from your calibration runs
+2. **Choose metric** — REAP, EAN, Frequency, or Weighted Frequency
+3. **Apply filters** — Set min/max rank sum thresholds or N to prune
+4. **Select mode** — Per-Layer or Model-Wide expert selection
+5. **Choose action** — Analyze, Prune, or Merge mode
+6. **Export results** — Download `filtered_experts.json` for CLI use
+
+**Export formats:**
+
+| Format | File | Use Case |
+|--------|------|----------|
+| CSV | `filtered_experts.csv` | Human inspection, manual editing |
+| JSON | `filtered_experts.json` | CLI `--expert-list` parameter |
+
+**Example workflow:**
+
+```bash
+# 1. In the web UI, apply filters and click "Export JSON for CLI"# 2. Use the exported file with prune or merge:
+mlx-fun prune --model ./model --expert-list filtered_experts.json --output ./pruned
+
+# Or for merging:
+mlx-fun merge --model ./model --expert-list filtered_experts.json --dataset calib.jsonl --output ./merged
+```
 
 ### Python API
 

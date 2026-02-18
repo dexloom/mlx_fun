@@ -929,8 +929,10 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
             with gr.Row():
                 merge_json = gr.JSON(label="Statistics")
             
-            # Export file output
-            export_file = gr.File(label="Exported CSV", visible=False)
+            # Export file outputs
+            with gr.Row():
+                export_file = gr.File(label="Exported CSV", visible=True)
+                export_json_file = gr.File(label="Exported JSON (for CLI)", visible=True)
 
             def merge_files_rank(f1, f2, f3, f4, metric):
                 """Merge input files using rank-based aggregation and return data for filtering.
@@ -1281,23 +1283,31 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                     for i, exp in enumerate(sorted_candidates[:5], 1):
                         info += f"  {i}. Layer {exp['layer']}, Expert {exp['expert']}: rank sum = {exp['rank_sum']:.0f}\n"
                 
-                # Add CLI command hint
-                if n_prune is not None and n_prune > 0:
-                    model_wide_flag = "--model-wide " if selection_mode == "Model-Wide" else ""
+                # Add CLI command hint - use --expert-list for Prune/Merge action modes
+                if action_mode in ("Prune", "Merge"):
                     if action_mode == "Prune":
                         info += (
-                            f"\n**CLI Command:**\n"
+                            f"\n**CLI Command (after exporting):**\n"
                             f"```bash\n"
-                            f"mlx-fun prune --model ./model --saliency merged.npz {model_wide_flag}--n-prune {int(n_prune)} --output ./pruned\n"
+                            f"mlx-fun prune --model ./model --expert-list filtered_experts.json --output ./pruned\n"
                             f"```\n"
                         )
                     elif action_mode == "Merge":
                         info += (
-                            f"\n**CLI Command:**\n"
+                            f"\n**CLI Command (after exporting):**\n"
                             f"```bash\n"
-                            f"mlx-fun merge --model ./model --saliency merged.npz --dataset calib.jsonl {model_wide_flag}--n-prune {int(n_prune)} --output ./merged\n"
+                            f"mlx-fun merge --model ./model --expert-list filtered_experts.json --dataset calib.jsonl --output ./merged\n"
                             f"```\n"
                         )
+                elif n_prune is not None and n_prune > 0:
+                    # Analyze mode - show traditional command with --saliency
+                    model_wide_flag = "--model-wide " if selection_mode == "Model-Wide" else ""
+                    info += (
+                        f"\n**CLI Command (traditional):**\n"
+                        f"```bash\n"
+                        f"mlx-fun prune --model ./model --saliency merged.npz {model_wide_flag}--n-prune {int(n_prune)} --output ./pruned\n"
+                        f"```\n"
+                    )
                 
                 return info, fig, stats
             
@@ -1374,13 +1384,17 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
             )
             
             def export_filtered_results(merge_data, min_rank, max_rank, n_prune, selection_mode, action_mode):
-                """Export filtered expert list to CSV file.
+                """Export filtered expert list to CSV and JSON files.
                 
-                Exports experts to KEEP (not prune/merge) based on filtering.
-                Also exports a separate file with prune/merge candidates.
+                Exports two files:
+                - filtered_experts.csv: Human-readable format for inspection
+                - filtered_experts.json: Machine-readable keep_map for CLI consumption
+                
+                Returns:
+                    Tuple of (csv_path, json_path) for Gradio download
                 """
                 if merge_data is None:
-                    return None
+                    return None, None
                 
                 summed_ranks = np.array(merge_data["summed_ranks"])
                 num_layers = merge_data["num_layers"]
@@ -1447,24 +1461,59 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 keep_experts.sort(key=lambda x: x["rank_sum"])
                 prune_candidates.sort(key=lambda x: x["rank_sum"], reverse=True)
                 
-                # Create CSV with all experts and their action
+                # --- Export CSV (human-readable) ---
                 all_experts = keep_experts + prune_candidates
                 output = io.StringIO()
                 writer = csv.DictWriter(output, fieldnames=["layer", "expert", "rank_sum", "action"])
                 writer.writeheader()
                 writer.writerows(all_experts)
                 
-                # Save to file
                 csv_path = "filtered_experts.csv"
                 with open(csv_path, "w", newline="") as f:
                     f.write(output.getvalue())
                 
-                return csv_path
+                # --- Export JSON (machine-readable keep_map) ---
+                # Build keep_map structure
+                keep_map = {}
+                for layer_idx in range(num_layers):
+                    kept = sorted([
+                        expert_idx for expert_idx in range(num_experts)
+                        if mask[layer_idx, expert_idx]
+                    ])
+                    keep_map[str(layer_idx)] = kept
+                
+                json_data = {
+                    "version": "1.0",
+                    "source": {
+                        "files": merge_data.get("files", []),
+                        "metric": merge_data.get("metric_key", "reap"),
+                        "selection_mode": selection_mode.lower().replace("-", "_"),
+                        "action_mode": action_mode.lower()
+                    },
+                    "filters": {
+                        "min_rank": min_rank,
+                        "max_rank": max_rank,
+                        "n_prune": n_prune
+                    },
+                    "keep_map": keep_map,
+                    "statistics": {
+                        "num_layers": num_layers,
+                        "num_experts": num_experts,
+                        "total_kept": sum(len(v) for v in keep_map.values()),
+                        "total_pruned": num_layers * num_experts - sum(len(v) for v in keep_map.values())
+                    }
+                }
+                
+                json_path = "filtered_experts.json"
+                with open(json_path, "w") as f:
+                    json.dump(json_data, f, indent=2)
+                
+                return csv_path, json_path
             
             export_btn.click(
                 export_filtered_results,
                 inputs=[merge_state, rank_min_filter, rank_max_filter, n_prune_filter, selection_mode, action_mode],
-                outputs=[export_file],
+                outputs=[export_file, export_json_file],
             )
 
         # -------------------------------------------------------------------

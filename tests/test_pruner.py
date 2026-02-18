@@ -1,5 +1,9 @@
 """Tests for pruning engine."""
 
+import json
+import tempfile
+from pathlib import Path
+
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -11,6 +15,9 @@ from mlx_fun.pruner import (
     _strided_prune_indices,
     prune_moe_layer,
     prune_model,
+    load_expert_list,
+    _load_expert_list_json,
+    _load_expert_list_csv,
 )
 from mlx_fun.adapters.minimax import MiniMaxAdapter
 from mlx_fun.adapters.glm4_moe import GLM4MoEAdapter
@@ -559,3 +566,148 @@ def test_prune_model_warns_exact_topk(tiny_minimax_moe):
     keep_map = {0: np.array([0, 1])}  # Exactly top_k=2
     with pytest.warns(UserWarning, match="exactly"):
         prune_model(adapter, keep_map)
+
+
+# --- Expert list loading tests ---
+
+def test_load_expert_list_json(tmp_path):
+    """Test loading keep_map from JSON file."""
+    json_data = {
+        "version": "1.0",
+        "keep_map": {
+            "0": [0, 1, 2],
+            "1": [0, 1, 3],
+            "2": [2, 4, 5]
+        }
+    }
+    json_path = tmp_path / "test.json"
+    json_path.write_text(json.dumps(json_data))
+    
+    keep_map = load_expert_list(str(json_path))
+    
+    assert 0 in keep_map
+    assert 1 in keep_map
+    assert 2 in keep_map
+    np.testing.assert_array_equal(keep_map[0], [0, 1, 2])
+    np.testing.assert_array_equal(keep_map[1], [0, 1, 3])
+    np.testing.assert_array_equal(keep_map[2], [2, 4, 5])
+
+
+def test_load_expert_list_json_with_metadata(tmp_path):
+    """Test loading JSON with source metadata (should be ignored)."""
+    json_data = {
+        "version": "1.0",
+        "source": {
+            "files": ["data/1.npz", "data/2.npz"],
+            "metric": "reap",
+            "selection_mode": "per_layer",
+            "action_mode": "prune"
+        },
+        "filters": {
+            "min_rank": None,
+            "max_rank": None,
+            "n_prune": 8
+        },
+        "keep_map": {
+            "0": [0, 1, 2, 3],
+            "1": [0, 1, 2, 4]
+        },
+        "statistics": {
+            "num_layers": 2,
+            "num_experts": 8,
+            "total_kept": 8,
+            "total_pruned": 8
+        }
+    }
+    json_path = tmp_path / "test.json"
+    json_path.write_text(json.dumps(json_data))
+    
+    keep_map = load_expert_list(str(json_path))
+    
+    assert len(keep_map) == 2
+    np.testing.assert_array_equal(keep_map[0], [0, 1, 2, 3])
+    np.testing.assert_array_equal(keep_map[1], [0, 1, 2, 4])
+
+
+def test_load_expert_list_csv(tmp_path):
+    """Test loading keep_map from CSV file."""
+    csv_content = "layer,expert,rank_sum,action\n0,0,10.0,keep\n0,1,20.0,prune\n0,2,15.0,keep\n1,0,12.0,keep\n1,1,25.0,prune\n"
+    csv_path = tmp_path / "test.csv"
+    csv_path.write_text(csv_content)
+    
+    keep_map = load_expert_list(str(csv_path))
+    
+    assert len(keep_map) == 2
+    # Layer 0: experts 0 and 2 are kept (sorted)
+    np.testing.assert_array_equal(keep_map[0], [0, 2])
+    # Layer 1: only expert 0 is kept
+    np.testing.assert_array_equal(keep_map[1], [0])
+
+
+def test_load_expert_list_csv_all_keep(tmp_path):
+    """Test CSV where all experts are kept."""
+    csv_content = "layer,expert,rank_sum,action\n0,0,10.0,keep\n0,1,20.0,keep\n0,2,15.0,keep\n"
+    csv_path = tmp_path / "test.csv"
+    csv_path.write_text(csv_content)
+    
+    keep_map = load_expert_list(str(csv_path))
+    
+    assert len(keep_map) == 1
+    np.testing.assert_array_equal(keep_map[0], [0, 1, 2])
+
+
+def test_load_expert_list_unsupported_format(tmp_path):
+    """Test error on unsupported file format."""
+    txt_path = tmp_path / "test.txt"
+    txt_path.write_text("some content")
+    
+    with pytest.raises(ValueError, match="Unsupported file format"):
+        load_expert_list(str(txt_path))
+
+
+def test_load_expert_list_json_missing_keep_map(tmp_path):
+    """Test error when JSON is missing keep_map key."""
+    json_data = {"version": "1.0", "other": "data"}
+    json_path = tmp_path / "test.json"
+    json_path.write_text(json.dumps(json_data))
+    
+    with pytest.raises(ValueError, match="must contain 'keep_map'"):
+        load_expert_list(str(json_path))
+
+
+def test_load_expert_list_csv_missing_columns(tmp_path):
+    """Test error when CSV is missing required columns."""
+    csv_content = "layer,expert,score\n0,0,10.0\n"  # Missing 'action' column
+    csv_path = tmp_path / "test.csv"
+    csv_path.write_text(csv_content)
+    
+    with pytest.raises(ValueError, match="CSV must have columns"):
+        load_expert_list(str(csv_path))
+
+
+def test_load_expert_list_json_version_warning(tmp_path):
+    """Test warning for non-1.0 version."""
+    json_data = {
+        "version": "2.0",
+        "keep_map": {"0": [0, 1]}
+    }
+    json_path = tmp_path / "test.json"
+    json_path.write_text(json.dumps(json_data))
+    
+    with pytest.warns(UserWarning, match="may not be fully supported"):
+        keep_map = load_expert_list(str(json_path))
+    
+    # Should still load the data
+    np.testing.assert_array_equal(keep_map[0], [0, 1])
+
+
+def test_load_expert_list_csv_case_insensitive_action(tmp_path):
+    """Test CSV action column is case-insensitive."""
+    csv_content = "layer,expert,rank_sum,action\n0,0,10.0,KEEP\n0,1,20.0,Keep\n0,2,15.0,prune\n"
+    csv_path = tmp_path / "test.csv"
+    csv_path.write_text(csv_content)
+    
+    keep_map = load_expert_list(str(csv_path))
+    
+    # Experts 0 and 1 should be kept (case-insensitive)
+    np.testing.assert_array_equal(keep_map[0], [0, 1])

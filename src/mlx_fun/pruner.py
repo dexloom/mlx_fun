@@ -1,6 +1,9 @@
 """Expert selection and tensor slicing for MoE pruning."""
 
+import json
 import warnings
+from collections import defaultdict
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import mlx.core as mx
@@ -59,6 +62,104 @@ def load_domain_constraints(
         return constraints, None
     else:
         raise ValueError(f"Unknown domain_mode '{mode}'. Use: protect")
+
+
+def load_expert_list(
+    expert_list_path: str,
+) -> Dict[int, np.ndarray]:
+    """Load expert list from CSV or JSON file and return keep_map.
+
+    Supports two formats:
+    - JSON: Direct keep_map format with layer indices as keys
+    - CSV: Row format with layer, expert, action columns
+
+    Args:
+        expert_list_path: Path to .csv or .json file.
+
+    Returns:
+        Dict mapping layer_index -> numpy array of kept expert indices.
+
+    Raises:
+        ValueError: If file format is invalid or unsupported.
+    """
+    path = Path(expert_list_path)
+
+    if path.suffix == ".json":
+        return _load_expert_list_json(path)
+    elif path.suffix == ".csv":
+        return _load_expert_list_csv(path)
+    else:
+        raise ValueError(
+            f"Unsupported file format: {path.suffix}. "
+            "Use .json or .csv files."
+        )
+
+
+def _load_expert_list_json(path: Path) -> Dict[int, np.ndarray]:
+    """Load keep_map from JSON format.
+
+    Expected format:
+    {
+        "version": "1.0",
+        "keep_map": {
+            "0": [0, 1, 2, ...],
+            "1": [0, 1, 3, ...],
+            ...
+        }
+    }
+    """
+    with open(path) as f:
+        data = json.load(f)
+
+    # Validate version
+    version = data.get("version", "1.0")
+    if version != "1.0":
+        warnings.warn(
+            f"Expert list version {version} may not be fully supported."
+        )
+
+    # Extract keep_map
+    if "keep_map" not in data:
+        raise ValueError("JSON file must contain 'keep_map' key")
+
+    keep_map = data["keep_map"]
+    return {
+        int(layer_idx): np.array(experts, dtype=np.intp)
+        for layer_idx, experts in keep_map.items()
+    }
+
+
+def _load_expert_list_csv(path: Path) -> Dict[int, np.ndarray]:
+    """Load keep_map from CSV format.
+
+    CSV must have columns: layer, expert, action
+    Rows with action='keep' are included in keep_map.
+    """
+    import csv
+
+    keep_per_layer = defaultdict(list)
+
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+
+        # Validate columns
+        required = {"layer", "expert", "action"}
+        if not required.issubset(set(reader.fieldnames or [])):
+            raise ValueError(
+                f"CSV must have columns: {required}. "
+                f"Found: {reader.fieldnames}"
+            )
+
+        for row in reader:
+            if row["action"].lower() == "keep":
+                layer_idx = int(row["layer"])
+                expert_idx = int(row["expert"])
+                keep_per_layer[layer_idx].append(expert_idx)
+
+    return {
+        layer_idx: np.sort(np.array(experts, dtype=np.intp))
+        for layer_idx, experts in keep_per_layer.items()
+    }
 
 
 def select_experts_to_keep(

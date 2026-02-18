@@ -5,9 +5,13 @@ Connects to a running REAP server and provides:
 - Expert activation dashboard (heatmaps from /v1/reap/stats)
 - Steering controls (via /v1/reap/steer)
 - Server management (save, reset, info)
+- File comparison and merge mode analysis with dynamic filtering
 """
 
+import csv
+import io
 import json
+from pathlib import Path
 from typing import Generator, List, Optional, Tuple
 
 import numpy as np
@@ -32,6 +36,119 @@ except ImportError:
     )
 
 import requests
+
+
+# ---------------------------------------------------------------------------
+# LocalStorage persistence JavaScript
+# ---------------------------------------------------------------------------
+
+def get_local_storage_script() -> str:
+    """Return JavaScript for localStorage persistence of file inputs and filters."""
+    return """
+    <script>
+    (function() {
+        const STORAGE_KEYS = {
+            files: [
+                'mlx_merge_file1', 'mlx_merge_file2', 'mlx_merge_file3', 'mlx_merge_file4',
+                'mlx_diff_file1', 'mlx_diff_file2'
+            ],
+            filters: [
+                'mlx_filter_min_rank', 'mlx_filter_max_rank', 'mlx_filter_top_n'
+            ]
+        };
+        
+        function getElementByElemId(elemId) {
+            // Try direct ID first
+            let container = document.getElementById(elemId);
+            if (container) {
+                const input = container.querySelector('input[type="text"], textarea');
+                if (input) return input;
+            }
+            // Try data-testid
+            let testContainer = document.querySelector(`[data-testid="${elemId}"]`);
+            if (testContainer) {
+                const input = testContainer.querySelector('input[type="text"], textarea');
+                if (input) return input;
+            }
+            return null;
+        }
+        
+        function saveToStorage(key, value) {
+            try {
+                localStorage.setItem(key, value || '');
+            } catch (e) {
+                console.warn('localStorage save failed:', e);
+            }
+        }
+        
+        function loadFromStorage(key) {
+            try {
+                return localStorage.getItem(key) || '';
+            } catch (e) {
+                console.warn('localStorage load failed:', e);
+                return '';
+            }
+        }
+        
+        function setupPersistence() {
+            // Map of element IDs to storage keys
+            const elemToStorage = {
+                'merge_file1': 'mlx_merge_file1',
+                'merge_file2': 'mlx_merge_file2',
+                'merge_file3': 'mlx_merge_file3',
+                'merge_file4': 'mlx_merge_file4',
+                'diff_file1': 'mlx_diff_file1',
+                'diff_file2': 'mlx_diff_file2',
+                'rank_min_filter': 'mlx_filter_min_rank',
+                'rank_max_filter': 'mlx_filter_max_rank',
+                'top_n_filter': 'mlx_filter_top_n'
+            };
+            
+            Object.entries(elemToStorage).forEach(([elemId, storageKey]) => {
+                const input = getElementByElemId(elemId);
+                if (input) {
+                    // Load saved value
+                    const saved = loadFromStorage(storageKey);
+                    if (saved && !input.value) {
+                        input.value = saved;
+                        // Trigger input event to notify Gradio
+                        input.dispatchEvent(new Event('input', { bubbles: true }));
+                    }
+                    
+                    // Save on change
+                    input.addEventListener('input', () => {
+                        saveToStorage(storageKey, input.value);
+                    });
+                }
+            });
+        }
+        
+        // Run after a short delay to ensure Gradio has rendered
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', () => setTimeout(setupPersistence, 500));
+        } else {
+            setTimeout(setupPersistence, 500);
+        }
+        
+        // Also run when Gradio updates the DOM
+        if (typeof MutationObserver !== 'undefined') {
+            const observer = new MutationObserver(() => {
+                setTimeout(setupPersistence, 100);
+            });
+            observer.observe(document.body, { childList: true, subtree: true });
+        }
+    })();
+    </script>
+    """
+
+
+def get_data_directory_files() -> List[str]:
+    """Get list of .npz files in the data directory."""
+    data_dir = Path("data")
+    if not data_dir.exists():
+        return []
+    npz_files = sorted(data_dir.glob("*.npz"))
+    return [str(f) for f in npz_files]
 
 
 # ---------------------------------------------------------------------------
@@ -641,38 +758,81 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
             gr.Markdown("### Compare Different Merge Modes")
             gr.Markdown(
                 "Merge the same input files using different strategies (sum, normalized, max) "
-                "and compare the results. Select which comparison to view."
+                "and compare the results. Use filters to identify experts for pruning."
             )
+            
+            # Inject localStorage persistence script
+            gr.HTML(get_local_storage_script())
 
             with gr.Row():
                 gr.Markdown("#### Input Files")
+            
+            # Get available .npz files from data directory
+            data_files = get_data_directory_files()
+            
+            # File 1 with Clear and Browse buttons
             with gr.Row():
                 merge_file1 = gr.Textbox(
                     label="File 1 Path (.npz)",
-                    placeholder="data/reap_saliency_agent_minimax_m25.npz",
-                    scale=1,
+                    placeholder="data/1.npz",
+                    scale=3,
                     elem_id="merge_file1",
                 )
+                merge_file1_dropdown = gr.Dropdown(
+                    choices=data_files,
+                    label="Browse data/",
+                    scale=2,
+                    interactive=True,
+                )
+                merge_file1_clear = gr.Button("Clear", scale=1, variant="secondary")
+            
+            # File 2 with Clear and Browse buttons
+            with gr.Row():
                 merge_file2 = gr.Textbox(
                     label="File 2 Path (.npz)",
-                    placeholder="data/reap_saliency_solidity_functions_minimax_m25.npz",
-                    scale=1,
+                    placeholder="data/2.npz",
+                    scale=3,
                     elem_id="merge_file2",
                 )
+                merge_file2_dropdown = gr.Dropdown(
+                    choices=data_files,
+                    label="Browse data/",
+                    scale=2,
+                    interactive=True,
+                )
+                merge_file2_clear = gr.Button("Clear", scale=1, variant="secondary")
 
+            # File 3 with Clear and Browse buttons
             with gr.Row():
                 merge_file3 = gr.Textbox(
                     label="File 3 Path (.npz, optional)",
-                    placeholder="data/reap_saliency_general_minimax_m25.npz",
-                    scale=1,
+                    placeholder="data/3.npz",
+                    scale=3,
                     elem_id="merge_file3",
                 )
+                merge_file3_dropdown = gr.Dropdown(
+                    choices=data_files,
+                    label="Browse data/",
+                    scale=2,
+                    interactive=True,
+                )
+                merge_file3_clear = gr.Button("Clear", scale=1, variant="secondary")
+
+            # File 4 with Clear and Browse buttons
+            with gr.Row():
                 merge_file4 = gr.Textbox(
                     label="File 4 Path (.npz, optional)",
                     placeholder="",
-                    scale=1,
+                    scale=3,
                     elem_id="merge_file4",
                 )
+                merge_file4_dropdown = gr.Dropdown(
+                    choices=data_files,
+                    label="Browse data/",
+                    scale=2,
+                    interactive=True,
+                )
+                merge_file4_clear = gr.Button("Clear", scale=1, variant="secondary")
 
             with gr.Row():
                 metric_choice_merge = gr.Radio(
@@ -683,18 +843,79 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
 
             with gr.Row():
                 merge_btn = gr.Button("Merge Files", variant="primary")
+            
+            # Store merged data for filtering
+            merge_state = gr.State(None)
+            
+            # Dynamic Filters Section
+            gr.Markdown("---")
+            gr.Markdown("#### Dynamic Filters")
+            gr.Markdown(
+                "Filter experts by rank sum thresholds. Lower rank sum = more important expert. "
+                "Use Top N to show only the N most important experts."
+            )
+            
+            with gr.Row():
+                rank_min_filter = gr.Number(
+                    label="Min Rank Sum (leave empty for no min)",
+                    value=None,
+                    precision=0,
+                    elem_id="rank_min_filter",
+                )
+                rank_max_filter = gr.Number(
+                    label="Max Rank Sum (leave empty for no max)",
+                    value=None,
+                    precision=0,
+                    elem_id="rank_max_filter",
+                )
+                top_n_filter = gr.Number(
+                    label="N to Prune Per Layer (hides N least important per layer)",
+                    value=None,
+                    precision=0,
+                    elem_id="top_n_filter",
+                )
+            
+            with gr.Row():
+                apply_filters_btn = gr.Button("Apply Filters", variant="secondary")
+                reset_filters_btn = gr.Button("Reset Filters", variant="secondary")
+                export_btn = gr.Button("Export Filtered Results", variant="primary")
 
             with gr.Row():
-                merge_info_md = gr.Markdown("Select input files and click **Merge Files** to see rank-based results.")
+                filter_info_md = gr.Markdown(
+                    "Merge files first, then use filters to narrow down results."
+                )
 
             with gr.Row():
                 merge_plot = gr.Plot(label="Summed Ranks (Lower = More Important)")
 
             with gr.Row():
                 merge_json = gr.JSON(label="Statistics")
+            
+            # Export file output
+            export_file = gr.File(label="Exported CSV", visible=False)
+
+            # Wire up dropdowns to textboxes
+            merge_file1_dropdown.change(
+                lambda x: x, inputs=[merge_file1_dropdown], outputs=[merge_file1]
+            )
+            merge_file2_dropdown.change(
+                lambda x: x, inputs=[merge_file2_dropdown], outputs=[merge_file2]
+            )
+            merge_file3_dropdown.change(
+                lambda x: x, inputs=[merge_file3_dropdown], outputs=[merge_file3]
+            )
+            merge_file4_dropdown.change(
+                lambda x: x, inputs=[merge_file4_dropdown], outputs=[merge_file4]
+            )
+            
+            # Wire up clear buttons
+            merge_file1_clear.click(lambda: "", outputs=[merge_file1])
+            merge_file2_clear.click(lambda: "", outputs=[merge_file2])
+            merge_file3_clear.click(lambda: "", outputs=[merge_file3])
+            merge_file4_clear.click(lambda: "", outputs=[merge_file4])
 
             def merge_files_rank(f1, f2, f3, f4, metric):
-                """Merge input files using rank-based aggregation."""
+                """Merge input files using rank-based aggregation and return data for filtering."""
                 from .saliency import SaliencyAccumulator
                 from .stats_ops import merge_saliency
 
@@ -704,6 +925,7 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 if len(files) < 2:
                     return (
                         "**Error:** At least 2 files are required.",
+                        None,
                         None,
                         None,
                     )
@@ -725,25 +947,32 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                         f"**Error merging files:** {e}",
                         None,
                         None,
+                        None,
                     )
 
                 # Get summed ranks (stored in freq array)
-                summed_ranks = merged.freq
+                summed_ranks = merged.freq.copy()
+                
+                # Store data for filtering
+                merge_data = {
+                    "summed_ranks": summed_ranks.tolist(),
+                    "num_layers": merged.num_layers,
+                    "num_experts": merged.num_experts,
+                    "files": files,
+                    "metric": metric,
+                    "metric_key": metric_key,
+                }
 
                 # Create heatmap showing summed ranks using matplotlib
-                # Note: Lower values = more important (use RdYlGn colormap reversed)
-                # Use a wider, squarer aspect ratio that fits better in browser
                 num_layers, num_experts = summed_ranks.shape
-                # Target a reasonable width (14) and height based on aspect ratio
-                # but capped to keep it compact
                 width = 14
-                height = max(4, min(8, num_layers * 0.1))  # Cap height at 8
+                height = max(4, min(8, num_layers * 0.1))
                 fig, ax = plt.subplots(figsize=(width, height))
                 
                 im = ax.imshow(
                     summed_ranks,
                     aspect="auto",
-                    cmap="RdYlGn_r",  # Reversed: green (low/good) to red (high/less important)
+                    cmap="RdYlGn_r",
                     interpolation="nearest",
                 )
                 
@@ -754,12 +983,12 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 fig.tight_layout()
 
                 # Compute statistics
-                num_experts = merged.num_layers * merged.num_experts
                 stats = {
                     "num_files": len(files),
                     "metric": metric_key,
                     "num_layers": merged.num_layers,
                     "num_experts": merged.num_experts,
+                    "total_experts": merged.num_layers * merged.num_experts,
                     "rank_sum_min": float(summed_ranks.min()),
                     "rank_sum_max": float(summed_ranks.max()),
                     "rank_sum_mean": float(summed_ranks.mean()),
@@ -807,12 +1036,328 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 for i, exp in enumerate(stats["most_important"][:3], 1):
                     info += f"  {i}. Layer {exp['layer']}, Expert {exp['expert']}: rank sum = {exp['rank_sum']:.0f}\n"
 
-                return info, fig, stats
+                return info, fig, stats, merge_data
 
             merge_btn.click(
                 merge_files_rank,
                 inputs=[merge_file1, merge_file2, merge_file3, merge_file4, metric_choice_merge],
-                outputs=[merge_info_md, merge_plot, merge_json],
+                outputs=[filter_info_md, merge_plot, merge_json, merge_state],
+            )
+            
+            def apply_filters(merge_data, min_rank, max_rank, top_n):
+                """Apply filters to merged data and update visualization.
+                
+                The Top N filter works PER-LAYER (matching the pruning algorithm):
+                - For each layer, identifies the N experts with LOWEST rank sum (most important)
+                - These are the experts to KEEP when pruning N experts per layer
+                - Experts NOT in this mask are candidates for PRUNING
+                """
+                if merge_data is None:
+                    return (
+                        "**No data to filter.** Please merge files first.",
+                        None,
+                        None,
+                    )
+                
+                summed_ranks = np.array(merge_data["summed_ranks"])
+                num_layers = merge_data["num_layers"]
+                num_experts = merge_data["num_experts"]
+                metric = merge_data["metric"]
+                total_experts = num_layers * num_experts
+                
+                # Create mask for filtering (start with all visible)
+                mask = np.ones_like(summed_ranks, dtype=bool)
+                filter_desc = []
+                prune_candidates = []  # Track which experts would be pruned
+                
+                # Apply min rank filter
+                if min_rank is not None and min_rank > 0:
+                    mask &= summed_ranks >= min_rank
+                    filter_desc.append(f"rank >= {min_rank}")
+                
+                # Apply max rank filter
+                if max_rank is not None and max_rank > 0:
+                    mask &= summed_ranks <= max_rank
+                    filter_desc.append(f"rank <= {max_rank}")
+                
+                # Apply top N PER-LAYER filter (matching pruning algorithm)
+                # Lower rank sum = more important = should be KEPT
+                # So we mask out (hide) the experts that would be PRUNED
+                if top_n is not None and top_n > 0:
+                    n_to_prune_per_layer = int(top_n)
+                    if n_to_prune_per_layer < num_experts:
+                        # For each layer, find the N experts with HIGHEST rank sum (least important)
+                        # These are the ones that would be pruned
+                        for layer_idx in range(num_layers):
+                            layer_ranks = summed_ranks[layer_idx]
+                            # Find indices of N highest rank sums (least important) in this layer
+                            prune_indices = np.argpartition(layer_ranks, -n_to_prune_per_layer)[-n_to_prune_per_layer:]
+                            # Mask out these experts (they would be pruned)
+                            mask[layer_idx, prune_indices] = False
+                            # Track prune candidates
+                            for expert_idx in prune_indices:
+                                prune_candidates.append({
+                                    "layer": int(layer_idx),
+                                    "expert": int(expert_idx),
+                                    "rank_sum": float(layer_ranks[expert_idx]),
+                                })
+                        filter_desc.append(f"prune {n_to_prune_per_layer}/layer (showing keep)")
+                
+                # Count matching experts
+                matching_count = mask.sum()
+                
+                if matching_count == 0:
+                    return (
+                        "**No experts match the filter criteria.** Try adjusting your filters.",
+                        None,
+                        {"error": "No matching experts"},
+                    )
+                
+                # Create masked heatmap - preserve original color scale
+                masked_ranks = np.where(mask, summed_ranks, np.nan)
+                
+                # Get original data range for consistent color scaling
+                original_vmin = float(summed_ranks.min())
+                original_vmax = float(summed_ranks.max())
+                
+                width = 14
+                height = max(4, min(8, num_layers * 0.1))
+                fig, ax = plt.subplots(figsize=(width, height))
+                
+                im = ax.imshow(
+                    masked_ranks,
+                    aspect="auto",
+                    cmap="RdYlGn_r",
+                    interpolation="nearest",
+                    vmin=original_vmin,
+                    vmax=original_vmax,
+                )
+                
+                ax.set_xlabel("Expert Index")
+                ax.set_ylabel("MoE Layer Index")
+                title = f"Filtered Summed Ranks - {metric}"
+                if filter_desc:
+                    title += f" ({', '.join(filter_desc)})"
+                ax.set_title(title)
+                fig.colorbar(im, ax=ax, label="Summed Rank (Lower = More Important)")
+                fig.tight_layout()
+                
+                # Compute filtered statistics
+                filtered_ranks = summed_ranks[mask]
+                stats = {
+                    "filter_criteria": {
+                        "min_rank": min_rank,
+                        "max_rank": max_rank,
+                        "top_n_per_layer": top_n,
+                    },
+                    "filter_mode": "per_layer" if (top_n is not None and top_n > 0) else "threshold",
+                    "matching_experts": int(matching_count),
+                    "total_experts": int(total_experts),
+                    "experts_per_layer": num_experts,
+                    "num_layers": num_layers,
+                    "percentage": f"{100 * matching_count / total_experts:.1f}%",
+                    "filtered_rank_min": float(filtered_ranks.min()),
+                    "filtered_rank_max": float(filtered_ranks.max()),
+                    "filtered_rank_mean": float(filtered_ranks.mean()),
+                    "filtered_rank_std": float(filtered_ranks.std()),
+                    "top_10_most_important": [],
+                    "prune_candidates": prune_candidates[:20] if prune_candidates else [],  # Top 20 candidates for pruning
+                }
+                
+                # Get top 10 most important from filtered results (experts to KEEP)
+                filtered_flat_indices = np.where(mask.ravel())[0]
+                filtered_ranks_flat = summed_ranks.ravel()[filtered_flat_indices]
+                sorted_filtered = np.argsort(filtered_ranks_flat)[:10]
+                
+                for idx in sorted_filtered:
+                    orig_idx = filtered_flat_indices[idx]
+                    layer_idx, expert_idx = np.unravel_index(orig_idx, summed_ranks.shape)
+                    stats["top_10_most_important"].append({
+                        "layer": int(layer_idx),
+                        "expert": int(expert_idx),
+                        "rank_sum": float(summed_ranks[layer_idx, expert_idx]),
+                    })
+                
+                # Format info text
+                info = (
+                    f"**Filtered Results**\n\n"
+                    f"**Filters applied:** {', '.join(filter_desc) if filter_desc else 'None'}\n"
+                    f"**Matching experts:** {matching_count} / {total_experts} ({100 * matching_count / total_experts:.1f}%)\n\n"
+                )
+                
+                # Add per-layer pruning info if applicable
+                if top_n is not None and top_n > 0 and prune_candidates:
+                    info += (
+                        f"**Per-Layer Pruning Mode:**\n"
+                        f"- Pruning {int(top_n)} experts per layer\n"
+                        f"- Total prune candidates: {len(prune_candidates)}\n"
+                        f"- Showing {matching_count} experts to **KEEP**\n\n"
+                    )
+                
+                info += (
+                    f"**Filtered Statistics:**\n"
+                    f"- Rank sum range: [{filtered_ranks.min():.0f}, {filtered_ranks.max():.0f}]\n"
+                    f"- Mean rank sum: {filtered_ranks.mean():.1f}\n"
+                    f"- Std dev: {filtered_ranks.std():.1f}\n\n"
+                    f"**Top 5 Most Important (in filtered set):**\n"
+                )
+                for i, exp in enumerate(stats["top_10_most_important"][:5], 1):
+                    info += f"  {i}. Layer {exp['layer']}, Expert {exp['expert']}: rank sum = {exp['rank_sum']:.0f}\n"
+                
+                # Show top prune candidates if applicable
+                if prune_candidates:
+                    # Sort by rank sum descending (highest = least important = first to prune)
+                    sorted_candidates = sorted(prune_candidates, key=lambda x: x["rank_sum"], reverse=True)
+                    info += f"\n**Top 5 Prune Candidates (highest rank sum):**\n"
+                    for i, exp in enumerate(sorted_candidates[:5], 1):
+                        info += f"  {i}. Layer {exp['layer']}, Expert {exp['expert']}: rank sum = {exp['rank_sum']:.0f}\n"
+                
+                return info, fig, stats
+            
+            apply_filters_btn.click(
+                apply_filters,
+                inputs=[merge_state, rank_min_filter, rank_max_filter, top_n_filter],
+                outputs=[filter_info_md, merge_plot, merge_json],
+            )
+            
+            def reset_filters(merge_data):
+                """Reset filters and show original merged data."""
+                if merge_data is None:
+                    return (
+                        "**No data to reset.** Please merge files first.",
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                
+                summed_ranks = np.array(merge_data["summed_ranks"])
+                num_layers = merge_data["num_layers"]
+                num_experts = merge_data["num_experts"]
+                metric = merge_data["metric"]
+                
+                # Create original heatmap
+                width = 14
+                height = max(4, min(8, num_layers * 0.1))
+                fig, ax = plt.subplots(figsize=(width, height))
+                
+                im = ax.imshow(
+                    summed_ranks,
+                    aspect="auto",
+                    cmap="RdYlGn_r",
+                    interpolation="nearest",
+                )
+                
+                ax.set_xlabel("Expert Index")
+                ax.set_ylabel("MoE Layer Index")
+                ax.set_title(f"Summed Ranks - {metric} (Lower = More Important)")
+                fig.colorbar(im, ax=ax, label="Summed Rank (Lower = More Important)")
+                fig.tight_layout()
+                
+                # Compute original statistics
+                stats = {
+                    "num_files": len(merge_data["files"]),
+                    "metric": merge_data["metric_key"],
+                    "num_layers": num_layers,
+                    "num_experts": num_experts,
+                    "total_experts": num_layers * num_experts,
+                    "rank_sum_min": float(summed_ranks.min()),
+                    "rank_sum_max": float(summed_ranks.max()),
+                    "rank_sum_mean": float(summed_ranks.mean()),
+                    "rank_sum_std": float(summed_ranks.std()),
+                }
+                
+                info = (
+                    f"**Filters reset. Showing all {num_layers * num_experts} experts.**\n\n"
+                    f"**Metric:** {metric}\n"
+                    f"**Dimensions:** {num_layers} layers × {num_experts} experts\n\n"
+                    f"**Statistics:**\n"
+                    f"- Rank sum range: [{summed_ranks.min():.0f}, {summed_ranks.max():.0f}]\n"
+                    f"- Mean rank sum: {summed_ranks.mean():.1f}\n"
+                    f"- Std dev: {summed_ranks.std():.1f}\n"
+                )
+                
+                return info, fig, stats, None, None, None
+            
+            reset_filters_btn.click(
+                reset_filters,
+                inputs=[merge_state],
+                outputs=[filter_info_md, merge_plot, merge_json, rank_min_filter, rank_max_filter, top_n_filter],
+            )
+            
+            def export_filtered_results(merge_data, min_rank, max_rank, top_n):
+                """Export filtered expert list to CSV file.
+                
+                Exports experts to KEEP (not prune) based on per-layer filtering.
+                Also exports a separate file with prune candidates.
+                """
+                if merge_data is None:
+                    return None
+                
+                summed_ranks = np.array(merge_data["summed_ranks"])
+                num_layers = merge_data["num_layers"]
+                num_experts = merge_data["num_experts"]
+                
+                # Create mask for filtering (same logic as apply_filters)
+                mask = np.ones_like(summed_ranks, dtype=bool)
+                prune_candidates = []
+                
+                if min_rank is not None and min_rank > 0:
+                    mask &= summed_ranks >= min_rank
+                if max_rank is not None and max_rank > 0:
+                    mask &= summed_ranks <= max_rank
+                
+                # Per-layer pruning (same as apply_filters)
+                if top_n is not None and top_n > 0:
+                    n_to_prune_per_layer = int(top_n)
+                    if n_to_prune_per_layer < num_experts:
+                        for layer_idx in range(num_layers):
+                            layer_ranks = summed_ranks[layer_idx]
+                            prune_indices = np.argpartition(layer_ranks, -n_to_prune_per_layer)[-n_to_prune_per_layer:]
+                            mask[layer_idx, prune_indices] = False
+                            for expert_idx in prune_indices:
+                                prune_candidates.append({
+                                    "layer": int(layer_idx),
+                                    "expert": int(expert_idx),
+                                    "rank_sum": float(layer_ranks[expert_idx]),
+                                    "action": "prune",
+                                })
+                
+                # Collect experts to KEEP
+                keep_experts = []
+                for layer_idx in range(num_layers):
+                    for expert_idx in range(num_experts):
+                        if mask[layer_idx, expert_idx]:
+                            keep_experts.append({
+                                "layer": layer_idx,
+                                "expert": expert_idx,
+                                "rank_sum": float(summed_ranks[layer_idx, expert_idx]),
+                                "action": "keep",
+                            })
+                
+                # Sort by rank sum (most important first)
+                keep_experts.sort(key=lambda x: x["rank_sum"])
+                prune_candidates.sort(key=lambda x: x["rank_sum"], reverse=True)
+                
+                # Create CSV with all experts and their action
+                all_experts = keep_experts + prune_candidates
+                output = io.StringIO()
+                writer = csv.DictWriter(output, fieldnames=["layer", "expert", "rank_sum", "action"])
+                writer.writeheader()
+                writer.writerows(all_experts)
+                
+                # Save to file
+                csv_path = "filtered_experts.csv"
+                with open(csv_path, "w", newline="") as f:
+                    f.write(output.getvalue())
+                
+                return csv_path
+            
+            export_btn.click(
+                export_filtered_results,
+                inputs=[merge_state, rank_min_filter, rank_max_filter, top_n_filter],
+                outputs=[export_file],
             )
 
         # -------------------------------------------------------------------
@@ -824,20 +1369,41 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 "Visualize differences between two collected saliency files. "
                 "Red areas indicate file1 has higher activation, blue indicates file2 has higher activation."
             )
+            
+            # Get available .npz files from data directory
+            data_files_diff = get_data_directory_files()
 
+            # File 1 with Clear and Browse buttons
             with gr.Row():
                 file1_input = gr.Textbox(
                     label="File 1 Path (.npz)",
-                    placeholder="data/reap_saliency_agent_minimax_m25.npz",
-                    scale=1,
+                    placeholder="data/1.npz",
+                    scale=3,
                     elem_id="diff_file1",
                 )
+                file1_dropdown = gr.Dropdown(
+                    choices=data_files_diff,
+                    label="Browse data/",
+                    scale=2,
+                    interactive=True,
+                )
+                file1_clear = gr.Button("Clear", scale=1, variant="secondary")
+
+            # File 2 with Clear and Browse buttons
+            with gr.Row():
                 file2_input = gr.Textbox(
                     label="File 2 Path (.npz)",
-                    placeholder="data/reap_saliency_solidity_functions_minimax_m25.npz",
-                    scale=1,
+                    placeholder="data/2.npz",
+                    scale=3,
                     elem_id="diff_file2",
                 )
+                file2_dropdown = gr.Dropdown(
+                    choices=data_files_diff,
+                    label="Browse data/",
+                    scale=2,
+                    interactive=True,
+                )
+                file2_clear = gr.Button("Clear", scale=1, variant="secondary")
 
             with gr.Row():
                 metric_choice_diff = gr.Radio(
@@ -846,6 +1412,18 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                     label="Metric to Compare",
                 )
                 compare_btn = gr.Button("Compare Files", variant="primary")
+            
+            # Wire up dropdowns to textboxes
+            file1_dropdown.change(
+                lambda x: x, inputs=[file1_dropdown], outputs=[file1_input]
+            )
+            file2_dropdown.change(
+                lambda x: x, inputs=[file2_dropdown], outputs=[file2_input]
+            )
+            
+            # Wire up clear buttons
+            file1_clear.click(lambda: "", outputs=[file1_input])
+            file2_clear.click(lambda: "", outputs=[file2_input])
 
             with gr.Row():
                 diff_info_md = gr.Markdown("Select files and click **Compare Files** to see differences.")

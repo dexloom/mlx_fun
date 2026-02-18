@@ -849,10 +849,30 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
             
             # Dynamic Filters Section
             gr.Markdown("---")
+            gr.Markdown("#### Selection Mode")
+            gr.Markdown(
+                "Choose how to select experts for pruning/merging. "
+                "**Per-Layer**: Select N experts from each layer independently. "
+                "**Model-Wide**: Select N experts globally across all layers."
+            )
+            
+            with gr.Row():
+                selection_mode = gr.Radio(
+                    ["Per-Layer", "Model-Wide"],
+                    value="Per-Layer",
+                    label="Selection Mode",
+                )
+                action_mode = gr.Radio(
+                    ["Analyze", "Prune", "Merge"],
+                    value="Analyze",
+                    label="Action Mode",
+                )
+            
+            gr.Markdown("---")
             gr.Markdown("#### Dynamic Filters")
             gr.Markdown(
                 "Filter experts by rank sum thresholds. Lower rank sum = more important expert. "
-                "Use Top N to show only the N most important experts."
+                "Use N to Prune to select experts for removal."
             )
             
             with gr.Row():
@@ -868,8 +888,8 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                     precision=0,
                     elem_id="rank_max_filter",
                 )
-                top_n_filter = gr.Number(
-                    label="N to Prune Per Layer (hides N least important per layer)",
+                n_prune_filter = gr.Number(
+                    label="N to Prune (per-layer or total based on mode)",
                     value=None,
                     precision=0,
                     elem_id="top_n_filter",
@@ -1044,13 +1064,17 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 outputs=[filter_info_md, merge_plot, merge_json, merge_state],
             )
             
-            def apply_filters(merge_data, min_rank, max_rank, top_n):
+            def apply_filters(merge_data, min_rank, max_rank, n_prune, selection_mode, action_mode):
                 """Apply filters to merged data and update visualization.
                 
-                The Top N filter works PER-LAYER (matching the pruning algorithm):
-                - For each layer, identifies the N experts with LOWEST rank sum (most important)
-                - These are the experts to KEEP when pruning N experts per layer
-                - Experts NOT in this mask are candidates for PRUNING
+                Supports two selection modes:
+                - Per-Layer: Select N experts from each layer independently
+                - Model-Wide: Select N experts globally across all layers
+                
+                Action modes:
+                - Analyze: Just visualize the selection
+                - Prune: Show what would be removed (for CLI prune command)
+                - Merge: Show what would be merged (for CLI merge command)
                 """
                 if merge_data is None:
                     return (
@@ -1068,7 +1092,7 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 # Create mask for filtering (start with all visible)
                 mask = np.ones_like(summed_ranks, dtype=bool)
                 filter_desc = []
-                prune_candidates = []  # Track which experts would be pruned
+                prune_candidates = []  # Track which experts would be pruned/merged
                 
                 # Apply min rank filter
                 if min_rank is not None and min_rank > 0:
@@ -1080,28 +1104,43 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                     mask &= summed_ranks <= max_rank
                     filter_desc.append(f"rank <= {max_rank}")
                 
-                # Apply top N PER-LAYER filter (matching pruning algorithm)
-                # Lower rank sum = more important = should be KEPT
-                # So we mask out (hide) the experts that would be PRUNED
-                if top_n is not None and top_n > 0:
-                    n_to_prune_per_layer = int(top_n)
-                    if n_to_prune_per_layer < num_experts:
-                        # For each layer, find the N experts with HIGHEST rank sum (least important)
-                        # These are the ones that would be pruned
-                        for layer_idx in range(num_layers):
-                            layer_ranks = summed_ranks[layer_idx]
-                            # Find indices of N highest rank sums (least important) in this layer
-                            prune_indices = np.argpartition(layer_ranks, -n_to_prune_per_layer)[-n_to_prune_per_layer:]
-                            # Mask out these experts (they would be pruned)
-                            mask[layer_idx, prune_indices] = False
-                            # Track prune candidates
-                            for expert_idx in prune_indices:
-                                prune_candidates.append({
-                                    "layer": int(layer_idx),
-                                    "expert": int(expert_idx),
-                                    "rank_sum": float(layer_ranks[expert_idx]),
-                                })
-                        filter_desc.append(f"prune {n_to_prune_per_layer}/layer (showing keep)")
+                # Apply N to prune based on selection mode
+                if n_prune is not None and n_prune > 0:
+                    if selection_mode == "Model-Wide":
+                        # Model-wide: Select N expert INDICES (columns) globally
+                        # These columns are pruned from ALL layers
+                        n_to_prune_total = int(n_prune)
+                        if n_to_prune_total < num_experts:
+                            # Compute column-wise scores by summing across all layers
+                            column_scores = summed_ranks.sum(axis=0)
+                            # Find N columns with highest scores (least important)
+                            prune_column_indices = np.argpartition(column_scores, -n_to_prune_total)[-n_to_prune_total:]
+                            
+                            # Mask out these columns from ALL layers
+                            for expert_idx in prune_column_indices:
+                                mask[:, expert_idx] = False
+                                for layer_idx in range(num_layers):
+                                    prune_candidates.append({
+                                        "layer": int(layer_idx),
+                                        "expert": int(expert_idx),
+                                        "rank_sum": float(summed_ranks[layer_idx, expert_idx]),
+                                    })
+                            filter_desc.append(f"model-wide prune {n_to_prune_total} columns")
+                    else:
+                        # Per-layer: Select N experts from each layer
+                        n_to_prune_per_layer = int(n_prune)
+                        if n_to_prune_per_layer < num_experts:
+                            for layer_idx in range(num_layers):
+                                layer_ranks = summed_ranks[layer_idx]
+                                prune_indices = np.argpartition(layer_ranks, -n_to_prune_per_layer)[-n_to_prune_per_layer:]
+                                mask[layer_idx, prune_indices] = False
+                                for expert_idx in prune_indices:
+                                    prune_candidates.append({
+                                        "layer": int(layer_idx),
+                                        "expert": int(expert_idx),
+                                        "rank_sum": float(layer_ranks[expert_idx]),
+                                    })
+                            filter_desc.append(f"per-layer prune {n_to_prune_per_layer}")
                 
                 # Count matching experts
                 matching_count = mask.sum()
@@ -1133,6 +1172,9 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                     vmax=original_vmax,
                 )
                 
+                # Pruned/merged experts are shown as white space (NaN values in masked_ranks)
+                # No markers needed - the gap in the heatmap indicates removed experts
+                
                 ax.set_xlabel("Expert Index")
                 ax.set_ylabel("MoE Layer Index")
                 title = f"Filtered Summed Ranks - {metric}"
@@ -1142,15 +1184,23 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 fig.colorbar(im, ax=ax, label="Summed Rank (Lower = More Important)")
                 fig.tight_layout()
                 
+                # Compute per-layer distribution for model-wide mode
+                per_layer_distribution = {}
+                if selection_mode == "Model-Wide" and prune_candidates:
+                    for c in prune_candidates:
+                        layer = c["layer"]
+                        per_layer_distribution[str(layer)] = per_layer_distribution.get(str(layer), 0) + 1
+                
                 # Compute filtered statistics
                 filtered_ranks = summed_ranks[mask]
                 stats = {
                     "filter_criteria": {
                         "min_rank": min_rank,
                         "max_rank": max_rank,
-                        "top_n_per_layer": top_n,
+                        "n_prune": n_prune,
                     },
-                    "filter_mode": "per_layer" if (top_n is not None and top_n > 0) else "threshold",
+                    "selection_mode": selection_mode.lower().replace("-", "_"),
+                    "action_mode": action_mode.lower(),
                     "matching_experts": int(matching_count),
                     "total_experts": int(total_experts),
                     "experts_per_layer": num_experts,
@@ -1161,7 +1211,8 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                     "filtered_rank_mean": float(filtered_ranks.mean()),
                     "filtered_rank_std": float(filtered_ranks.std()),
                     "top_10_most_important": [],
-                    "prune_candidates": prune_candidates[:20] if prune_candidates else [],  # Top 20 candidates for pruning
+                    "prune_candidates": prune_candidates[:20] if prune_candidates else [],
+                    "per_layer_distribution": per_layer_distribution if per_layer_distribution else None,
                 }
                 
                 # Get top 10 most important from filtered results (experts to KEEP)
@@ -1179,20 +1230,36 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                     })
                 
                 # Format info text
+                action_verb = "merged" if action_mode == "Merge" else "pruned"
                 info = (
-                    f"**Filtered Results**\n\n"
+                    f"**Filtered Results ({action_mode} Mode)**\n\n"
+                    f"**Selection Mode:** {selection_mode}\n"
+                    f"**Action:** {action_mode}\n"
                     f"**Filters applied:** {', '.join(filter_desc) if filter_desc else 'None'}\n"
                     f"**Matching experts:** {matching_count} / {total_experts} ({100 * matching_count / total_experts:.1f}%)\n\n"
                 )
                 
-                # Add per-layer pruning info if applicable
-                if top_n is not None and top_n > 0 and prune_candidates:
-                    info += (
-                        f"**Per-Layer Pruning Mode:**\n"
-                        f"- Pruning {int(top_n)} experts per layer\n"
-                        f"- Total prune candidates: {len(prune_candidates)}\n"
-                        f"- Showing {matching_count} experts to **KEEP**\n\n"
-                    )
+                # Add mode-specific info
+                if n_prune is not None and n_prune > 0 and prune_candidates:
+                    if selection_mode == "Model-Wide":
+                        info += (
+                            f"**Model-Wide Selection:**\n"
+                            f"- Total experts to {action_verb}: {len(prune_candidates)}\n"
+                            f"- Showing {matching_count} experts to **KEEP**\n"
+                        )
+                        if per_layer_distribution:
+                            dist_str = ", ".join(f"L{k}:{v}" for k, v in sorted(per_layer_distribution.items())[:10])
+                            if len(per_layer_distribution) > 10:
+                                dist_str += "..."
+                            info += f"- Per-layer distribution: {dist_str}\n"
+                        info += "\n"
+                    else:
+                        info += (
+                            f"**Per-Layer Selection:**\n"
+                            f"- Experts to {action_verb} per layer: {int(n_prune)}\n"
+                            f"- Total {action_verb} candidates: {len(prune_candidates)}\n"
+                            f"- Showing {matching_count} experts to **KEEP**\n\n"
+                        )
                 
                 info += (
                     f"**Filtered Statistics:**\n"
@@ -1204,19 +1271,36 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 for i, exp in enumerate(stats["top_10_most_important"][:5], 1):
                     info += f"  {i}. Layer {exp['layer']}, Expert {exp['expert']}: rank sum = {exp['rank_sum']:.0f}\n"
                 
-                # Show top prune candidates if applicable
+                # Show top prune/merge candidates if applicable
                 if prune_candidates:
-                    # Sort by rank sum descending (highest = least important = first to prune)
                     sorted_candidates = sorted(prune_candidates, key=lambda x: x["rank_sum"], reverse=True)
-                    info += f"\n**Top 5 Prune Candidates (highest rank sum):**\n"
+                    info += f"\n**Top 5 {action_mode} Candidates (highest rank sum):**\n"
                     for i, exp in enumerate(sorted_candidates[:5], 1):
                         info += f"  {i}. Layer {exp['layer']}, Expert {exp['expert']}: rank sum = {exp['rank_sum']:.0f}\n"
+                
+                # Add CLI command hint
+                if n_prune is not None and n_prune > 0:
+                    model_wide_flag = "--model-wide " if selection_mode == "Model-Wide" else ""
+                    if action_mode == "Prune":
+                        info += (
+                            f"\n**CLI Command:**\n"
+                            f"```bash\n"
+                            f"mlx-fun prune --model ./model --saliency merged.npz {model_wide_flag}--n-prune {int(n_prune)} --output ./pruned\n"
+                            f"```\n"
+                        )
+                    elif action_mode == "Merge":
+                        info += (
+                            f"\n**CLI Command:**\n"
+                            f"```bash\n"
+                            f"mlx-fun merge --model ./model --saliency merged.npz --dataset calib.jsonl {model_wide_flag}--n-prune {int(n_prune)} --output ./merged\n"
+                            f"```\n"
+                        )
                 
                 return info, fig, stats
             
             apply_filters_btn.click(
                 apply_filters,
-                inputs=[merge_state, rank_min_filter, rank_max_filter, top_n_filter],
+                inputs=[merge_state, rank_min_filter, rank_max_filter, n_prune_filter, selection_mode, action_mode],
                 outputs=[filter_info_md, merge_plot, merge_json],
             )
             
@@ -1283,14 +1367,14 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
             reset_filters_btn.click(
                 reset_filters,
                 inputs=[merge_state],
-                outputs=[filter_info_md, merge_plot, merge_json, rank_min_filter, rank_max_filter, top_n_filter],
+                outputs=[filter_info_md, merge_plot, merge_json, rank_min_filter, rank_max_filter, n_prune_filter],
             )
             
-            def export_filtered_results(merge_data, min_rank, max_rank, top_n):
+            def export_filtered_results(merge_data, min_rank, max_rank, n_prune, selection_mode, action_mode):
                 """Export filtered expert list to CSV file.
                 
-                Exports experts to KEEP (not prune) based on per-layer filtering.
-                Also exports a separate file with prune candidates.
+                Exports experts to KEEP (not prune/merge) based on filtering.
+                Also exports a separate file with prune/merge candidates.
                 """
                 if merge_data is None:
                     return None
@@ -1298,6 +1382,7 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 summed_ranks = np.array(merge_data["summed_ranks"])
                 num_layers = merge_data["num_layers"]
                 num_experts = merge_data["num_experts"]
+                total_experts = num_layers * num_experts
                 
                 # Create mask for filtering (same logic as apply_filters)
                 mask = np.ones_like(summed_ranks, dtype=bool)
@@ -1308,21 +1393,40 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 if max_rank is not None and max_rank > 0:
                     mask &= summed_ranks <= max_rank
                 
-                # Per-layer pruning (same as apply_filters)
-                if top_n is not None and top_n > 0:
-                    n_to_prune_per_layer = int(top_n)
-                    if n_to_prune_per_layer < num_experts:
-                        for layer_idx in range(num_layers):
-                            layer_ranks = summed_ranks[layer_idx]
-                            prune_indices = np.argpartition(layer_ranks, -n_to_prune_per_layer)[-n_to_prune_per_layer:]
-                            mask[layer_idx, prune_indices] = False
-                            for expert_idx in prune_indices:
-                                prune_candidates.append({
-                                    "layer": int(layer_idx),
-                                    "expert": int(expert_idx),
-                                    "rank_sum": float(layer_ranks[expert_idx]),
-                                    "action": "prune",
-                                })
+                # Apply N to prune based on selection mode
+                if n_prune is not None and n_prune > 0:
+                    if selection_mode == "Model-Wide":
+                        # Model-wide: Select N expert INDICES (columns) globally
+                        n_to_prune_total = int(n_prune)
+                        if n_to_prune_total < num_experts:
+                            # Compute column-wise scores by summing across all layers
+                            column_scores = summed_ranks.sum(axis=0)
+                            # Find N columns with highest scores (least important)
+                            prune_column_indices = np.argpartition(column_scores, -n_to_prune_total)[-n_to_prune_total:]
+                            # Mask out these columns from ALL layers
+                            for expert_idx in prune_column_indices:
+                                mask[:, expert_idx] = False
+                                for layer_idx in range(num_layers):
+                                    prune_candidates.append({
+                                        "layer": int(layer_idx),
+                                        "expert": int(expert_idx),
+                                        "rank_sum": float(summed_ranks[layer_idx, expert_idx]),
+                                        "action": action_mode.lower(),
+                                    })
+                    else:
+                        n_to_prune_per_layer = int(n_prune)
+                        if n_to_prune_per_layer < num_experts:
+                            for layer_idx in range(num_layers):
+                                layer_ranks = summed_ranks[layer_idx]
+                                prune_indices = np.argpartition(layer_ranks, -n_to_prune_per_layer)[-n_to_prune_per_layer:]
+                                mask[layer_idx, prune_indices] = False
+                                for expert_idx in prune_indices:
+                                    prune_candidates.append({
+                                        "layer": int(layer_idx),
+                                        "expert": int(expert_idx),
+                                        "rank_sum": float(layer_ranks[expert_idx]),
+                                        "action": action_mode.lower(),
+                                    })
                 
                 # Collect experts to KEEP
                 keep_experts = []
@@ -1356,7 +1460,7 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
             
             export_btn.click(
                 export_filtered_results,
-                inputs=[merge_state, rank_min_filter, rank_max_filter, top_n_filter],
+                inputs=[merge_state, rank_min_filter, rank_max_filter, n_prune_filter, selection_mode, action_mode],
                 outputs=[export_file],
             )
 

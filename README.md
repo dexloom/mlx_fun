@@ -82,6 +82,41 @@ Given 160 experts and `--n-prune 40`:
 
 This can help preserve routing diversity compared to simply chopping the tail.
 
+### Selection Modes: Per-Layer vs Model-Wide
+
+By default, pruning and merging select N experts **per layer** independently. The `--model-wide` flag changes this to select N expert **indices** (columns) that are removed from **all layers**.
+
+| Mode | Flag | Behavior |
+|---|---|---|
+| Per-Layer | (default) | Remove N experts from each layer. Total removed = N × num_layers. |
+| Model-Wide | `--model-wide` | Remove N expert indices from ALL layers. Same columns removed everywhere. |
+
+**How model-wide selection works:**
+
+1. Sum saliency scores for each expert index across all layers (column-wise sum)
+2. Select the N expert indices with lowest total saliency (least important globally)
+3. Remove those expert indices from every layer in the model
+
+This results in entire "columns" being blanked out in the expert heatmap visualization.
+
+**When to use model-wide:**
+
+- When you want consistent expert removal across all layers
+- When certain expert indices are consistently less important across the model
+- When you want simpler model structure (same experts kept in each layer)
+
+**Example:**
+
+```bash
+# Per-layer: removes 16 experts from each of 40 layers = 640 total
+mlx-fun prune --model ./model --saliency stats.npz --n-prune 16 --output ./pruned
+
+# Model-wide: removes 40 expert indices from ALL layers
+mlx-fun prune --model ./model --saliency stats.npz --n-prune 40 --model-wide --output ./pruned
+```
+
+The model-wide mode uses the `--min-experts-per-layer` option (default: 1) to ensure no layer loses all its experts.
+
 ### REAM: Expert Merging
 
 REAM is an alternative to pruning that **merges** experts instead of removing them. While pruning discards low-saliency experts entirely, REAM preserves knowledge from all experts by folding them into fewer, higher-quality centroids.
@@ -261,9 +296,11 @@ mlx-fun prune \
 | `--model` | *(required)* | Same model used for collection |
 | `--saliency` | *(required)* | Path to `.npz` from collect step |
 | `--output` | *(required)* | Output directory for pruned model |
-| `--n-prune` | *(required)* | Number of experts to remove per layer |
+| `--n-prune` | *(required)* | Number of experts to remove (per layer or total with `--model-wide`) |
 | `--metric` | `reap` | Saliency metric: `reap`, `ean`, `freq`, `weighted_freq` |
 | `--strategy` | `bottom` | Pruning strategy: `bottom` (remove lowest) or `strided` (distribute evenly) |
+| `--model-wide` | `false` | Select N experts globally across all layers instead of per-layer |
+| `--min-experts-per-layer` | `1` | Minimum experts to keep per layer when using `--model-wide` |
 | `--safety-map` | *(none)* | Path to `safety_report.json` from `safety-scan` |
 | `--safety-mode` | *(none)* | `protect` (never prune safety experts) or `target` (specifically prune them) |
 | `--domain-map` | *(none)* | Path to `domain_report.json` from `domain-scan` |
@@ -330,8 +367,10 @@ mlx-fun merge \
 | `--saliency` | *(required)* | Path to `.npz` from collect step |
 | `--dataset` | *(required)* | Calibration data for similarity/alignment computation |
 | `--output` | *(required)* | Output directory for merged model |
-| `--n-prune` | *(required)* | Number of experts to prune (merge reduces by this many per layer) |
+| `--n-prune` | *(required)* | Number of experts to prune (per layer or total with `--model-wide`) |
 | `--metric` | `reap` | Saliency metric: `reap`, `ean`, `freq`, `weighted_freq` |
+| `--model-wide` | `false` | Select N experts globally across all layers instead of per-layer |
+| `--min-experts-per-layer` | `1` | Minimum experts to keep per layer when using `--model-wide` |
 | `--similarity-mode` | `gated` | Expert similarity: `gated` (gate_logit * output cosine sim) or `average` (mean of output sim + gate logit sim) |
 | `--alignment` | `greedy` | Neuron alignment: `greedy` (fast, O(n^2)), `hungarian` (optimal, requires scipy), or `none` (skip alignment) |
 | `--max-group-size` | `16` | Maximum experts per merge group (the C parameter from the REAM paper) |

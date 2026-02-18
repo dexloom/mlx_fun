@@ -682,3 +682,129 @@ def merge_model(
     config[adapter.config_expert_count_key()] = n_keep
 
     return config, centroid_map, group_map
+
+
+def merge_model_with_keep_map(
+    model,
+    adapter: BaseAdapter,
+    keep_map: Dict[int, np.ndarray],
+    saliency_scores: np.ndarray,
+    calibration_samples: list,
+    similarity_mode: str = "gated",
+    alignment_method: str = "greedy",
+    max_group_size: int = 16,
+    max_similarity_tokens: int = 512,
+    max_alignment_tokens: int = 256,
+    progress_callback=None,
+) -> Tuple[dict, Dict[int, np.ndarray], Dict[int, Dict[int, List[int]]]]:
+    """REAM merge pipeline with per-layer expert counts from keep_map.
+
+    This variant supports model-wide pruning where each layer may have
+    a different number of experts to keep.
+
+    Args:
+        model: The MLX model.
+        adapter: Model adapter.
+        keep_map: Dict mapping accumulator layer_idx -> array of expert indices to keep.
+        saliency_scores: (num_layers, num_experts) from SaliencyAccumulator.
+        calibration_samples: List[mx.array] tokenized samples.
+        similarity_mode: "gated" or "average".
+        alignment_method: "greedy", "hungarian", or "none".
+        max_group_size: Maximum experts per merge group (C).
+        max_similarity_tokens: Max tokens for similarity computation.
+        max_alignment_tokens: Max tokens for alignment computation.
+        progress_callback: Optional callable(layer_num, total_layers) for progress.
+
+    Returns:
+        (updated_config, centroid_map, group_map) tuple.
+    """
+    moe_indices = adapter.moe_layer_indices()
+    n_experts = adapter.num_routed_experts()
+    top_k = adapter.num_experts_per_tok()
+    model_type = adapter.config.get("model_type", "")
+
+    # Validate keep_map
+    for acc_idx in range(len(moe_indices)):
+        n_keep_layer = len(keep_map[acc_idx])
+        if n_keep_layer < top_k:
+            raise ValueError(
+                f"Layer {acc_idx}: n_keep={n_keep_layer} must be >= top_k={top_k}."
+            )
+
+    centroid_map: Dict[int, np.ndarray] = {}
+    group_map: Dict[int, Dict[int, List[int]]] = {}
+
+    for acc_idx, layer_idx in enumerate(moe_indices):
+        if progress_callback:
+            progress_callback(acc_idx, len(moe_indices))
+
+        layer_saliency = saliency_scores[acc_idx]
+        n_keep_layer = len(keep_map[acc_idx])
+
+        # Skip layers where all experts are kept (no merging needed)
+        if n_keep_layer >= n_experts:
+            centroid_map[layer_idx] = np.arange(n_experts)
+            group_map[layer_idx] = {i: [i] for i in range(n_experts)}
+            continue
+
+        # --- Step 1: Forward calibration data and capture layer input + gate logits ---
+        moe_block = adapter.get_moe_block(layer_idx)
+        install_ream_hooks([moe_block], model_type)
+
+        for sample in calibration_samples:
+            tokens = sample.reshape(1, -1)
+            model(tokens)
+            mx.eval(model.parameters())
+
+        captures = collect_ream_data([moe_block])
+        remove_ream_hooks([moe_block])
+
+        # Concatenate all captured inputs and gate logits
+        all_inputs = []
+        all_gates = []
+        for inp, gates in captures[0]:
+            # Flatten batch and seq dims
+            flat_inp = inp.reshape(-1, inp.shape[-1])
+            flat_gates = gates.reshape(-1, gates.shape[-1])
+            all_inputs.append(flat_inp)
+            all_gates.append(flat_gates)
+
+        layer_input_np = np.concatenate(all_inputs, axis=0)
+        gate_logits_np = np.concatenate(all_gates, axis=0)
+
+        # --- Step 2: Compute similarity matrix ---
+        similarity = compute_similarity_matrix(
+            adapter.get_switch_mlp(moe_block),
+            layer_input_np,
+            gate_logits_np,
+            n_experts,
+            mode=similarity_mode,
+            max_tokens=max_similarity_tokens,
+        )
+
+        # --- Step 3: Select centroids and form groups ---
+        # Use the keep_map to determine which experts are centroids
+        centroids = keep_map[acc_idx].copy()
+        groups = group_experts(
+            layer_saliency, centroids, similarity, max_group_size,
+        )
+
+        centroid_map[layer_idx] = centroids
+        group_map[layer_idx] = {int(c): members for c, members in groups.items()}
+
+        # --- Step 4: Merge ---
+        layer_input_mx = mx.array(layer_input_np)
+        merge_moe_layer(
+            adapter, layer_idx, centroids, groups, layer_saliency,
+            layer_input_mx, alignment_method, max_alignment_tokens,
+        )
+
+    # Determine the most common n_keep for config (or use max)
+    n_keep_values = [len(keep_map[i]) for i in range(len(moe_indices))]
+    n_keep_config = max(set(n_keep_values), key=n_keep_values.count)
+
+    # Update config
+    config = adapter.config.copy()
+    config[adapter.config_expert_count_key()] = n_keep_config
+
+    return config, centroid_map, group_map

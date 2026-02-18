@@ -102,6 +102,89 @@ def select_experts_to_keep(
     return keep_map
 
 
+def select_experts_to_keep_model_wide(
+    scores: np.ndarray,
+    n_prune_total: int,
+    protected_experts: Dict[int, np.ndarray] = None,
+    targeted_experts: Dict[int, np.ndarray] = None,
+    min_experts_per_layer: int = 1,
+) -> Dict[int, np.ndarray]:
+    """Select experts to keep using model-wide column selection.
+
+    Instead of pruning N experts per layer, this selects N expert INDICES
+    (columns) globally based on lowest total saliency across all layers.
+    The selected expert indices are then pruned from ALL layers.
+
+    This means if expert 5 is selected for pruning, it gets removed from
+    every layer in the model.
+
+    Args:
+        scores: (num_layers, num_experts) saliency scores. Higher = more important.
+        n_prune_total: Number of expert indices to prune globally (removed from all layers).
+        protected_experts: Optional dict mapping layer_idx -> expert IDs to never prune.
+        targeted_experts: Optional dict mapping layer_idx -> expert IDs to always prune.
+        min_experts_per_layer: Minimum experts to keep in each layer (default 1).
+
+    Returns:
+        Dict mapping layer_index -> numpy array of kept expert indices (sorted).
+
+    Raises:
+        ValueError: If n_prune_total is invalid or would leave insufficient experts.
+    """
+    num_layers, num_experts = scores.shape
+
+    if n_prune_total <= 0:
+        return {i: np.arange(num_experts) for i in range(num_layers)}
+    if n_prune_total >= num_experts - min_experts_per_layer + 1:
+        raise ValueError(
+            f"Cannot prune {n_prune_total} expert indices when only {num_experts} exist "
+            f"(min_experts_per_layer={min_experts_per_layer})."
+        )
+
+    # Compute column-wise scores by summing across all layers
+    # Lower score = less important = candidate for pruning
+    column_scores = scores.sum(axis=0)  # (num_experts,)
+
+    # Apply constraints by modifying column scores
+    # Count how many layers protect/target each expert index
+    if protected_experts:
+        protect_count = np.zeros(num_experts)
+        for layer_idx, experts in protected_experts.items():
+            for expert_idx in experts:
+                protect_count[expert_idx] += 1
+        # If an expert is protected in ANY layer, don't prune it globally
+        column_scores[protect_count > 0] = np.inf
+
+    if targeted_experts:
+        target_count = np.zeros(num_experts)
+        for layer_idx, experts in targeted_experts.items():
+            for expert_idx in experts:
+                target_count[expert_idx] += 1
+        # If an expert is targeted in ANY layer, prioritize pruning it
+        column_scores[target_count > 0] = -np.inf
+
+    # Find the n_prune_total lowest-scoring expert indices (columns)
+    prune_expert_indices = np.argpartition(column_scores, n_prune_total)[:n_prune_total]
+    prune_set = set(prune_expert_indices)
+
+    # Build keep_map for each layer - same expert indices removed from all layers
+    keep_map = {}
+    for layer_idx in range(num_layers):
+        keep_indices = [e for e in range(num_experts) if e not in prune_set]
+        keep_map[layer_idx] = np.sort(np.array(keep_indices, dtype=np.intp))
+
+    # Enforce minimum experts per layer
+    for layer_idx in range(num_layers):
+        if len(keep_map[layer_idx]) < min_experts_per_layer:
+            warnings.warn(
+                f"Layer {layer_idx} has only {len(keep_map[layer_idx])} experts "
+                f"after model-wide pruning (min={min_experts_per_layer}). "
+                f"Consider reducing n_prune_total or adjusting constraints."
+            )
+
+    return keep_map
+
+
 def _strided_prune_indices(group_size: int, n_prune: int) -> np.ndarray:
     """Pick n_prune evenly-spaced indices within a group to prune.
 

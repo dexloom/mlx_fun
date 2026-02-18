@@ -7,6 +7,7 @@ import pytest
 from mlx_fun.pruner import (
     select_experts_to_keep,
     select_experts_to_keep_strided,
+    select_experts_to_keep_model_wide,
     _strided_prune_indices,
     prune_moe_layer,
     prune_model,
@@ -146,6 +147,104 @@ def test_strided_select_prune_too_many():
     scores = np.array([[1.0, 2.0]])
     with pytest.raises(ValueError, match="Cannot prune"):
         select_experts_to_keep_strided(scores, n_prune=2)
+
+
+# --- Model-wide pruning tests (column-based selection) ---
+
+def test_model_wide_keep_all():
+    """n_prune_total=0 keeps all experts."""
+    scores = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    keep_map = select_experts_to_keep_model_wide(scores, n_prune_total=0)
+    np.testing.assert_array_equal(keep_map[0], [0, 1, 2])
+    np.testing.assert_array_equal(keep_map[1], [0, 1, 2])
+
+
+def test_model_wide_prune_columns():
+    """Model-wide pruning removes entire columns (expert indices) from all layers."""
+    # 2 layers x 4 experts = 8 total cells
+    # Column sums: expert0=13, expert1=11, expert2=9, expert3=8
+    # Pruning 2 columns removes expert2 and expert3 (lowest column sums)
+    scores = np.array([
+        [10.0, 1.0, 5.0, 2.0],  # layer0: sums to 18
+        [3.0, 10.0, 4.0, 6.0],  # layer1: sums to 23
+    ])
+    keep_map = select_experts_to_keep_model_wide(scores, n_prune_total=2)
+    # Expert 2 and 3 have lowest column sums (9 and 8), should be pruned from ALL layers
+    np.testing.assert_array_equal(keep_map[0], [0, 1])  # experts 2,3 removed
+    np.testing.assert_array_equal(keep_map[1], [0, 1])  # experts 2,3 removed
+
+
+def test_model_wide_same_columns_all_layers():
+    """Model-wide pruning removes same expert indices from all layers."""
+    # Create scores where column 1 has lowest sum across all layers
+    scores = np.array([
+        [100.0, 1.0, 50.0, 50.0],  # layer0: col1 lowest
+        [100.0, 2.0, 50.0, 50.0],  # layer1: col1 lowest
+        [100.0, 3.0, 50.0, 50.0],  # layer2: col1 lowest
+    ])
+    keep_map = select_experts_to_keep_model_wide(scores, n_prune_total=1)
+    # Expert 1 should be pruned from ALL layers
+    for layer_idx in range(3):
+        assert 1 not in keep_map[layer_idx], f"Expert 1 should be pruned from layer {layer_idx}"
+        # Other experts should be kept
+        for e in [0, 2, 3]:
+            assert e in keep_map[layer_idx], f"Expert {e} should be kept in layer {layer_idx}"
+
+
+def test_model_wide_prune_too_many():
+    """Cannot prune more experts than exist (minus minimum)."""
+    # 4 experts, min_experts_per_layer=1 means max prune = 3
+    scores = np.array([
+        [1.0, 2.0, 3.0, 4.0],
+        [5.0, 6.0, 7.0, 8.0],
+    ])
+    with pytest.raises(ValueError, match="Cannot prune"):
+        select_experts_to_keep_model_wide(scores, n_prune_total=4, min_experts_per_layer=1)
+
+
+def test_model_wide_with_protected():
+    """Protected experts (columns) are never pruned."""
+    scores = np.array([
+        [1.0, 2.0, 3.0, 4.0],
+        [5.0, 6.0, 7.0, 8.0],
+    ])
+    # Protect expert 0 in layer 0 - this protects column 0 globally
+    protected = {0: np.array([0])}
+    keep_map = select_experts_to_keep_model_wide(
+        scores, n_prune_total=2, protected_experts=protected
+    )
+    # Expert 0 should be kept in ALL layers (column protected)
+    assert 0 in keep_map[0]
+    assert 0 in keep_map[1]
+
+
+def test_model_wide_with_targeted():
+    """Targeted experts (columns) are always pruned."""
+    scores = np.array([
+        [100.0, 10.0, 50.0, 50.0],  # expert1 has low score in layer0
+        [100.0, 100.0, 50.0, 50.0], # expert1 has high score in layer1
+    ])
+    # Target expert 0 in layer 0 - this targets column 0 globally
+    targeted = {0: np.array([0])}
+    keep_map = select_experts_to_keep_model_wide(
+        scores, n_prune_total=1, targeted_experts=targeted
+    )
+    # Expert 0 should be pruned from ALL layers (column targeted)
+    assert 0 not in keep_map[0]
+    assert 0 not in keep_map[1]
+
+
+def test_model_wide_column_count():
+    """Model-wide pruning removes exactly n_prune_total columns."""
+    scores = np.array([
+        [10.0, 1.0, 5.0, 2.0],
+        [3.0, 10.0, 4.0, 6.0],
+    ])
+    n_prune = 2
+    keep_map = select_experts_to_keep_model_wide(scores, n_prune_total=n_prune)
+    # Each layer should have (num_experts - n_prune) experts
+    for layer_idx in range(2):
+        assert len(keep_map[layer_idx]) == 4 - n_prune
 
 
 def test_strided_vs_bottom_different():

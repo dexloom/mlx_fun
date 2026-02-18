@@ -98,24 +98,29 @@ def collect(model, dataset, output, max_samples, max_tokens, text_key, seed):
 @click.option("--model", required=True, help="Model path or HuggingFace repo ID.")
 @click.option("--saliency", required=True, help="Path to saliency .npz file.")
 @click.option("--output", required=True, help="Output directory for pruned model.")
-@click.option("--n-prune", required=True, type=int, help="Number of experts to prune per layer.")
+@click.option("--n-prune", required=True, type=int, help="Number of experts to prune per layer (or total if --model-wide).")
 @click.option("--metric", default="reap", type=click.Choice(["reap", "ean", "freq", "weighted_freq"]))
 @click.option("--strategy", default="bottom", type=click.Choice(["bottom", "strided"]),
               help="Pruning strategy: 'bottom' removes lowest-scoring, 'strided' distributes pruning evenly.")
+@click.option("--model-wide", is_flag=True, default=False,
+              help="Select N experts globally across all layers instead of per-layer.")
+@click.option("--min-experts-per-layer", default=1, type=int,
+              help="Minimum experts to keep per layer when using --model-wide (default: 1).")
 @click.option("--safety-map", default=None, help="Path to safety_report.json from safety-scan.")
 @click.option("--safety-mode", default=None, type=click.Choice(["protect", "target"]),
               help="'protect': never prune safety experts; 'target': specifically prune them.")
 @click.option("--domain-map", default=None, help="Path to domain_report.json from domain-scan.")
 @click.option("--domain-mode", default=None, type=click.Choice(["protect"]),
               help="'protect': never prune domain experts.")
-def prune(model, saliency, output, n_prune, metric, strategy, safety_map, safety_mode,
-          domain_map, domain_mode):
+def prune(model, saliency, output, n_prune, metric, strategy, model_wide, min_experts_per_layer,
+          safety_map, safety_mode, domain_map, domain_mode):
     """Prune experts from model based on saliency statistics."""
     from mlx_lm import load as mlx_load
 
     from .adapters import get_adapter
     from .pruner import (
         select_experts_to_keep, select_experts_to_keep_strided,
+        select_experts_to_keep_model_wide,
         prune_model, load_safety_constraints, load_domain_constraints,
     )
     from .saliency import SaliencyAccumulator
@@ -142,6 +147,7 @@ def prune(model, saliency, output, n_prune, metric, strategy, safety_map, safety
 
     adapter = get_adapter(mlx_model, config)
     original_n_experts = adapter.num_routed_experts()
+    num_moe_layers = len(adapter.moe_layer_indices())
 
     click.echo(f"Loading saliency from: {saliency}")
     acc = SaliencyAccumulator.load(saliency)
@@ -171,19 +177,32 @@ def prune(model, saliency, output, n_prune, metric, strategy, safety_map, safety
     elif domain_map and not domain_mode:
         raise click.UsageError("--domain-mode is required when --domain-map is provided.")
 
-    click.echo(f"Selecting experts to prune (n_prune={n_prune}, metric={metric}, strategy={strategy})")
-    if strategy == "strided":
-        keep_map = select_experts_to_keep_strided(
+    # Select experts to keep based on mode
+    if model_wide:
+        click.echo(f"Selecting experts to prune (model-wide: {n_prune} total, metric={metric})")
+        keep_map = select_experts_to_keep_model_wide(
             scores, n_prune,
             protected_experts=protected_experts,
             targeted_experts=targeted_experts,
+            min_experts_per_layer=min_experts_per_layer,
         )
+        # Calculate total pruned and per-layer distribution
+        total_pruned = sum(original_n_experts - len(keep_map[i]) for i in range(len(keep_map)))
+        click.echo(f"Model-wide pruning: {total_pruned} experts removed across {num_moe_layers} layers")
     else:
-        keep_map = select_experts_to_keep(
-            scores, n_prune,
-            protected_experts=protected_experts,
-            targeted_experts=targeted_experts,
-        )
+        click.echo(f"Selecting experts to prune (per-layer: {n_prune}/layer, metric={metric}, strategy={strategy})")
+        if strategy == "strided":
+            keep_map = select_experts_to_keep_strided(
+                scores, n_prune,
+                protected_experts=protected_experts,
+                targeted_experts=targeted_experts,
+            )
+        else:
+            keep_map = select_experts_to_keep(
+                scores, n_prune,
+                protected_experts=protected_experts,
+                targeted_experts=targeted_experts,
+            )
 
     # Map from accumulator layer indices to actual model layer indices
     moe_indices = adapter.moe_layer_indices()
@@ -200,9 +219,14 @@ def prune(model, saliency, output, n_prune, metric, strategy, safety_map, safety
         mlx_model, tokenizer, new_config, output,
         model_keep_map, original_n_experts, metric,
     )
-    click.echo(
-        f"Done! Experts: {original_n_experts} -> {original_n_experts - n_prune}"
-    )
+    
+    # Calculate final expert counts
+    if model_wide:
+        total_kept = sum(len(keep) for keep in model_keep_map.values())
+        total_original = original_n_experts * num_moe_layers
+        click.echo(f"Done! Total experts: {total_original} -> {total_kept}")
+    else:
+        click.echo(f"Done! Experts per layer: {original_n_experts} -> {original_n_experts - n_prune}")
 
 
 @main.command()
@@ -210,8 +234,12 @@ def prune(model, saliency, output, n_prune, metric, strategy, safety_map, safety
 @click.option("--saliency", required=True, help="Path to saliency .npz file.")
 @click.option("--dataset", required=True, help="Calibration dataset (JSONL or directory).")
 @click.option("--output", required=True, help="Output directory for merged model.")
-@click.option("--n-prune", required=True, type=int, help="Number of experts to prune per layer.")
+@click.option("--n-prune", required=True, type=int, help="Number of experts to prune per layer (or total if --model-wide).")
 @click.option("--metric", default="reap", type=click.Choice(["reap", "ean", "freq", "weighted_freq"]))
+@click.option("--model-wide", is_flag=True, default=False,
+              help="Select N experts globally across all layers instead of per-layer.")
+@click.option("--min-experts-per-layer", default=1, type=int,
+              help="Minimum experts to keep per layer when using --model-wide (default: 1).")
 @click.option("--similarity-mode", default="gated", type=click.Choice(["gated", "average"]),
               help="Similarity metric: 'gated' or 'average'.")
 @click.option("--alignment", default="greedy", type=click.Choice(["greedy", "hungarian", "none"]),
@@ -225,8 +253,8 @@ def prune(model, saliency, output, n_prune, metric, strategy, safety_map, safety
               help="Max tokens for permutation alignment.")
 @click.option("--text-key", default="content", help="JSON key for text in JSONL.")
 @click.option("--seed", default=None, type=int, help="Random seed.")
-def merge(model, saliency, dataset, output, n_prune, metric, similarity_mode,
-          alignment, max_group_size, max_samples, max_tokens,
+def merge(model, saliency, dataset, output, n_prune, metric, model_wide, min_experts_per_layer,
+          similarity_mode, alignment, max_group_size, max_samples, max_tokens,
           max_similarity_tokens, max_alignment_tokens, text_key, seed):
     """Merge experts using REAM (Router-weighted Expert Activation Merging)."""
     import random
@@ -240,7 +268,8 @@ def merge(model, saliency, dataset, output, n_prune, metric, similarity_mode,
 
     from .adapters import get_adapter
     from .data import load_dataset
-    from .merger import merge_model
+    from .merger import merge_model, merge_model_with_keep_map
+    from .pruner import select_experts_to_keep_model_wide
     from .saliency import SaliencyAccumulator
     from .save import save_merged_model
 
@@ -262,11 +291,17 @@ def merge(model, saliency, dataset, output, n_prune, metric, similarity_mode,
 
     adapter = get_adapter(mlx_model, config)
     original_n_experts = adapter.num_routed_experts()
+    num_moe_layers = len(adapter.moe_layer_indices())
     n_keep = original_n_experts - n_prune
 
     click.echo(f"Model type: {config.get('model_type')}")
-    click.echo(f"MoE layers: {len(adapter.moe_layer_indices())}, "
-               f"Experts: {original_n_experts} -> {n_keep}")
+    if model_wide:
+        click.echo(f"MoE layers: {num_moe_layers}, "
+                   f"Total experts: {original_n_experts * num_moe_layers} -> "
+                   f"{original_n_experts * num_moe_layers - n_prune} (model-wide)")
+    else:
+        click.echo(f"MoE layers: {num_moe_layers}, "
+                   f"Experts per layer: {original_n_experts} -> {n_keep}")
 
     # Load saliency
     click.echo(f"Loading saliency from: {saliency}")
@@ -279,21 +314,47 @@ def merge(model, saliency, dataset, output, n_prune, metric, similarity_mode,
     click.echo(f"Loaded {len(samples)} calibration samples")
 
     # Merge
-    click.echo(f"Merging (similarity={similarity_mode}, alignment={alignment}, "
-               f"max_group_size={max_group_size})...")
-
     def progress(layer_num, total):
         click.echo(f"  Processing MoE layer {layer_num + 1}/{total}...")
 
-    new_config, centroid_map, group_map = merge_model(
-        mlx_model, adapter, scores, n_keep, samples,
-        similarity_mode=similarity_mode,
-        alignment_method=alignment,
-        max_group_size=max_group_size,
-        max_similarity_tokens=max_similarity_tokens,
-        max_alignment_tokens=max_alignment_tokens,
-        progress_callback=progress,
-    )
+    if model_wide:
+        click.echo(f"Model-wide merge: selecting {n_prune} experts to merge globally...")
+        
+        # Select experts to keep using model-wide selection
+        keep_map = select_experts_to_keep_model_wide(
+            scores, n_prune,
+            min_experts_per_layer=min_experts_per_layer,
+        )
+        
+        # Calculate distribution
+        kept_per_layer = [len(keep_map[i]) for i in range(len(keep_map))]
+        click.echo(f"Experts per layer after merge: min={min(kept_per_layer)}, max={max(kept_per_layer)}, avg={sum(kept_per_layer)/len(kept_per_layer):.1f}")
+        
+        click.echo(f"Merging (similarity={similarity_mode}, alignment={alignment}, "
+                   f"max_group_size={max_group_size})...")
+        
+        new_config, centroid_map, group_map = merge_model_with_keep_map(
+            mlx_model, adapter, keep_map, scores, samples,
+            similarity_mode=similarity_mode,
+            alignment_method=alignment,
+            max_group_size=max_group_size,
+            max_similarity_tokens=max_similarity_tokens,
+            max_alignment_tokens=max_alignment_tokens,
+            progress_callback=progress,
+        )
+    else:
+        click.echo(f"Merging (similarity={similarity_mode}, alignment={alignment}, "
+                   f"max_group_size={max_group_size})...")
+        
+        new_config, centroid_map, group_map = merge_model(
+            mlx_model, adapter, scores, n_keep, samples,
+            similarity_mode=similarity_mode,
+            alignment_method=alignment,
+            max_group_size=max_group_size,
+            max_similarity_tokens=max_similarity_tokens,
+            max_alignment_tokens=max_alignment_tokens,
+            progress_callback=progress,
+        )
 
     # Save
     click.echo(f"Saving merged model to: {output}")
@@ -301,7 +362,13 @@ def merge(model, saliency, dataset, output, n_prune, metric, similarity_mode,
         mlx_model, tokenizer, new_config, output,
         centroid_map, group_map, original_n_experts, metric,
     )
-    click.echo(f"Done! Experts: {original_n_experts} -> {n_keep}")
+    
+    if model_wide:
+        total_kept = sum(len(keep_map[i]) for i in range(len(keep_map)))
+        total_original = original_n_experts * num_moe_layers
+        click.echo(f"Done! Total experts: {total_original} -> {total_kept}")
+    else:
+        click.echo(f"Done! Experts per layer: {original_n_experts} -> {n_keep}")
 
 
 @main.command("smoke-test")

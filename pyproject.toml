@@ -26,3 +26,9 @@ mlx-fun = "mlx_fun.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    # Ignore SWIG-related deprecation warnings from dependencies
+    "ignore::DeprecationWarning:",
+]

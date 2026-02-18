@@ -422,7 +422,7 @@ The server exposes additional REAP endpoints for monitoring and exporting statis
   "num_experts": 256,
   "request_count": 150,
   "token_count": 75000,
-  "total_samples": 12687240.0,      // Total samples (important for normalized merge mode)
+  "total_samples": 12687240.0,      // Total samples processed
   "computed_scores": {
     "reap": [[...], [...]],         // Computed REAP scores (divide sum by count)
     "ean": [[...], [...]],          // Computed EAN scores
@@ -432,7 +432,7 @@ The server exposes additional REAP endpoints for monitoring and exporting statis
 }
 ```
 
-The `computed_scores` field provides ready-to-use scores for comparison with `mlx-fun stats-diff`. The `total_samples` field is essential for the `normalized` merge mode in `mlx-fun stats-merge`.
+The `computed_scores` field provides ready-to-use scores for comparison with `mlx-fun stats-diff` and for rank-based merging with `mlx-fun stats-merge`.
 
 ```bash
 # Check stats after some traffic
@@ -704,70 +704,67 @@ Save the report with `--output` for programmatic analysis or export.
 
 #### Merge Multiple Saliency Files
 
-Combine statistics from multiple datasets into a single accumulator with different merge strategies:
+Combine statistics from multiple datasets using rank-based aggregation. This approach normalizes data across different datasets by computing per-layer rankings and summing them:
 
 ```bash
-# Normalized merge (default) - equal weight per dataset
+# Rank-based merge (default metric: reap)
 mlx-fun stats-merge \
     --files data/reap_saliency_agent_minimax_m25.npz \
     --files data/reap_saliency_solidity_functions_minimax_m25.npz \
     --output data/merged_saliency.npz \
-    --mode normalized
+    --metric reap
 
-# Sum merge - raw sum, larger datasets dominate
+# Using frequency metric for ranking
 mlx-fun stats-merge \
     --files data/run1.npz --files data/run2.npz --files data/run3.npz \
-    --output data/merged_raw.npz \
-    --mode sum
-
-# Max merge - keep peak activations across all files
-mlx-fun stats-merge \
-    --files data/morning_stats.npz --files data/evening_stats.npz \
-    --output data/merged_peak.npz \
-    --mode max
+    --output data/merged_ranks.npz \
+    --metric freq
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--files` | *(required)* | Paths to saliency `.npz` files to merge (repeat for each file) |
 | `--output` | *(required)* | Output path for merged `.npz` file |
-| `--mode` | `normalized` | Merge strategy: `sum`, `normalized`, or `max` |
+| `--metric` | `reap` | Metric to use for ranking: `reap`, `ean`, `freq`, or `weighted_freq` |
 
-**Merge Modes:**
+**How Rank-Based Merge Works:**
 
-| Mode | Description | Best For |
-|------|-------------|----------|
-| **sum** | Raw sum of all arrays. Equivalent to collecting from all datasets together. Larger datasets dominate the result. | Aggregating multiple runs from the same data source, when you want the full combined statistics |
-| **normalized** (default) | Normalize each file by its total samples before merging. Each dataset contributes equally regardless of sample count. | Combining datasets of different sizes (e.g., 10K samples + 1K samples) where you want balanced representation |
-| **max** | Keep the maximum activation per expert across all files. Shows peak expert behavior. | Identifying the strongest expert activations across different conditions, finding peak usage patterns |
+1. **Compute scores** — For each input file, compute saliency scores using the specified metric
+2. **Rank per-layer** — Within each layer, rank experts from 1 (highest score) to N (lowest score)
+3. **Sum ranks** — Add up the ranks from all files for each (layer, expert) pair
+4. **Result** — Lower summed rank = more important expert (consistently ranked high across datasets)
 
-**Example Comparison:**
+This approach ensures each dataset contributes equally regardless of sample count or scale differences.
+
+**Example:**
 
 ```bash
 # Dataset A has 10,000 samples, Dataset B has 1,000 samples
+# Both contribute equally to the final ranking
 
-# sum mode: Result is 11x more influenced by Dataset A
-mlx-fun stats-merge --files A.npz --files B.npz --output sum.npz --mode sum
-# Total samples: ~253M (biased toward larger dataset)
-
-# normalized mode: Each dataset contributes 50%
-mlx-fun stats-merge --files A.npz --files B.npz --output norm.npz --mode normalized
-# Total samples: 1 (equal weight per dataset)
-
-# max mode: Shows the highest activation per expert across both
-mlx-fun stats-merge --files A.npz --files B.npz --output peak.npz --mode max
-# Total samples: ~167M (peak activations only)
+mlx-fun stats-merge --files A.npz --files B.npz --output merged.npz --metric reap
+# Rank sum range: [2, 2*num_experts]
+# Lower values = more important (expert ranked high in both datasets)
 ```
 
+**Metrics for Ranking:**
+
+| Metric | Description |
+|--------|-------------|
+| `reap` (default) | Router-weighted activation norm — the standard REAP importance score |
+| `ean` | Expert Activation Norm — average activation magnitude, ignores routing weight |
+| `freq` | Raw routing frequency — how often each expert is selected |
+| `weighted_freq` | Cumulative routing confidence — sum of router weights |
+
 **Use cases:**
-- **sum**: Combine multiple calibration runs from the same data source, aggregate online collection sessions over time
-- **normalized**: Merge statistics from datasets of different sizes (code + natural language) for balanced representation, when you want each domain to contribute equally regardless of sample count
-- **max**: Identify peak expert activations across different conditions, find experts that are consistently strong across multiple datasets
+- Merge statistics from datasets of different sizes (code + natural language) with balanced representation
+- Combine multiple calibration runs while normalizing for sample count differences
+- Identify experts that are consistently important across different domains
 
 **Validation:**
 - All files must have identical dimensions (same num_layers and num_experts)
 - Only files from the same model architecture can be merged
-- The merge operation is commutative and associative for all modes
+- The merge operation is commutative and associative
 
 #### Purge Low-Activation Data
 

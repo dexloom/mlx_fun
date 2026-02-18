@@ -845,20 +845,17 @@ def stats_diff(file1, file2, metric, output):
 @main.command("stats-merge")
 @click.option("--files", required=True, multiple=True, help="Paths to saliency .npz files to merge.")
 @click.option("--output", required=True, help="Output path for merged .npz file.")
-@click.option("--mode", default="normalized", type=click.Choice(["sum", "normalized", "max"]),
-              help="Merge mode: 'sum' (raw sum, larger datasets dominate), 'normalized' (equal weight per dataset), 'max' (peak activations).")
-def stats_merge(files, output, mode):
-    """Merge multiple collected saliency files into one.
+@click.option("--metric", default="reap", type=click.Choice(["reap", "ean", "freq", "weighted_freq"]),
+              help="Metric to use for ranking experts (default: reap).")
+def stats_merge(files, output, metric):
+    """Merge multiple collected saliency files using rank-based aggregation.
 
-    Combines statistics from multiple datasets into a single accumulator.
-    
-    Modes:
-    - sum: Raw sum of all arrays. Equivalent to collecting from all datasets together.
-          Larger datasets dominate the result.
-    - normalized (default): Normalize each file by its total samples before merging.
-          Each dataset contributes equally regardless of sample count.
-    - max: Keep the maximum activation per expert across all files.
-          Shows peak activation patterns across datasets.
+    For each input file, experts are ranked per-layer based on the specified
+    metric. Ranks are then summed across all files. Lower summed rank indicates
+    higher importance (expert consistently ranked high across datasets).
+
+    This approach normalizes data across different datasets, ensuring each
+    dataset contributes equally regardless of sample count or scale differences.
     """
     from .saliency import SaliencyAccumulator
     from .stats_ops import merge_saliency
@@ -867,12 +864,13 @@ def stats_merge(files, output, mode):
         click.echo("Error: At least 2 files are required for merging", err=True)
         return
 
-    click.echo(f"Merging {len(files)} files with mode '{mode}'...")
+    click.echo(f"Merging {len(files)} files using rank-based aggregation...")
+    click.echo(f"Metric for ranking: {metric}")
     for i, f in enumerate(files, 1):
         click.echo(f"  {i}. {f}")
 
     try:
-        merged = merge_saliency(list(files), mode=mode)
+        merged = merge_saliency(list(files), metric=metric)
     except ValueError as e:
         click.echo(f"Error: {e}", err=True)
         return
@@ -880,7 +878,8 @@ def stats_merge(files, output, mode):
     click.echo(f"\nMerged accumulator:")
     click.echo(f"  Layers: {merged.num_layers}")
     click.echo(f"  Experts: {merged.num_experts}")
-    click.echo(f"  Total samples (freq sum): {merged.freq.sum():.0f}")
+    click.echo(f"  Summed ranks range: [{merged.freq.min():.0f}, {merged.freq.max():.0f}]")
+    click.echo(f"  Note: Lower rank sum = higher importance")
 
     merged.save(output)
     click.echo(f"\nMerged stats saved to: {output}")

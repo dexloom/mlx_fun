@@ -152,7 +152,11 @@ def make_freq_heatmap(
     Returns:
         matplotlib Figure.
     """
-    fig, ax = plt.subplots(figsize=(10, max(4, freq.shape[0] * 0.2)))
+    # Use wider, squarer aspect ratio for better browser fit
+    num_layers = freq.shape[0]
+    width = 14
+    height = max(4, min(8, num_layers * 0.1))  # Cap height at 8
+    fig, ax = plt.subplots(figsize=(width, height))
 
     # Use log scale if range is large
     vmax = freq.max()
@@ -186,7 +190,11 @@ def make_weighted_freq_heatmap(
     title: str = "Router-Weighted Frequency",
 ) -> plt.Figure:
     """Create a heatmap of router-weighted frequencies."""
-    fig, ax = plt.subplots(figsize=(10, max(4, weighted_freq.shape[0] * 0.2)))
+    # Use wider, squarer aspect ratio for better browser fit
+    num_layers = weighted_freq.shape[0]
+    width = 14
+    height = max(4, min(8, num_layers * 0.1))  # Cap height at 8
+    fig, ax = plt.subplots(figsize=(width, height))
 
     im = ax.imshow(
         weighted_freq,
@@ -248,7 +256,11 @@ def make_diff_heatmap(
         matplotlib Figure.
     """
     diff = freq1 - freq2
-    fig, ax = plt.subplots(figsize=(10, max(4, diff.shape[0] * 0.2)))
+    # Use wider, squarer aspect ratio for better browser fit
+    num_layers = diff.shape[0]
+    width = 14
+    height = max(4, min(8, num_layers * 0.1))  # Cap height at 8
+    fig, ax = plt.subplots(figsize=(width, height))
 
     # Use diverging colormap centered at 0
     max_abs = np.abs(diff).max()
@@ -298,8 +310,42 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
         A Gradio Blocks app ready to .launch().
     """
 
+    # JavaScript for localStorage persistence of file paths
+    storage_js = """
+    () => {
+        // Load saved values on page load
+        const mergeFields = ['merge_file1', 'merge_file2', 'merge_file3', 'merge_file4'];
+        const diffFields = ['diff_file1', 'diff_file2'];
+        
+        mergeFields.forEach(id => {
+            const el = document.getElementById(id);
+            if (el) {
+                const saved = localStorage.getItem('mlx_fun_' + id);
+                if (saved) el.value = saved;
+                el.addEventListener('input', () => {
+                    localStorage.setItem('mlx_fun_' + id, el.value);
+                });
+            }
+        });
+        
+        diffFields.forEach(id => {
+            const el = document.getElementById(id);
+            if (el) {
+                const saved = localStorage.getItem('mlx_fun_' + id);
+                if (saved) el.value = saved;
+                el.addEventListener('input', () => {
+                    localStorage.setItem('mlx_fun_' + id, el.value);
+                });
+            }
+        });
+        
+        return [];
+    }
+    """
+
     with gr.Blocks(
         title="MLX-FUN Dashboard",
+        js=storage_js,
     ) as app:
 
         gr.Markdown("# MLX-FUN Dashboard")
@@ -605,11 +651,13 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                     label="File 1 Path (.npz)",
                     placeholder="data/reap_saliency_agent_minimax_m25.npz",
                     scale=1,
+                    elem_id="merge_file1",
                 )
                 merge_file2 = gr.Textbox(
                     label="File 2 Path (.npz)",
                     placeholder="data/reap_saliency_solidity_functions_minimax_m25.npz",
                     scale=1,
+                    elem_id="merge_file2",
                 )
 
             with gr.Row():
@@ -617,54 +665,47 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                     label="File 3 Path (.npz, optional)",
                     placeholder="data/reap_saliency_general_minimax_m25.npz",
                     scale=1,
+                    elem_id="merge_file3",
                 )
                 merge_file4 = gr.Textbox(
                     label="File 4 Path (.npz, optional)",
                     placeholder="",
                     scale=1,
+                    elem_id="merge_file4",
                 )
 
             with gr.Row():
                 metric_choice_merge = gr.Radio(
                     ["Frequency", "Weighted Frequency", "REAP", "EAN"],
-                    value="Frequency",
-                    label="Metric to Compare",
-                )
-                comparison_choice = gr.Radio(
-                    ["Sum vs Normalized", "Sum vs Max", "Normalized vs Max"],
-                    value="Sum vs Normalized",
-                    label="Comparison to View",
+                    value="REAP",
+                    label="Metric for Ranking",
                 )
 
             with gr.Row():
-                compare_modes_btn = gr.Button("Merge and Compare", variant="primary")
+                merge_btn = gr.Button("Merge Files", variant="primary")
 
             with gr.Row():
-                merge_info_md = gr.Markdown("Select input files and click **Merge and Compare** to see results.")
+                merge_info_md = gr.Markdown("Select input files and click **Merge Files** to see rank-based results.")
 
             with gr.Row():
-                comparison_plot = gr.Plot(label="Merge Mode Comparison")
+                merge_plot = gr.Plot(label="Summed Ranks (Lower = More Important)")
 
             with gr.Row():
-                comparison_json = gr.JSON(label="Statistics")
+                merge_json = gr.JSON(label="Statistics")
 
-            # Store merged results in state to allow switching comparisons
-            merged_results_state = gr.State(None)
-
-            def compare_merge_modes(f1, f2, f3, f4, metric):
-                """Merge input files with different modes and compare results."""
+            def merge_files_rank(f1, f2, f3, f4, metric):
+                """Merge input files using rank-based aggregation."""
                 from .saliency import SaliencyAccumulator
-                from .stats_ops import merge_saliency, compute_diff_stats
+                from .stats_ops import merge_saliency
 
                 # Collect non-empty file paths
                 files = [f for f in [f1, f2, f3, f4] if f and f.strip()]
-                
+
                 if len(files) < 2:
                     return (
                         "**Error:** At least 2 files are required.",
                         None,
                         None,
-                        None,  # Return None for comparison_choice state update
                     )
 
                 # Normalize metric names
@@ -674,129 +715,104 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                     "REAP": "reap",
                     "EAN": "ean",
                 }
-                metric_key = metric_map.get(metric, "freq")
+                metric_key = metric_map.get(metric, "reap")
 
                 try:
-                    # Merge with all modes
-                    merged_sum = merge_saliency(files, mode="sum")
-                    merged_norm = merge_saliency(files, mode="normalized")
-                    merged_max = merge_saliency(files, mode="max")
+                    # Merge using rank-based aggregation
+                    merged = merge_saliency(files, metric=metric_key)
                 except Exception as e:
                     return (
                         f"**Error merging files:** {e}",
                         None,
                         None,
-                        None,  # Return None for comparison_choice state update
                     )
 
-                # Store all merged results
-                merged_results = {
-                    "sum": merged_sum,
-                    "norm": merged_norm,
-                    "max": merged_max,
-                }
+                # Get summed ranks (stored in freq array)
+                summed_ranks = merged.freq
 
-                # Generate the default comparison (Sum vs Normalized)
-                comparison = "Sum vs Normalized"
-                info, heatmap, stats = _generate_comparison(
-                    merged_results, comparison, metric, metric_key, len(files)
-                )
-
-                return info, heatmap, stats, merged_results
-
-            def _generate_comparison(merged_results, comparison, metric_name, metric_key, num_files):
-                """Generate a specific comparison based on selection."""
-                from .saliency import SaliencyAccumulator
-                from .stats_ops import merge_saliency, compute_diff_stats
+                # Create heatmap showing summed ranks using matplotlib
+                # Note: Lower values = more important (use RdYlGn colormap reversed)
+                # Use a wider, squarer aspect ratio that fits better in browser
+                num_layers, num_experts = summed_ranks.shape
+                # Target a reasonable width (14) and height based on aspect ratio
+                # but capped to keep it compact
+                width = 14
+                height = max(4, min(8, num_layers * 0.1))  # Cap height at 8
+                fig, ax = plt.subplots(figsize=(width, height))
                 
-                # Get the two modes to compare
-                if comparison == "Sum vs Normalized":
-                    mode1, mode2 = "sum", "norm"
-                    title = f"Sum Mode - Normalized Mode ({metric_name})"
-                elif comparison == "Sum vs Max":
-                    mode1, mode2 = "sum", "max"
-                    title = f"Sum Mode - Max Mode ({metric_name})"
-                else:  # Normalized vs Max
-                    mode1, mode2 = "norm", "max"
-                    title = f"Normalized Mode - Max Mode ({metric_name})"
-
-                acc1 = merged_results[mode1]
-                acc2 = merged_results[mode2]
-
-                # Get arrays for visualization
-                if metric_key == "freq":
-                    arr1 = acc1.freq
-                    arr2 = acc2.freq
-                elif metric_key == "weighted_freq":
-                    arr1 = acc1.weighted_freq_sum
-                    arr2 = acc2.weighted_freq_sum
-                elif metric_key == "reap":
-                    arr1 = acc1.compute_scores("reap")
-                    arr2 = acc2.compute_scores("reap")
-                else:  # ean
-                    arr1 = acc1.compute_scores("ean")
-                    arr2 = acc2.compute_scores("ean")
-
-                # Create heatmap
-                heatmap = make_diff_heatmap(arr1, arr2, title=title)
+                im = ax.imshow(
+                    summed_ranks,
+                    aspect="auto",
+                    cmap="RdYlGn_r",  # Reversed: green (low/good) to red (high/less important)
+                    interpolation="nearest",
+                )
+                
+                ax.set_xlabel("Expert Index")
+                ax.set_ylabel("MoE Layer Index")
+                ax.set_title(f"Summed Ranks - {metric} (Lower = More Important)")
+                fig.colorbar(im, ax=ax, label="Summed Rank (Lower = More Important)")
+                fig.tight_layout()
 
                 # Compute statistics
-                diff_stats = compute_diff_stats(acc1, acc2, metric_key)
+                num_experts = merged.num_layers * merged.num_experts
+                stats = {
+                    "num_files": len(files),
+                    "metric": metric_key,
+                    "num_layers": merged.num_layers,
+                    "num_experts": merged.num_experts,
+                    "rank_sum_min": float(summed_ranks.min()),
+                    "rank_sum_max": float(summed_ranks.max()),
+                    "rank_sum_mean": float(summed_ranks.mean()),
+                    "rank_sum_std": float(summed_ranks.std()),
+                    "most_important": [],
+                    "least_important": [],
+                }
+
+                # Find most important (lowest rank sum) and least important (highest rank sum)
+                flat_ranks = summed_ranks.ravel()
+                most_important_indices = np.argsort(flat_ranks)[:5]
+                least_important_indices = np.argsort(flat_ranks)[-5:][::-1]
+
+                for idx in most_important_indices:
+                    layer_idx, expert_idx = np.unravel_index(idx, summed_ranks.shape)
+                    stats["most_important"].append({
+                        "layer": int(layer_idx),
+                        "expert": int(expert_idx),
+                        "rank_sum": float(summed_ranks[layer_idx, expert_idx]),
+                    })
+
+                for idx in least_important_indices:
+                    layer_idx, expert_idx = np.unravel_index(idx, summed_ranks.shape)
+                    stats["least_important"].append({
+                        "layer": int(layer_idx),
+                        "expert": int(expert_idx),
+                        "rank_sum": float(summed_ranks[layer_idx, expert_idx]),
+                    })
 
                 # Format info text
                 info = (
-                    f"**Merging {num_files} files with different modes...**\n\n"
-                    f"**Merge Mode Characteristics:**\n"
-                    f"- **Sum mode:** Total samples = {merged_results['sum'].freq.sum():.0f} (larger datasets dominate)\n"
-                    f"- **Normalized mode:** Total samples = {merged_results['norm'].freq.sum():.0f} (equal weight per dataset)\n"
-                    f"- **Max mode:** Total samples = {merged_results['max'].freq.sum():.0f} (peak activations only)\n\n"
-                    f"**Current Comparison:** {comparison}\n"
-                    f"**Metric:** {metric_name} | "
-                    f"**Dimensions:** {acc1.num_layers} layers × {acc1.num_experts} experts\n\n"
-                    f"**Difference Statistics:**\n"
-                    f"- Mean: {diff_stats['diff_mean']:.4f}\n"
-                    f"- Std: {diff_stats['diff_std']:.4f}\n"
-                    f"- Range: [{diff_stats['diff_min']:.4f}, {diff_stats['diff_max']:.4f}]\n\n"
-                    f"**Distribution:**\n"
-                    f"- Positive ({comparison.split(' vs ')[0]} > {comparison.split(' vs ')[1]}): {diff_stats['positive_count']} experts\n"
-                    f"- Negative ({comparison.split(' vs ')[1]} > {comparison.split(' vs ')[0]}): {diff_stats['negative_count']} experts\n"
-                    f"- Zero: {diff_stats['zero_count']} experts"
+                    f"**Merged {len(files)} files using rank-based aggregation**\n\n"
+                    f"**Metric for ranking:** {metric}\n"
+                    f"**Dimensions:** {merged.num_layers} layers × {merged.num_experts} experts\n\n"
+                    f"**How it works:**\n"
+                    f"- Each file ranks experts per-layer (rank 1 = highest score)\n"
+                    f"- Ranks are summed across all files\n"
+                    f"- **Lower summed rank = more important** (consistently high ranking)\n\n"
+                    f"**Statistics:**\n"
+                    f"- Rank sum range: [{summed_ranks.min():.0f}, {summed_ranks.max():.0f}]\n"
+                    f"- Mean rank sum: {summed_ranks.mean():.1f}\n"
+                    f"- Std dev: {summed_ranks.std():.1f}\n\n"
+                    f"**Most Important Experts (lowest rank sum):**\n"
                 )
+                for i, exp in enumerate(stats["most_important"][:3], 1):
+                    info += f"  {i}. Layer {exp['layer']}, Expert {exp['expert']}: rank sum = {exp['rank_sum']:.0f}\n"
 
-                return info, heatmap, diff_stats
+                return info, fig, stats
 
-            def switch_comparison(merged_results, comparison, metric):
-                """Switch between different comparisons without re-merging."""
-                if merged_results is None:
-                    return None, None, None
-
-                metric_map = {
-                    "Frequency": "freq",
-                    "Weighted Frequency": "weighted_freq",
-                    "REAP": "reap",
-                    "EAN": "ean",
-                }
-                metric_key = metric_map.get(metric, "freq")
-                metric_name = metric
-
-                num_files = 2  # Default, since we don't know the original count
-                
-                info, heatmap, stats = _generate_comparison(
-                    merged_results, comparison, metric_name, metric_key, num_files
-                )
-
-                return info, heatmap, stats
-
-            compare_modes_btn.click(
-                compare_merge_modes,
+            merge_btn.click(
+                merge_files_rank,
                 inputs=[merge_file1, merge_file2, merge_file3, merge_file4, metric_choice_merge],
-                outputs=[merge_info_md, comparison_plot, comparison_json, merged_results_state],
-            )
-
-            comparison_choice.change(
-                switch_comparison,
-                inputs=[merged_results_state, comparison_choice, metric_choice_merge],
-                outputs=[merge_info_md, comparison_plot, comparison_json],
+                outputs=[merge_info_md, merge_plot, merge_json],
             )
 
         # -------------------------------------------------------------------
@@ -814,11 +830,13 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                     label="File 1 Path (.npz)",
                     placeholder="data/reap_saliency_agent_minimax_m25.npz",
                     scale=1,
+                    elem_id="diff_file1",
                 )
                 file2_input = gr.Textbox(
                     label="File 2 Path (.npz)",
                     placeholder="data/reap_saliency_solidity_functions_minimax_m25.npz",
                     scale=1,
+                    elem_id="diff_file2",
                 )
 
             with gr.Row():

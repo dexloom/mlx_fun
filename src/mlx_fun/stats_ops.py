@@ -98,33 +98,74 @@ def _get_extreme_experts(
     return result
 
 
+def _compute_ranked_scores(
+    acc: SaliencyAccumulator,
+    metric: str,
+) -> np.ndarray:
+    """Compute per-layer rankings for an accumulator.
+
+    Args:
+        acc: SaliencyAccumulator to rank.
+        metric: Metric to use for ranking (reap, ean, freq, weighted_freq).
+
+    Returns:
+        (num_layers, num_experts) array of ranks. Rank 1 = highest score.
+    """
+    scores = acc.compute_scores(metric)
+    ranks = np.zeros_like(scores, dtype=np.float64)
+
+    for layer_idx in range(acc.num_layers):
+        layer_scores = scores[layer_idx]
+        # argsort gives indices that would sort the array
+        # we want rank 1 for highest score, so we negate
+        sorted_indices = np.argsort(-layer_scores)
+        # Create ranking: position in sorted array + 1
+        for rank, idx in enumerate(sorted_indices, 1):
+            ranks[layer_idx, idx] = rank
+
+    return ranks
+
+
 def merge_saliency(
     files: List[str],
-    mode: str = "normalized",
+    metric: str = "reap",
 ) -> SaliencyAccumulator:
-    """Merge multiple SaliencyAccumulator files into one.
+    """Merge multiple SaliencyAccumulator files using rank-based aggregation.
+
+    For each file:
+    1. Compute scores using the specified metric
+    2. Rank experts within each layer (rank 1 = highest score)
+
+    Then sum ranks across all files. Lower summed rank = more important expert.
+
+    This approach normalizes data across different datasets by using rankings
+    instead of raw values, ensuring each dataset contributes equally regardless
+    of sample count or scale differences.
 
     Args:
         files: List of paths to .npz files containing SaliencyAccumulator data.
-        mode: Merge strategy:
-            - "sum" (raw): Sum all arrays. Equivalent to collecting from all datasets together.
-              Larger datasets dominate.
-            - "normalized" (default): Normalize each file by its total samples before merging.
-              Each dataset contributes equally regardless of sample count.
-            - "max": Keep the maximum activation per expert across all files.
-              Shows peak activation patterns.
+        metric: Saliency metric to use for ranking (reap, ean, freq, weighted_freq).
+                Default is "reap".
 
     Returns:
-        Merged SaliencyAccumulator.
+        Merged SaliencyAccumulator with summed ranks stored in freq array.
+        Lower values indicate higher importance (more consistent high ranking
+        across datasets).
 
     Raises:
-        ValueError: If files have incompatible dimensions or unknown mode.
+        ValueError: If files have incompatible dimensions or invalid metric.
+
+    Example:
+        >>> merged = merge_saliency(["data/1.npz", "data/2.npz"], metric="reap")
+        >>> # Lower freq values = more important experts
+        >>> ranks = merged.freq
     """
     if not files:
         raise ValueError("At least one file must be provided for merging.")
 
-    if mode not in ["sum", "normalized", "max"]:
-        raise ValueError(f"Unknown merge mode '{mode}'. Use: sum, normalized, or max")
+    valid_metrics = ["reap", "ean", "freq", "weighted_freq"]
+    if metric not in valid_metrics:
+        raise ValueError(f"Unknown metric '{metric}'. Use: {', '.join(valid_metrics)}")
 
     # Load first file to get dimensions
     first_acc = SaliencyAccumulator.load(files[0])
@@ -144,54 +185,20 @@ def merge_saliency(
     # Initialize merged accumulator
     merged = SaliencyAccumulator(num_layers, num_experts)
 
-    if mode == "sum":
-        # Raw sum - equivalent to collecting from all datasets together
-        for file_path in files:
-            acc = SaliencyAccumulator.load(file_path)
-            merged.reap_sum += acc.reap_sum
-            merged.reap_count += acc.reap_count
-            merged.ean_sum += acc.ean_sum
-            merged.freq += acc.freq
-            merged.weighted_freq_sum += acc.weighted_freq_sum
+    # Compute and sum ranks from all files
+    summed_ranks = np.zeros((num_layers, num_experts), dtype=np.float64)
 
-    elif mode == "normalized":
-        # Normalize each file by its total samples before merging
-        # This gives equal weight to each dataset regardless of sample count
-        for file_path in files:
-            acc = SaliencyAccumulator.load(file_path)
-            
-            # Calculate total samples processed in this file
-            # Use the sum of all freq counts as a proxy for total samples
-            total_samples = acc.freq.sum()
-            
-            if total_samples > 0:
-                # Normalize arrays by sample count
-                norm_factor = 1.0 / total_samples
-                merged.reap_sum += acc.reap_sum * norm_factor
-                merged.reap_count += acc.reap_count * norm_factor
-                merged.ean_sum += acc.ean_sum * norm_factor
-                merged.freq += acc.freq * norm_factor
-                merged.weighted_freq_sum += acc.weighted_freq_sum * norm_factor
+    for file_path in files:
+        acc = SaliencyAccumulator.load(file_path)
+        ranks = _compute_ranked_scores(acc, metric)
+        summed_ranks += ranks
 
-        # Scale back up to represent average across datasets
-        # This keeps the magnitude reasonable for downstream operations
-        avg_samples_per_file = 1.0 / len(files)
-        merged.reap_sum *= avg_samples_per_file
-        merged.reap_count *= avg_samples_per_file
-        merged.ean_sum *= avg_samples_per_file
-        merged.freq *= avg_samples_per_file
-        merged.weighted_freq_sum *= avg_samples_per_file
+    # Store summed ranks in freq array
+    # Lower value = higher importance (expert consistently ranked high)
+    merged.freq = summed_ranks
 
-    elif mode == "max":
-        # Keep maximum activation per expert across all files
-        # Useful for identifying peak expert behavior
-        accumulators = [SaliencyAccumulator.load(f) for f in files]
-        
-        merged.reap_sum = np.maximum.reduce([acc.reap_sum for acc in accumulators])
-        merged.reap_count = np.maximum.reduce([acc.reap_count for acc in accumulators])
-        merged.ean_sum = np.maximum.reduce([acc.ean_sum for acc in accumulators])
-        merged.freq = np.maximum.reduce([acc.freq for acc in accumulators])
-        merged.weighted_freq_sum = np.maximum.reduce([acc.weighted_freq_sum for acc in accumulators])
+    # Note: Other arrays (reap_sum, ean_sum, etc.) remain zero
+    # The merged result is primarily useful for the rank information
 
     return merged
 

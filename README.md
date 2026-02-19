@@ -117,6 +117,23 @@ mlx-fun prune --model ./model --saliency stats.npz --n-prune 40 --model-wide --o
 
 The model-wide mode uses the `--min-experts-per-layer` option (default: 1) to ensure no layer loses all its experts.
 
+#### Protecting Experts with --ignore-experts
+
+When using model-wide mode, you can protect specific expert indices from being pruned using `--ignore-experts`:
+
+```bash
+# Model-wide prune 50 experts, but keep experts 0, 1, 2, and 250-255
+mlx-fun prune --model ./model --saliency stats.npz --n-prune 50 --model-wide \
+    --ignore-experts "0,1,2,250..255" --output ./pruned
+```
+
+**Format:**
+- Individual indices: `1,2,5`
+- Ranges (inclusive): `250..255`
+- Combined: `1,2,250..255`
+
+The ignored experts are protected in **all layers** - they will never be pruned regardless of their saliency scores.
+
 ### REAM: Expert Merging
 
 REAM is an alternative to pruning that **merges** experts instead of removing them. While pruning discards low-saliency experts entirely, REAM preserves knowledge from all experts by folding them into fewer, higher-quality centroids.
@@ -315,6 +332,7 @@ mlx-fun prune \
 | `--strategy` | `bottom` | Pruning strategy: `bottom` (remove lowest) or `strided` (distribute evenly) |
 | `--model-wide` | `false` | Select N experts globally across all layers instead of per-layer |
 | `--min-experts-per-layer` | `1` | Minimum experts to keep per layer when using `--model-wide` |
+| `--ignore-experts` | *(none)* | Expert indices to protect from model-wide pruning. Format: `1,2,250..255`. Only valid with `--model-wide`. |
 | `--safety-map` | *(none)* | Path to `safety_report.json` from `safety-scan` |
 | `--safety-mode` | *(none)* | `protect` (never prune safety experts) or `target` (specifically prune them) |
 | `--domain-map` | *(none)* | Path to `domain_report.json` from `domain-scan` |
@@ -402,6 +420,7 @@ mlx-fun merge \
 | `--metric` | `reap` | Saliency metric: `reap`, `ean`, `freq`, `weighted_freq` |
 | `--model-wide` | `false` | Select N experts globally across all layers instead of per-layer |
 | `--min-experts-per-layer` | `1` | Minimum experts to keep per layer when using `--model-wide` |
+| `--ignore-experts` | *(none)* | Expert indices to protect from model-wide merge. Format: `1,2,250..255`. Only valid with `--model-wide`. |
 | `--similarity-mode` | `gated` | Expert similarity: `gated` (gate_logit * output cosine sim) or `average` (mean of output sim + gate logit sim) |
 | `--alignment` | `greedy` | Neuron alignment: `greedy` (fast, O(n^2)), `hungarian` (optimal, requires scipy), or `none` (skip alignment) |
 | `--max-group-size` | `16` | Maximum experts per merge group (the C parameter from the REAM paper) |

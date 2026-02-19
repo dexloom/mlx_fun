@@ -18,6 +18,7 @@ from mlx_fun.pruner import (
     load_expert_list,
     _load_expert_list_json,
     _load_expert_list_csv,
+    parse_expert_list,
 )
 from mlx_fun.adapters.minimax import MiniMaxAdapter
 from mlx_fun.adapters.glm4_moe import GLM4MoEAdapter
@@ -264,6 +265,180 @@ def test_strided_vs_bottom_different():
     assert len(keep_bottom[0]) == 8
     assert len(keep_strided[0]) == 8
     assert not np.array_equal(keep_bottom[0], keep_strided[0])
+
+
+# --- parse_expert_list tests ---
+
+class TestParseExpertList:
+    """Tests for the parse_expert_list utility function."""
+
+    def test_single_index(self):
+        """Single index returns set with one element."""
+        result = parse_expert_list("5")
+        assert result == {5}
+
+    def test_multiple_indices(self):
+        """Comma-separated indices return all elements."""
+        result = parse_expert_list("1,2,5")
+        assert result == {1, 2, 5}
+
+    def test_range(self):
+        """Range notation returns all indices in range (inclusive)."""
+        result = parse_expert_list("250..255")
+        assert result == {250, 251, 252, 253, 254, 255}
+
+    def test_combined(self):
+        """Combined indices and ranges work together."""
+        result = parse_expert_list("1,2,250..255")
+        assert result == {1, 2, 250, 251, 252, 253, 254, 255}
+
+    def test_whitespace_tolerance(self):
+        """Whitespace around values is handled gracefully."""
+        result = parse_expert_list("1, 2, 250..255")
+        assert result == {1, 2, 250, 251, 252, 253, 254, 255}
+
+    def test_empty_string(self):
+        """Empty string returns empty set."""
+        result = parse_expert_list("")
+        assert result == set()
+
+    def test_whitespace_only(self):
+        """Whitespace-only string returns empty set."""
+        result = parse_expert_list("   ")
+        assert result == set()
+
+    def test_range_single_value(self):
+        """Range with same start and end returns single value."""
+        result = parse_expert_list("5..5")
+        assert result == {5}
+
+    def test_multiple_ranges(self):
+        """Multiple ranges can be combined."""
+        result = parse_expert_list("1..3,7..9")
+        assert result == {1, 2, 3, 7, 8, 9}
+
+    def test_invalid_non_integer(self):
+        """Non-integer values raise ValueError."""
+        with pytest.raises(ValueError, match="Invalid expert index"):
+            parse_expert_list("abc")
+
+    def test_invalid_range_format(self):
+        """Invalid range format raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid range format"):
+            parse_expert_list("1..2..3")
+
+    def test_invalid_range_bounds(self):
+        """Non-integer range bounds raise ValueError."""
+        with pytest.raises(ValueError, match="Invalid range bounds"):
+            parse_expert_list("a..b")
+
+    def test_invalid_range_order(self):
+        """Range with start > end raises ValueError."""
+        with pytest.raises(ValueError, match="start.*>.*end"):
+            parse_expert_list("10..5")
+
+    def test_duplicate_indices(self):
+        """Duplicate indices are handled gracefully (set deduplicates)."""
+        result = parse_expert_list("1,1,2,2")
+        assert result == {1, 2}
+
+    def test_range_with_duplicates(self):
+        """Overlapping ranges and indices deduplicate correctly."""
+        result = parse_expert_list("1..3,2..4")
+        assert result == {1, 2, 3, 4}
+
+
+# --- Model-wide pruning with ignored_experts tests ---
+
+def test_model_wide_with_ignored_experts():
+    """Ignored experts (columns) are never pruned."""
+    scores = np.array([
+        [1.0, 2.0, 3.0, 4.0],
+        [5.0, 6.0, 7.0, 8.0],
+    ])
+    # Ignore expert 0 - this protects column 0 globally
+    ignored = {0}
+    keep_map = select_experts_to_keep_model_wide(
+        scores, n_prune_total=2, ignored_experts=ignored
+    )
+    # Expert 0 should be kept in ALL layers (column protected)
+    assert 0 in keep_map[0]
+    assert 0 in keep_map[1]
+
+
+def test_model_wide_with_multiple_ignored_experts():
+    """Multiple ignored experts are all protected."""
+    scores = np.array([
+        [1.0, 2.0, 3.0, 4.0, 5.0],
+        [6.0, 7.0, 8.0, 9.0, 10.0],
+    ])
+    # Ignore experts 0 and 4
+    ignored = {0, 4}
+    keep_map = select_experts_to_keep_model_wide(
+        scores, n_prune_total=2, ignored_experts=ignored
+    )
+    # Experts 0 and 4 should be kept in ALL layers
+    assert 0 in keep_map[0]
+    assert 0 in keep_map[1]
+    assert 4 in keep_map[0]
+    assert 4 in keep_map[1]
+
+
+def test_model_wide_ignored_with_protected():
+    """Ignored experts work alongside protected_experts."""
+    scores = np.array([
+        [1.0, 2.0, 3.0, 4.0],
+        [5.0, 6.0, 7.0, 8.0],
+    ])
+    # Protect expert 0 via safety constraint
+    protected = {0: np.array([0])}
+    # Ignore expert 1 via ignore list
+    ignored = {1}
+    keep_map = select_experts_to_keep_model_wide(
+        scores, n_prune_total=2, protected_experts=protected, ignored_experts=ignored
+    )
+    # Both experts 0 and 1 should be kept in ALL layers
+    assert 0 in keep_map[0]
+    assert 0 in keep_map[1]
+    assert 1 in keep_map[0]
+    assert 1 in keep_map[1]
+
+
+def test_model_wide_ignored_out_of_range():
+    """Out-of-range ignored experts are silently skipped."""
+    scores = np.array([
+        [1.0, 2.0, 3.0, 4.0],
+    ])
+    # Ignore expert 10 which doesn't exist
+    ignored = {10}
+    # Should not raise an error
+    keep_map = select_experts_to_keep_model_wide(
+        scores, n_prune_total=1, ignored_experts=ignored
+    )
+    # Should still work, just ignoring the out-of-range index
+    assert len(keep_map[0]) == 3
+
+
+def test_model_wide_ignored_none():
+    """None value for ignored_experts works correctly."""
+    scores = np.array([
+        [1.0, 2.0, 3.0, 4.0],
+    ])
+    keep_map = select_experts_to_keep_model_wide(
+        scores, n_prune_total=1, ignored_experts=None
+    )
+    assert len(keep_map[0]) == 3
+
+
+def test_model_wide_ignored_empty_set():
+    """Empty set for ignored_experts works correctly."""
+    scores = np.array([
+        [1.0, 2.0, 3.0, 4.0],
+    ])
+    keep_map = select_experts_to_keep_model_wide(
+        scores, n_prune_total=1, ignored_experts=set()
+    )
+    assert len(keep_map[0]) == 3
 
 
 # --- Tensor slicing tests (MiniMax) ---

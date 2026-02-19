@@ -350,6 +350,12 @@ def make_freq_heatmap(
     ax.set_xlabel("Expert Index")
     ax.set_ylabel("MoE Layer Index")
     ax.set_title(title)
+    
+    # Show every10th tick label on X-axis
+    num_experts = freq.shape[1]
+    ax.set_xticks(range(0, num_experts, 10))
+    ax.set_xticklabels([str(i) for i in range(0, num_experts, 10)], fontsize=7)
+    
     fig.colorbar(im, ax=ax, label="Activation Count")
     fig.tight_layout()
     return fig
@@ -376,6 +382,12 @@ def make_weighted_freq_heatmap(
     ax.set_xlabel("Expert Index")
     ax.set_ylabel("MoE Layer Index")
     ax.set_title(title)
+    
+    # Show every10th tick label on X-axis
+    num_experts = weighted_freq.shape[1]
+    ax.set_xticks(range(0, num_experts, 10))
+    ax.set_xticklabels([str(i) for i in range(0, num_experts, 10)], fontsize=7)
+    
     fig.colorbar(im, ax=ax, label="Weighted Frequency Sum")
     fig.tight_layout()
     return fig
@@ -455,6 +467,11 @@ def make_diff_heatmap(
     ax.set_xlabel("Expert Index", fontsize=10)
     ax.set_ylabel("MoE Layer Index", fontsize=10)
     ax.set_title(title, fontsize=11)
+    
+    # Show every10th tick label on X-axis
+    num_experts = diff.shape[1]
+    ax.set_xticks(range(0, num_experts, 10))
+    ax.set_xticklabels([str(i) for i in range(0, num_experts, 10)], fontsize=7)
     
     # Add colorbar with label
     cbar = fig.colorbar(im, ax=ax)
@@ -886,6 +903,15 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                     label="Action Mode",
                 )
             
+            # Ignore experts input (only for model-wide mode)
+            ignore_experts_input = gr.Textbox(
+                label="Ignore Experts (Model-Wide only)",
+                placeholder="e.g., 1,2,250..255",
+                value="",
+                info="Comma-separated expert indices or ranges to protect from model-wide pruning. "
+                     "Only applies when Selection Mode is 'Model-Wide'.",
+            )
+            
             gr.Markdown("---")
             gr.Markdown("#### Dynamic Filters")
             gr.Markdown(
@@ -1004,6 +1030,11 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 ax.set_xlabel("Expert Index")
                 ax.set_ylabel("MoE Layer Index")
                 ax.set_title(f"Summed Ranks - {metric} (Lower = More Important)")
+                
+                # Show every10th tick label on X-axis
+                ax.set_xticks(range(0, num_experts, 10))
+                ax.set_xticklabels([str(i) for i in range(0, num_experts, 10)], fontsize=7)
+                
                 fig.colorbar(im, ax=ax, label="Summed Rank (Lower = More Important)")
                 fig.tight_layout()
 
@@ -1069,7 +1100,7 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 outputs=[filter_info_md, merge_plot, merge_json, merge_state],
             )
             
-            def apply_filters(merge_data, min_rank, max_rank, n_prune, selection_mode, action_mode):
+            def apply_filters(merge_data, min_rank, max_rank, n_prune, selection_mode, action_mode, ignore_experts_str):
                 """Apply filters to merged data and update visualization.
                 
                 Supports two selection modes:
@@ -1080,6 +1111,8 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 - Analyze: Just visualize the selection
                 - Prune: Show what would be removed (for CLI prune command)
                 - Merge: Show what would be merged (for CLI merge command)
+                
+                ignore_experts_str: Comma-separated expert indices or ranges to protect (model-wide only)
                 """
                 if merge_data is None:
                     return (
@@ -1093,6 +1126,19 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 num_experts = merge_data["num_experts"]
                 metric = merge_data["metric"]
                 total_experts = num_layers * num_experts
+                
+                # Parse ignored experts if provided and model-wide mode
+                ignored_set = set()
+                if ignore_experts_str and ignore_experts_str.strip() and selection_mode == "Model-Wide":
+                    from .pruner import parse_expert_list
+                    try:
+                        ignored_set = parse_expert_list(ignore_experts_str)
+                    except ValueError as e:
+                        return (
+                            f"**Error parsing ignore experts:** {str(e)}",
+                            None,
+                            {"error": str(e)},
+                        )
                 
                 # Create mask for filtering (start with all visible)
                 mask = np.ones_like(summed_ranks, dtype=bool)
@@ -1118,11 +1164,20 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                         if n_to_prune_total < num_experts:
                             # Compute column-wise scores by summing across all layers
                             column_scores = summed_ranks.sum(axis=0)
+                            
+                            # Protect ignored experts by setting their score to infinity
+                            for expert_idx in ignored_set:
+                                if 0 <= expert_idx < num_experts:
+                                    column_scores[expert_idx] = np.inf
+                            
                             # Find N columns with highest scores (least important)
                             prune_column_indices = np.argpartition(column_scores, -n_to_prune_total)[-n_to_prune_total:]
                             
                             # Mask out these columns from ALL layers
                             for expert_idx in prune_column_indices:
+                                # Skip if this expert is in ignored set (shouldn't happen with inf score)
+                                if expert_idx in ignored_set:
+                                    continue
                                 mask[:, expert_idx] = False
                                 for layer_idx in range(num_layers):
                                     prune_candidates.append({
@@ -1130,7 +1185,11 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                                         "expert": int(expert_idx),
                                         "rank_sum": float(summed_ranks[layer_idx, expert_idx]),
                                     })
-                            filter_desc.append(f"model-wide prune {n_to_prune_total} columns")
+                            
+                            if ignored_set:
+                                filter_desc.append(f"model-wide prune {n_to_prune_total} columns (ignoring {len(ignored_set)} experts)")
+                            else:
+                                filter_desc.append(f"model-wide prune {n_to_prune_total} columns")
                     else:
                         # Per-layer: Select N experts from each layer
                         n_to_prune_per_layer = int(n_prune)
@@ -1186,6 +1245,11 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 if filter_desc:
                     title += f" ({', '.join(filter_desc)})"
                 ax.set_title(title)
+                
+                # Show every10th tick label on X-axis
+                ax.set_xticks(range(0, num_experts, 10))
+                ax.set_xticklabels([str(i) for i in range(0, num_experts, 10)], fontsize=7)
+                
                 fig.colorbar(im, ax=ax, label="Summed Rank (Lower = More Important)")
                 fig.tight_layout()
                 
@@ -1313,7 +1377,7 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
             
             apply_filters_btn.click(
                 apply_filters,
-                inputs=[merge_state, rank_min_filter, rank_max_filter, n_prune_filter, selection_mode, action_mode],
+                inputs=[merge_state, rank_min_filter, rank_max_filter, n_prune_filter, selection_mode, action_mode, ignore_experts_input],
                 outputs=[filter_info_md, merge_plot, merge_json],
             )
             
@@ -1349,6 +1413,11 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 ax.set_xlabel("Expert Index")
                 ax.set_ylabel("MoE Layer Index")
                 ax.set_title(f"Summed Ranks - {metric} (Lower = More Important)")
+                
+                # Show every10th tick label on X-axis
+                ax.set_xticks(range(0, num_experts, 10))
+                ax.set_xticklabels([str(i) for i in range(0, num_experts, 10)], fontsize=7)
+                
                 fig.colorbar(im, ax=ax, label="Summed Rank (Lower = More Important)")
                 fig.tight_layout()
                 
@@ -1383,7 +1452,7 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 outputs=[filter_info_md, merge_plot, merge_json, rank_min_filter, rank_max_filter, n_prune_filter],
             )
             
-            def export_filtered_results(merge_data, min_rank, max_rank, n_prune, selection_mode, action_mode):
+            def export_filtered_results(merge_data, min_rank, max_rank, n_prune, selection_mode, action_mode, ignore_experts_str):
                 """Export filtered expert list to CSV and JSON files.
                 
                 Exports two files:
@@ -1400,6 +1469,15 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 num_layers = merge_data["num_layers"]
                 num_experts = merge_data["num_experts"]
                 total_experts = num_layers * num_experts
+                
+                # Parse ignored experts if provided and model-wide mode
+                ignored_set = set()
+                if ignore_experts_str and ignore_experts_str.strip() and selection_mode == "Model-Wide":
+                    from .pruner import parse_expert_list
+                    try:
+                        ignored_set = parse_expert_list(ignore_experts_str)
+                    except ValueError:
+                        pass  # Ignore parsing errors on export
                 
                 # Create mask for filtering (same logic as apply_filters)
                 mask = np.ones_like(summed_ranks, dtype=bool)
@@ -1418,10 +1496,19 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                         if n_to_prune_total < num_experts:
                             # Compute column-wise scores by summing across all layers
                             column_scores = summed_ranks.sum(axis=0)
+                            
+                            # Protect ignored experts by setting their score to infinity
+                            for expert_idx in ignored_set:
+                                if 0 <= expert_idx < num_experts:
+                                    column_scores[expert_idx] = np.inf
+                            
                             # Find N columns with highest scores (least important)
                             prune_column_indices = np.argpartition(column_scores, -n_to_prune_total)[-n_to_prune_total:]
                             # Mask out these columns from ALL layers
                             for expert_idx in prune_column_indices:
+                                # Skip if this expert is in ignored set
+                                if expert_idx in ignored_set:
+                                    continue
                                 mask[:, expert_idx] = False
                                 for layer_idx in range(num_layers):
                                     prune_candidates.append({
@@ -1468,7 +1555,11 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 writer.writeheader()
                 writer.writerows(all_experts)
                 
-                csv_path = "filtered_experts.csv"
+                # Ensure data directory exists
+                data_dir = Path("data")
+                data_dir.mkdir(exist_ok=True)
+                
+                csv_path = data_dir / "filtered_experts.csv"
                 with open(csv_path, "w", newline="") as f:
                     f.write(output.getvalue())
                 
@@ -1504,15 +1595,15 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                     }
                 }
                 
-                json_path = "filtered_experts.json"
+                json_path = data_dir / "filtered_experts.json"
                 with open(json_path, "w") as f:
                     json.dump(json_data, f, indent=2)
                 
-                return csv_path, json_path
+                return str(csv_path), str(json_path)
             
             export_btn.click(
                 export_filtered_results,
-                inputs=[merge_state, rank_min_filter, rank_max_filter, n_prune_filter, selection_mode, action_mode],
+                inputs=[merge_state, rank_min_filter, rank_max_filter, n_prune_filter, selection_mode, action_mode, ignore_experts_input],
                 outputs=[export_file, export_json_file],
             )
 

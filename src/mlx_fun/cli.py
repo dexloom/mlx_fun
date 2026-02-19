@@ -1,6 +1,7 @@
 """CLI for MLX-FUN: collect saliency, prune experts, smoke-test."""
 
 import os
+import shutil
 import click
 import numpy as np
 
@@ -117,8 +118,11 @@ def collect(model, dataset, output, max_samples, max_tokens, text_key, seed):
 @click.option("--domain-map", default=None, help="Path to domain_report.json from domain-scan.")
 @click.option("--domain-mode", default=None, type=click.Choice(["protect"]),
               help="'protect': never prune domain experts.")
+@click.option("--ignore-experts", default=None,
+              help="Comma-separated expert indices to protect from model-wide pruning. "
+                   "Format: 1,2,250..255 (ranges inclusive). Only valid with --model-wide.")
 def prune(model, saliency, expert_list, output, n_prune, metric, strategy, model_wide, min_experts_per_layer,
-          safety_map, safety_mode, domain_map, domain_mode):
+          safety_map, safety_mode, domain_map, domain_mode, ignore_experts):
     """Prune experts from model based on saliency statistics or expert list.
     
     Two modes of operation:
@@ -136,7 +140,7 @@ def prune(model, saliency, expert_list, output, n_prune, metric, strategy, model
         select_experts_to_keep, select_experts_to_keep_strided,
         select_experts_to_keep_model_wide,
         prune_model, load_safety_constraints, load_domain_constraints,
-        load_expert_list,
+        load_expert_list, parse_expert_list,
     )
     from .saliency import SaliencyAccumulator
     from .save import save_pruned_model
@@ -152,6 +156,18 @@ def prune(model, saliency, expert_list, output, n_prune, metric, strategy, model
         )
     if expert_list is not None and n_prune is not None:
         click.echo("Warning: --n-prune is ignored when --expert-list is provided.")
+    
+    # Validate --ignore-experts usage
+    if ignore_experts and not model_wide:
+        raise click.UsageError(
+            "--ignore-experts is only valid with --model-wide."
+        )
+
+    # Clean output directory if it exists
+    expanded_output = os.path.expanduser(output)
+    if os.path.exists(expanded_output):
+        click.echo(f"Removing existing output directory: {expanded_output}")
+        shutil.rmtree(expanded_output)
 
     # Expand user path and validate if it's a local path
     expanded_model = os.path.expanduser(model)
@@ -221,12 +237,19 @@ def prune(model, saliency, expert_list, output, n_prune, metric, strategy, model
 
         # Select experts to keep based on mode
         if model_wide:
+            # Parse ignored experts if provided
+            ignored_set = None
+            if ignore_experts:
+                ignored_set = parse_expert_list(ignore_experts)
+                click.echo(f"Ignoring {len(ignored_set)} expert indices: {sorted(ignored_set)}")
+            
             click.echo(f"Selecting experts to prune (model-wide: {n_prune} total, metric={metric})")
             keep_map = select_experts_to_keep_model_wide(
                 scores, n_prune,
                 protected_experts=protected_experts,
                 targeted_experts=targeted_experts,
                 min_experts_per_layer=min_experts_per_layer,
+                ignored_experts=ignored_set,
             )
             # Calculate total pruned and per-layer distribution
             total_pruned = sum(original_n_experts - len(keep_map[i]) for i in range(len(keep_map)))
@@ -300,9 +323,12 @@ def prune(model, saliency, expert_list, output, n_prune, metric, strategy, model
               help="Max tokens for permutation alignment.")
 @click.option("--text-key", default="content", help="JSON key for text in JSONL.")
 @click.option("--seed", default=None, type=int, help="Random seed.")
+@click.option("--ignore-experts", default=None,
+              help="Comma-separated expert indices to protect from model-wide merge. "
+                   "Format: 1,2,250..255 (ranges inclusive). Only valid with --model-wide.")
 def merge(model, saliency, expert_list, dataset, output, n_prune, metric, model_wide, min_experts_per_layer,
           similarity_mode, alignment, max_group_size, max_samples, max_tokens,
-          max_similarity_tokens, max_alignment_tokens, text_key, seed):
+          max_similarity_tokens, max_alignment_tokens, text_key, seed, ignore_experts):
     """Merge experts using REAM (Router-weighted Expert Activation Merging).
     
     Two modes of operation:
@@ -329,6 +355,18 @@ def merge(model, saliency, expert_list, dataset, output, n_prune, metric, model_
         )
     if expert_list is not None and n_prune is not None:
         click.echo("Warning: --n-prune is ignored when --expert-list is provided.")
+    
+    # Validate --ignore-experts usage
+    if ignore_experts and not model_wide:
+        raise click.UsageError(
+            "--ignore-experts is only valid with --model-wide."
+        )
+
+    # Clean output directory if it exists
+    expanded_output = os.path.expanduser(output)
+    if os.path.exists(expanded_output):
+        click.echo(f"Removing existing output directory: {expanded_output}")
+        shutil.rmtree(expanded_output)
 
     if seed is not None:
         random.seed(seed)
@@ -337,7 +375,7 @@ def merge(model, saliency, expert_list, dataset, output, n_prune, metric, model_
     from .adapters import get_adapter
     from .data import load_dataset
     from .merger import merge_model, merge_model_with_keep_map
-    from .pruner import select_experts_to_keep_model_wide, load_expert_list
+    from .pruner import select_experts_to_keep_model_wide, load_expert_list, parse_expert_list
     from .saliency import SaliencyAccumulator
     from .save import save_merged_model
 
@@ -415,10 +453,17 @@ def merge(model, saliency, expert_list, dataset, output, n_prune, metric, model_
         # Use keep_map-based merge
         if not expert_list:
             # Compute keep_map from saliency
+            # Parse ignored experts if provided
+            ignored_set = None
+            if ignore_experts:
+                ignored_set = parse_expert_list(ignore_experts)
+                click.echo(f"Ignoring {len(ignored_set)} expert indices: {sorted(ignored_set)}")
+            
             click.echo(f"Model-wide merge: selecting {n_prune} experts to merge globally...")
             keep_map = select_experts_to_keep_model_wide(
                 scores, n_prune,
                 min_experts_per_layer=min_experts_per_layer,
+                ignored_experts=ignored_set,
             )
         
         # Calculate distribution

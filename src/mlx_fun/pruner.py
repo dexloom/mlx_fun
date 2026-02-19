@@ -64,6 +64,77 @@ def load_domain_constraints(
         raise ValueError(f"Unknown domain_mode '{mode}'. Use: protect")
 
 
+def parse_expert_list(expert_spec: str) -> set:
+    """Parse expert specification string into a set of indices.
+
+    Supports:
+    - Individual indices: "1,2,5"
+    - Ranges: "250..255" (inclusive)
+    - Combined: "1,2,250..255"
+    - Whitespace tolerant: "1, 2, 250..255"
+
+    Args:
+        expert_spec: Comma-separated list of indices or ranges.
+
+    Returns:
+        Set of expert indices.
+
+    Raises:
+        ValueError: If format is invalid (non-integer values, invalid ranges).
+
+    Examples:
+        >>> parse_expert_list("5")
+        {5}
+        >>> parse_expert_list("1,2,5")
+        {1, 2, 5}
+        >>> parse_expert_list("250..255")
+        {250, 251, 252, 253, 254, 255}
+        >>> parse_expert_list("1,2,250..255")
+        {1, 2, 250, 251, 252, 253, 254, 255}
+    """
+    if not expert_spec or not expert_spec.strip():
+        return set()
+
+    indices = set()
+    parts = expert_spec.split(",")
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        if ".." in part:
+            # Parse range
+            range_parts = part.split("..")
+            if len(range_parts) != 2:
+                raise ValueError(
+                    f"Invalid range format: '{part}'. Expected 'start..end'."
+                )
+            try:
+                start = int(range_parts[0].strip())
+                end = int(range_parts[1].strip())
+            except ValueError as e:
+                raise ValueError(
+                    f"Invalid range bounds in '{part}': {e}"
+                ) from e
+
+            if start > end:
+                raise ValueError(
+                    f"Invalid range '{part}': start ({start}) > end ({end})."
+                )
+            indices.update(range(start, end + 1))
+        else:
+            # Parse single index
+            try:
+                indices.add(int(part))
+            except ValueError as e:
+                raise ValueError(
+                    f"Invalid expert index: '{part}'. Expected integer."
+                ) from e
+
+    return indices
+
+
 def load_expert_list(
     expert_list_path: str,
 ) -> Dict[int, np.ndarray]:
@@ -209,6 +280,7 @@ def select_experts_to_keep_model_wide(
     protected_experts: Dict[int, np.ndarray] = None,
     targeted_experts: Dict[int, np.ndarray] = None,
     min_experts_per_layer: int = 1,
+    ignored_experts: set = None,
 ) -> Dict[int, np.ndarray]:
     """Select experts to keep using model-wide column selection.
 
@@ -225,6 +297,7 @@ def select_experts_to_keep_model_wide(
         protected_experts: Optional dict mapping layer_idx -> expert IDs to never prune.
         targeted_experts: Optional dict mapping layer_idx -> expert IDs to always prune.
         min_experts_per_layer: Minimum experts to keep in each layer (default 1).
+        ignored_experts: Optional set of expert indices to never prune globally.
 
     Returns:
         Dict mapping layer_index -> numpy array of kept expert indices (sorted).
@@ -255,6 +328,12 @@ def select_experts_to_keep_model_wide(
                 protect_count[expert_idx] += 1
         # If an expert is protected in ANY layer, don't prune it globally
         column_scores[protect_count > 0] = np.inf
+
+    # Apply ignored_experts protection (globally protected indices)
+    if ignored_experts:
+        for expert_idx in ignored_experts:
+            if 0 <= expert_idx < num_experts:
+                column_scores[expert_idx] = np.inf
 
     if targeted_experts:
         target_count = np.zeros(num_experts)

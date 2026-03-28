@@ -478,8 +478,9 @@ mlx-fun serve \
 | `--steering-mode` | *(none)* | `safe` (boost safety experts) or `unsafe` (mask them) |
 | `--domain-map` | *(none)* | Path to `domain_report.json` for domain boosting at startup |
 | `--domain-steering-mode` | *(none)* | `boost` (activate domain experts) or `suppress` (deactivate general experts) |
+| `--max-kv-size` | *(none)* | Max KV cache size per layer (tokens). Uses sliding window to cap memory. |
 | `--kv-compress` | `false` | Enable TurboQuant KV cache compression |
-| `--kv-compress-bits` | 4 | Bits per channel for KV compression (2-8). Mutually exclusive with `--max-kv-size`. |
+| `--kv-compress-bits` | 4 | Bits per channel for KV compression (2-8). Can be combined with `--max-kv-size`. |
 
 The server is fully OpenAI-compatible — use it as a drop-in replacement:
 
@@ -779,6 +780,17 @@ mlx-fun serve \
     --port 8080 \
     --kv-compress --kv-compress-bits 3
 
+# Combine KV compression with sliding window (max 4096 tokens)
+mlx-fun serve \
+    --model mlx-community/MiniMax-M1-40k-4bit \
+    --kv-compress --kv-compress-bits 4 \
+    --max-kv-size 4096
+
+# Sliding window only (no compression) — cap context to 8192 tokens
+mlx-fun serve \
+    --model mlx-community/MiniMax-M1-40k-4bit \
+    --max-kv-size 8192
+
 # Combine with expert steering
 mlx-fun steer \
     --model mlx-community/Qwen3-30B-A3B-4bit \
@@ -814,6 +826,8 @@ mlx-fun steer \
 | 2 | Acceptable | ~8x | Extreme compression |
 
 TurboQuant is complementary to weight quantization (GPTQ, AWQ) — use both for maximum compression: 4-bit model weights + 3-bit KV cache.
+
+**Sliding window support:** TurboQuant can be combined with `--max-kv-size` to cap the KV cache to a fixed number of tokens. When the cache exceeds the limit, the oldest tokens are dropped (while preserving the first 4 tokens for BOS/system prompt). This provides both memory savings from compression AND bounded memory from windowing. Without `--max-kv-size`, the cache grows unbounded (full context attention).
 
 ### Statistics Operations: Diff, Merge, Purge
 

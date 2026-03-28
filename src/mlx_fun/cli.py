@@ -609,12 +609,6 @@ def serve(model, host, port, mode, auto_save, max_tokens, max_kv_size,
     """
     from .server import run_reap_server
 
-    if kv_compress and max_kv_size is not None:
-        raise click.UsageError(
-            "--kv-compress and --max-kv-size are mutually exclusive. "
-            "TurboQuant cache does not yet support a rotating window."
-        )
-
     run_reap_server(
         host=host,
         port=port,

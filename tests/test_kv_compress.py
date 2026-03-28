@@ -569,3 +569,122 @@ class TestMakeTurboQuantCache:
         caches = make_turbo_quant_cache(FakeModel())
         assert caches[0]._bits == 4
         assert caches[0]._group_size == 64
+
+    def test_max_size_propagated(self):
+        class FakeModel:
+            layers = [None] * 2
+
+        cfg = TurboQuantConfig(bits=4, max_size=1024, keep=4)
+        caches = make_turbo_quant_cache(FakeModel(), cfg)
+        assert caches[0]._max_size == 1024
+        assert caches[0]._keep == 4
+
+
+# ---------------------------------------------------------------------------
+# Sliding window tests
+# ---------------------------------------------------------------------------
+
+
+class TestSlidingWindow:
+    """Test TurboQuantKVCache with max_size (sliding window)."""
+
+    def _make_cache(self, max_size, keep=4, bits=4, group_size=64, quantized_sdpa=False):
+        cfg = TurboQuantConfig(
+            bits=bits, group_size=group_size, quantized_sdpa=quantized_sdpa,
+            max_size=max_size, keep=keep,
+        )
+        return TurboQuantKVCache(config=cfg)
+
+    def _random_kv(self, B=1, n_heads=2, steps=1, head_dim=64):
+        keys = mx.random.normal((B, n_heads, steps, head_dim))
+        values = mx.random.normal((B, n_heads, steps, head_dim))
+        mx.eval(keys, values)
+        return keys, values
+
+    def test_no_trim_under_limit(self):
+        cache = self._make_cache(max_size=32, keep=4)
+        for _ in range(16):
+            k, v = self._random_kv()
+            cache.update_and_fetch(k, v)
+        assert cache.offset == 16
+
+    def test_trim_at_limit(self):
+        cache = self._make_cache(max_size=16, keep=4)
+        for _ in range(20):
+            k, v = self._random_kv()
+            cache.update_and_fetch(k, v)
+        assert cache.offset == 16
+
+    def test_trim_preserves_keep_tokens(self):
+        """First `keep` tokens should be preserved after trimming."""
+        cache = self._make_cache(max_size=8, keep=2, quantized_sdpa=False)
+        # Insert 4 tokens as initial batch
+        k_init, v_init = self._random_kv(steps=4)
+        k_out_init, v_out_init = cache.update_and_fetch(k_init, v_init)
+        mx.eval(k_out_init, v_out_init)
+        # Save the first 2 tokens (the "keep" tokens)
+        first_two_k = k_out_init[:, :, :2, :]
+        first_two_v = v_out_init[:, :, :2, :]
+
+        # Insert more to trigger trim
+        for _ in range(8):
+            k, v = self._random_kv()
+            result = cache.update_and_fetch(k, v)
+            mx.eval(*result)
+
+        assert cache.offset == 8
+        # Get final state - first 2 tokens should match original
+        k_final, v_final = result
+        mx.eval(k_final, v_final)
+        assert mx.allclose(k_final[:, :, :2, :], first_two_k, atol=0.5)
+        assert mx.allclose(v_final[:, :, :2, :], first_two_v, atol=0.5)
+
+    def test_batch_insert_triggers_trim(self):
+        """Inserting a batch that exceeds max_size should trim."""
+        cache = self._make_cache(max_size=8, keep=2)
+        k, v = self._random_kv(steps=12)
+        cache.update_and_fetch(k, v)
+        assert cache.offset == 8
+
+    def test_repeated_trims(self):
+        """Multiple trims should keep offset stable at max_size."""
+        cache = self._make_cache(max_size=8, keep=2)
+        for _ in range(50):
+            k, v = self._random_kv()
+            cache.update_and_fetch(k, v)
+        assert cache.offset == 8
+
+    def test_no_window_when_max_size_none(self):
+        """Without max_size, cache grows unbounded."""
+        cfg = TurboQuantConfig(bits=4, group_size=64, quantized_sdpa=False)
+        cache = TurboQuantKVCache(config=cfg)
+        for _ in range(100):
+            k, v = self._random_kv()
+            cache.update_and_fetch(k, v)
+        assert cache.offset == 100
+
+    def test_quantized_sdpa_with_window(self):
+        """Sliding window works in quantized SDPA mode too."""
+        cache = self._make_cache(max_size=8, keep=2, quantized_sdpa=True)
+        for _ in range(12):
+            k, v = self._random_kv()
+            cache.update_and_fetch(k, v)
+        assert cache.offset == 8
+
+    def test_meta_state_roundtrip_with_window(self):
+        """meta_state should preserve max_size and keep."""
+        cache = self._make_cache(max_size=1024, keep=8)
+        state = cache.meta_state
+        cache2 = TurboQuantKVCache()
+        cache2.meta_state = state
+        assert cache2._max_size == 1024
+        assert cache2._keep == 8
+
+    def test_meta_state_none_max_size(self):
+        """meta_state roundtrip with no max_size."""
+        cfg = TurboQuantConfig(bits=4)
+        cache = TurboQuantKVCache(config=cfg)
+        state = cache.meta_state
+        cache2 = TurboQuantKVCache()
+        cache2.meta_state = state
+        assert cache2._max_size is None

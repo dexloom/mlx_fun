@@ -912,6 +912,46 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                      "Only applies when Selection Mode is 'Model-Wide'.",
             )
             
+            # Guard Experts section (model-wide mode)
+            gr.Markdown("#### Guard Experts (Model-Wide only)")
+            gr.Markdown(
+                "Automatically protect experts that rank in the top X% in ANY layer. "
+                "Lower rank = more important. Experts with rank < threshold in any layer are guarded."
+            )
+            
+            with gr.Row():
+                top_pct_input = gr.Number(
+                    label="Top Percent %",
+                    value=10,
+                    precision=1,
+                    minimum=0,
+                    maximum=100,
+                    info="Experts in top X% of any layer get guarded",
+                )
+                guard_experts_btn = gr.Button("Guard Experts", variant="secondary")
+            
+            guard_status_md = gr.Markdown("", visible=True)
+            
+            # Expert Removal section
+            gr.Markdown("#### Expert Removal (Model-Wide only)")
+            gr.Markdown(
+                "After guarding experts, select N additional experts for pruning/merging "
+                "from the remaining pool. Experts with highest rank sums (least important) are selected."
+            )
+            
+            with gr.Row():
+                n_remove_input = gr.Number(
+                    label="N to Remove",
+                    value=None,
+                    precision=0,
+                    minimum=0,
+                    info="Number of non-guarded experts to remove",
+                )
+                apply_removal_btn = gr.Button("Apply Removal", variant="secondary")
+                export_removal_btn = gr.Button("Export Removal Results", variant="primary")
+            
+            removal_status_md = gr.Markdown("", visible=True)
+            
             gr.Markdown("---")
             gr.Markdown("#### Dynamic Filters")
             gr.Markdown(
@@ -1004,6 +1044,14 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 # Get summed ranks (stored in freq array)
                 summed_ranks = merged.freq.copy()
                 
+                # Also load individual file rankings for guard experts feature
+                from .stats_ops import _compute_ranked_scores
+                individual_ranks = []
+                for file_path in files:
+                    acc = SaliencyAccumulator.load(file_path)
+                    ranks = _compute_ranked_scores(acc, metric_key)
+                    individual_ranks.append(ranks.tolist())
+                
                 # Store data for filtering
                 merge_data = {
                     "summed_ranks": summed_ranks.tolist(),
@@ -1012,6 +1060,7 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                     "files": files,
                     "metric": metric,
                     "metric_key": metric_key,
+                    "individual_ranks": individual_ranks,  # Per-file rankings for guard feature
                 }
 
                 # Create heatmap showing summed ranks using matplotlib
@@ -1098,6 +1147,373 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 merge_files_rank,
                 inputs=[merge_file1, merge_file2, merge_file3, merge_file4, metric_choice_merge],
                 outputs=[filter_info_md, merge_plot, merge_json, merge_state],
+            )
+            
+            def guard_experts_by_top_percent(merge_data, top_pct):
+                """Find experts to guard based on per-file per-layer top percentile ranking.
+                
+                An expert is guarded if it ranks in the top top_pct% in ANY layer of ANY NPZ file.
+                This checks individual file rankings, not the merged/summed ranks.
+                
+                Args:
+                    merge_data: Dictionary containing individual_ranks, num_layers, num_experts, files
+                    top_pct: Percentage threshold (e.g., 10 for top 10%)
+                
+                Returns:
+                    Tuple of (status_message, ignore_experts_text)
+                """
+                if merge_data is None:
+                    return "**No data available.** Please merge files first.", ""
+                
+                if top_pct is None or top_pct <= 0:
+                    return "**Invalid top percent.** Please enter a positive number.", ""
+                
+                num_layers = merge_data["num_layers"]
+                num_experts = merge_data["num_experts"]
+                files = merge_data.get("files", [])
+                individual_ranks = merge_data.get("individual_ranks", [])
+                
+                if not individual_ranks:
+                    return "**No individual file data available.** Please re-merge files.", ""
+                
+                # Calculate threshold: top_pct% of num_experts
+                threshold = int(top_pct / 100 * num_experts)
+                if threshold < 1:
+                    threshold = 1
+                
+                guarded = set()
+                guarded_details = []  # Track which file/layer triggered the guard
+                
+                # Check each individual file's rankings
+                for file_idx, file_ranks in enumerate(individual_ranks):
+                    file_ranks_arr = np.array(file_ranks)
+                    file_name = files[file_idx] if file_idx < len(files) else f"file {file_idx}"
+                    
+                    for expert_idx in range(num_experts):
+                        if expert_idx in guarded:
+                            continue  # Already guarded, skip
+                        
+                        # Check this expert's rank in all layers of this file
+                        for layer_idx in range(num_layers):
+                            expert_rank = file_ranks_arr[layer_idx, expert_idx]
+                            
+                            # Rank 1 = best, so check if rank <= threshold
+                            # (ranks are 1-indexed: 1, 2, 3, ... num_experts)
+                            if expert_rank <= threshold:
+                                guarded.add(expert_idx)
+                                guarded_details.append({
+                                    "expert": expert_idx,
+                                    "file": file_name,
+                                    "layer": layer_idx,
+                                    "rank": int(expert_rank),
+                                })
+                                break  # No need to check other layers in this file
+                
+                # Format the guarded experts as comma-separated string
+                if guarded:
+                    sorted_guarded = sorted(guarded)
+                    # Format as ranges where possible
+                    ignore_text = format_expert_indices(sorted_guarded)
+                    
+                    # Build status message
+                    status = (
+                        f"**Guarded {len(guarded)} experts** (top {top_pct}% threshold: rank ≤ {threshold})\n\n"
+                        f"Experts protected: {ignore_text}\n\n"
+                        f"These experts rank in the top {top_pct}% in at least one layer of at least one NPZ file.\n\n"
+                        f"Checked {len(individual_ranks)} files."
+                    )
+                else:
+                    status = f"**No experts guarded.** No expert ranks in top {top_pct}% of any layer in any file."
+                    ignore_text = ""
+                
+                return status, ignore_text
+            
+            def format_expert_indices(indices):
+                """Format a list of indices as comma-separated values with ranges.
+                
+                Examples:
+                    [1, 2, 3, 5, 7, 8, 9] -> "1..3, 5, 7..9"
+                """
+                if not indices:
+                    return ""
+                
+                result = []
+                start = indices[0]
+                end = indices[0]
+                
+                for i in range(1, len(indices)):
+                    if indices[i] == end + 1:
+                        end = indices[i]
+                    else:
+                        if start == end:
+                            result.append(str(start))
+                        else:
+                            result.append(f"{start}..{end}")
+                        start = indices[i]
+                        end = indices[i]
+                
+                # Add last range
+                if start == end:
+                    result.append(str(start))
+                else:
+                    result.append(f"{start}..{end}")
+                
+                return ", ".join(result)
+            
+            def select_n_experts_for_removal(merge_data, ignore_experts_str, n_remove):
+                """Select N least important experts from non-guarded pool and update visualization.
+                
+                After excluding guarded experts, select the N experts with highest
+                total rank sums (least important) for pruning/merging.
+                Also updates the visualization to show which experts are selected for removal.
+                
+                Args:
+                    merge_data: Dictionary containing summed_ranks, num_layers, num_experts
+                    ignore_experts_str: Comma-separated expert indices to exclude
+                    n_remove: Number of experts to select for removal
+                
+                Returns:
+                    Tuple of (status_message, plot_figure, removal_info_json)
+                """
+                if merge_data is None:
+                    return "**No data available.** Please merge files first.", None, None
+                
+                if n_remove is None or n_remove <= 0:
+                    return "**Invalid N to remove.** Please enter a positive number.", None, None
+                
+                summed_ranks = np.array(merge_data["summed_ranks"])
+                num_layers = merge_data["num_layers"]
+                num_experts = merge_data["num_experts"]
+                metric = merge_data["metric"]
+                
+                # Parse ignored experts
+                ignored_set = set()
+                if ignore_experts_str and ignore_experts_str.strip():
+                    from .pruner import parse_expert_list
+                    try:
+                        ignored_set = parse_expert_list(ignore_experts_str)
+                    except ValueError as e:
+                        return f"**Error parsing ignore experts:** {str(e)}", None, None
+                
+                # Build list of non-guarded experts with their total scores
+                candidates = []
+                for expert_idx in range(num_experts):
+                    if expert_idx not in ignored_set:
+                        # Sum across all layers (higher = less important)
+                        total_score = summed_ranks[:, expert_idx].sum()
+                        candidates.append({
+                            "expert": expert_idx,
+                            "total_score": float(total_score),
+                        })
+                
+                if not candidates:
+                    return "**No candidates available.** All experts are guarded.", None, None
+                
+                # Sort by score descending (highest first = least important)
+                candidates.sort(key=lambda x: x["total_score"], reverse=True)
+                
+                # Cap n_remove at available candidates
+                actual_n = min(int(n_remove), len(candidates))
+                selected = candidates[:actual_n]
+                selected_indices = [c["expert"] for c in selected]
+                selected_set = set(selected_indices)
+                
+                # Create mask: True = keep (visible), False = remove (hidden)
+                mask = np.ones_like(summed_ranks, dtype=bool)
+                for expert_idx in selected_set:
+                    mask[:, expert_idx] = False
+                
+                # Create masked heatmap - preserve original color scale
+                masked_ranks = np.where(mask, summed_ranks, np.nan)
+                
+                # Get original data range for consistent color scaling
+                original_vmin = float(summed_ranks.min())
+                original_vmax = float(summed_ranks.max())
+                
+                width = 14
+                height = max(4, min(8, num_layers * 0.1))
+                fig, ax = plt.subplots(figsize=(width, height))
+                
+                im = ax.imshow(
+                    masked_ranks,
+                    aspect="auto",
+                    cmap="RdYlGn_r",
+                    interpolation="nearest",
+                    vmin=original_vmin,
+                    vmax=original_vmax,
+                )
+                
+                ax.set_xlabel("Expert Index")
+                ax.set_ylabel("MoE Layer Index")
+                ax.set_title(f"Experts Selected for Removal - {metric} (White = To Be Removed)")
+                
+                # Show every 10th tick label on X-axis
+                ax.set_xticks(range(0, num_experts, 10))
+                ax.set_xticklabels([str(i) for i in range(0, num_experts, 10)], fontsize=7)
+                
+                fig.colorbar(im, ax=ax, label="Summed Rank (Lower = More Important)")
+                fig.tight_layout()
+                
+                # Build status message
+                selected_text = format_expert_indices(selected_indices)
+                
+                status = (
+                    f"**Selected {actual_n} experts for removal**\n\n"
+                    f"Experts to remove: {selected_text}\n\n"
+                    f"Total candidates (non-guarded): {len(candidates)}\n"
+                    f"Guarded experts excluded: {len(ignored_set)}\n\n"
+                    f"White columns in the plot show experts selected for removal."
+                )
+                
+                removal_info = {
+                    "n_requested": int(n_remove),
+                    "n_selected": actual_n,
+                    "total_candidates": len(candidates),
+                    "guarded_count": len(ignored_set),
+                    "selected_experts": selected_indices,
+                    "selected_details": selected,
+                }
+                
+                return status, fig, removal_info
+            
+            # Wire up Guard Experts button
+            guard_experts_btn.click(
+                guard_experts_by_top_percent,
+                inputs=[merge_state, top_pct_input],
+                outputs=[guard_status_md, ignore_experts_input],
+            )
+            
+            # Wire up Apply Removal button
+            apply_removal_btn.click(
+                select_n_experts_for_removal,
+                inputs=[merge_state, ignore_experts_input, n_remove_input],
+                outputs=[removal_status_md, merge_plot, merge_json],
+            )
+            
+            def export_removal_results(merge_data, ignore_experts_str, n_remove):
+                """Export removal results to CSV and JSON files.
+                
+                Exports two files:
+                - removal_experts.csv: Human-readable format for inspection
+                - removal_experts.json: Machine-readable keep_map for CLI consumption
+                
+                Returns:
+                    Tuple of (csv_path, json_path) for Gradio download
+                """
+                if merge_data is None:
+                    return None, None
+                
+                if n_remove is None or n_remove <= 0:
+                    return None, None
+                
+                summed_ranks = np.array(merge_data["summed_ranks"])
+                num_layers = merge_data["num_layers"]
+                num_experts = merge_data["num_experts"]
+                
+                # Parse ignored experts
+                ignored_set = set()
+                if ignore_experts_str and ignore_experts_str.strip():
+                    from .pruner import parse_expert_list
+                    try:
+                        ignored_set = parse_expert_list(ignore_experts_str)
+                    except ValueError:
+                        pass  # Ignore parsing errors on export
+                
+                # Build list of non-guarded experts with their total scores
+                candidates = []
+                for expert_idx in range(num_experts):
+                    if expert_idx not in ignored_set:
+                        total_score = summed_ranks[:, expert_idx].sum()
+                        candidates.append({
+                            "expert": expert_idx,
+                            "total_score": float(total_score),
+                        })
+                
+                if not candidates:
+                    return None, None
+                
+                # Sort by score descending (highest first = least important)
+                candidates.sort(key=lambda x: x["total_score"], reverse=True)
+                
+                # Cap n_remove at available candidates
+                actual_n = min(int(n_remove), len(candidates))
+                selected = candidates[:actual_n]
+                selected_indices = [c["expert"] for c in selected]
+                selected_set = set(selected_indices)
+                
+                # Build lists of kept and removed experts
+                keep_experts = []
+                remove_experts = []
+                
+                for layer_idx in range(num_layers):
+                    for expert_idx in range(num_experts):
+                        rank_sum = float(summed_ranks[layer_idx, expert_idx])
+                        if expert_idx in selected_set:
+                            remove_experts.append({
+                                "layer": layer_idx,
+                                "expert": expert_idx,
+                                "rank_sum": rank_sum,
+                                "action": "remove",
+                            })
+                        else:
+                            action = "guard" if expert_idx in ignored_set else "keep"
+                            keep_experts.append({
+                                "layer": layer_idx,
+                                "expert": expert_idx,
+                                "rank_sum": rank_sum,
+                                "action": action,
+                            })
+                
+                # Sort by rank sum (most important first)
+                keep_experts.sort(key=lambda x: x["rank_sum"])
+                remove_experts.sort(key=lambda x: x["rank_sum"], reverse=True)
+                
+                # --- Export CSV (human-readable) ---
+                all_experts = keep_experts + remove_experts
+                output = io.StringIO()
+                writer = csv.DictWriter(output, fieldnames=["layer", "expert", "rank_sum", "action"])
+                writer.writeheader()
+                writer.writerows(all_experts)
+                
+                # Ensure data directory exists
+                data_dir = Path("data")
+                data_dir.mkdir(exist_ok=True)
+                
+                csv_path = data_dir / "removal_experts.csv"
+                with open(csv_path, "w", newline="") as f:
+                    f.write(output.getvalue())
+                
+                # --- Export JSON (machine-readable keep_map) ---
+                # Build keep_map structure (experts NOT selected for removal)
+                keep_map = {}
+                for layer_idx in range(num_layers):
+                    kept = sorted([
+                        expert_idx for expert_idx in range(num_experts)
+                        if expert_idx not in selected_set
+                    ])
+                    keep_map[str(layer_idx)] = kept
+                
+                json_data = {
+                    "keep_map": keep_map,
+                    "n_removed": actual_n,
+                    "n_guarded": len(ignored_set),
+                    "removed_expert_indices": selected_indices,
+                    "guarded_expert_indices": sorted(ignored_set),
+                    "num_layers": num_layers,
+                    "num_experts": num_experts,
+                }
+                
+                json_path = data_dir / "removal_experts.json"
+                with open(json_path, "w") as f:
+                    json.dump(json_data, f, indent=2)
+                
+                return str(csv_path), str(json_path)
+            
+            # Wire up Export Removal button
+            export_removal_btn.click(
+                export_removal_results,
+                inputs=[merge_state, ignore_experts_input, n_remove_input],
+                outputs=[export_file, export_json_file],
             )
             
             def apply_filters(merge_data, min_rank, max_rank, n_prune, selection_mode, action_mode, ignore_experts_str):
@@ -1759,10 +2175,35 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
             with gr.Row():
                 server_info_btn = gr.Button("Refresh Server Info", variant="primary")
             server_info_json = gr.JSON(label="Server Info")
+            kv_status_md = gr.Markdown(value="*Click Refresh to load KV cache status*")
+
+            def _refresh_info_and_kv():
+                info = _safe_call(lambda: fetch_server_info(base_url))
+                if isinstance(info, dict) and "error" not in info:
+                    parts = []
+                    kv_size = info.get("max_kv_size")
+                    kv_comp = info.get("kv_compress")
+                    if kv_size:
+                        parts.append(f"**Window:** {kv_size} tokens/layer")
+                    else:
+                        parts.append("**Window:** Full (unlimited)")
+                    if kv_comp and kv_comp.get("enabled"):
+                        mode = "Quantized SDPA" if kv_comp.get("quantized_sdpa") else "Plain SDPA"
+                        bits = kv_comp.get("bits", "?")
+                        parts.append(f"**KV Compression:** {bits}-bit PolarQuant ({mode})")
+                        comp_max = kv_comp.get("max_size")
+                        if comp_max:
+                            parts.append(f"**Compressed Window:** {comp_max} tokens/layer")
+                    else:
+                        parts.append("**KV Compression:** Off (full precision)")
+                    kv_md = "#### Context Attention Status\n" + " | ".join(parts)
+                else:
+                    kv_md = "*Could not fetch server info*"
+                return info, kv_md
 
             server_info_btn.click(
-                lambda: _safe_call(lambda: fetch_server_info(base_url)),
-                outputs=[server_info_json],
+                _refresh_info_and_kv,
+                outputs=[server_info_json, kv_status_md],
             )
 
             gr.Markdown("---")

@@ -42,12 +42,19 @@ class TurboQuantConfig:
         quantized_sdpa: If True, return quantized tuples and expose
             ``self.bits`` so attention uses ``quantized_matmul``.
             Requires :func:`install_turbo_quant_sdpa` to be called.
+        max_size: If set, cap the KV cache to this many tokens using a
+            sliding window.  Oldest tokens (except ``keep``) are dropped
+            when the cache exceeds this size.
+        keep: Number of initial tokens to always preserve when trimming
+            via sliding window (e.g. BOS + system prompt start).
     """
 
     bits: int = 4
     group_size: int = 64
     seed: int = 0
     quantized_sdpa: bool = True
+    max_size: Optional[int] = None
+    keep: int = 4
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +164,8 @@ class TurboQuantKVCache:
         self._group_size = self.config.group_size
         self._quantized_sdpa = self.config.quantized_sdpa
         self.offset: int = 0
+        self._max_size = self.config.max_size
+        self._keep = self.config.keep
 
         # Expose bits/group_size only in quantized SDPA mode so
         # base.scaled_dot_product_attention dispatches to quantized path.
@@ -213,6 +222,28 @@ class TurboQuantKVCache:
         self, buf: Tuple[mx.array, mx.array, mx.array],
     ) -> Tuple[mx.array, mx.array, mx.array]:
         return tuple(t[..., : self.offset, :] for t in buf)
+
+    def _trim_to_window(self) -> None:
+        """Drop oldest tokens to fit within ``max_size``, preserving
+        the first ``keep`` tokens.
+
+        Quantization is per-token along head_dim, so slicing along the
+        sequence axis is safe — each token's scales/biases are independent.
+        """
+        keep = min(self._keep, self._max_size)
+        recent_len = self._max_size - keep
+        recent_start = self.offset - recent_len
+        for label in ("_keys", "_values"):
+            buf = getattr(self, label)
+            trimmed = tuple(
+                mx.concatenate(
+                    [t[..., :keep, :], t[..., recent_start : self.offset, :]],
+                    axis=-2,
+                )
+                for t in buf
+            )
+            setattr(self, label, trimmed)
+        self.offset = self._max_size
 
     # -- core API ---------------------------------------------------------
 
@@ -273,6 +304,10 @@ class TurboQuantKVCache:
             self._keys[i][..., prev : self.offset, :] = k_q[i]
             self._values[i][..., prev : self.offset, :] = v_q[i]
 
+        # --- sliding window trim (if max_size is set) ----------------------
+        if self._max_size is not None and self.offset > self._max_size:
+            self._trim_to_window()
+
         k_sliced = self._sliced(self._keys)
         v_sliced = self._sliced(self._values)
 
@@ -330,7 +365,9 @@ class TurboQuantKVCache:
     def meta_state(self):
         return tuple(
             map(str, (self.offset, self._bits, self._group_size, self.config.seed,
-                       int(self._quantized_sdpa)))
+                       int(self._quantized_sdpa),
+                       self._max_size if self._max_size is not None else -1,
+                       self._keep))
         )
 
     @meta_state.setter
@@ -342,10 +379,19 @@ class TurboQuantKVCache:
         self.config.seed = int(vals[3])
         if len(vals) > 4:
             self._quantized_sdpa = bool(int(vals[4]))
+        if len(vals) > 5:
+            ms = int(vals[5])
+            self._max_size = ms if ms >= 0 else None
+        if len(vals) > 6:
+            self._keep = int(vals[6])
 
     def make_mask(self, *args, **kwargs):
         from mlx_lm.models.cache import create_attention_mask
-        return create_attention_mask(*args, offset=self.offset, **kwargs)
+        offset = min(self.offset, self._max_size - 1) if self._max_size else self.offset
+        window = self._max_size if self._max_size else None
+        return create_attention_mask(
+            *args, offset=offset, window_size=window, **kwargs
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -525,6 +571,8 @@ def setup_turbo_quant(
                 group_size=cfg.group_size,
                 seed=cfg.seed,
                 quantized_sdpa=False,
+                max_size=cfg.max_size,
+                keep=cfg.keep,
             )
 
     caches = make_turbo_quant_cache(model, cfg)

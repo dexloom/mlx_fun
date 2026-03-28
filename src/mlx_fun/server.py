@@ -606,6 +606,7 @@ class ReapAPIHandler:
         accumulator: OnlineAccumulator,
         moe_blocks: List = None,
         num_experts: int = 0,
+        kv_compress_info: Optional[dict] = None,
     ):
         """Dynamically create a handler class with accumulator reference.
 
@@ -620,6 +621,7 @@ class ReapAPIHandler:
             _reap_moe_blocks = moe_blocks
             _reap_num_experts = num_experts
             _reap_steering_config = None  # Current SteeringConfig or None
+            _reap_kv_compress_info = kv_compress_info
 
             def do_GET(self):
                 if self.path == "/v1/reap/stats":
@@ -667,6 +669,7 @@ class ReapAPIHandler:
                     "request_count": acc._request_count,
                     "token_count": acc._token_count,
                     "steering_active": self._reap_steering_config is not None,
+                    "kv_compress": self._reap_kv_compress_info,
                 }
                 self._json_response(200, info)
 
@@ -763,6 +766,8 @@ def run_reap_server(
     max_kv_size: Optional[int] = None,
     domain_map: Optional[str] = None,
     domain_steering_mode: Optional[str] = None,
+    kv_compress: bool = False,
+    kv_compress_bits: int = 4,
 ):
     """Load model, install counting hooks, and start the server.
 
@@ -781,6 +786,8 @@ def run_reap_server(
         steering_mode: Optional 'safe' or 'unsafe' steering mode.
         domain_map: Optional path to domain_report.json for domain boosting.
         domain_steering_mode: Optional 'boost' or 'suppress' domain mode.
+        kv_compress: Enable TurboQuant KV cache compression (PolarQuant).
+        kv_compress_bits: Bits per channel for KV compression (2-8).
     """
     from mlx_lm import load as mlx_load
     from mlx_lm.server import (
@@ -857,6 +864,28 @@ def run_reap_server(
             f"KV cache limited to {max_kv_size} tokens per layer (RotatingKVCache)"
         )
 
+    # Apply TurboQuant KV cache compression if specified
+    if kv_compress:
+        from .kv_compress import TurboQuantConfig, TurboQuantKVCache, setup_turbo_quant
+
+        _tq_cfg = TurboQuantConfig(bits=kv_compress_bits)
+        _tq_caches_template, sdpa_patched = setup_turbo_quant(model, model_type, _tq_cfg)
+        # We need make_cache to create fresh caches per conversation
+        _tq_effective_cfg = _tq_caches_template[0].config if _tq_caches_template else _tq_cfg
+        _num_model_layers = len(model.layers)
+
+        def _make_cache():
+            return [
+                TurboQuantKVCache(config=_tq_effective_cfg)
+                for _ in range(_num_model_layers)
+            ]
+
+        model.make_cache = _make_cache
+        mode_str = "quantized SDPA" if sdpa_patched else "plain SDPA"
+        logging.info(
+            f"TurboQuant KV compression enabled ({kv_compress_bits}-bit PolarQuant, {mode_str})"
+        )
+
     # Build cli_args namespace for mlx-lm server
     cli_kwargs = dict(
         model=model_path,
@@ -872,8 +901,17 @@ def run_reap_server(
     response_generator = ResponseGenerator(provider, prompt_cache)
 
     # Create handler class with accumulator and steering access
+    kv_compress_info = None
+    if kv_compress:
+        kv_compress_info = {
+            "enabled": True,
+            "bits": kv_compress_bits,
+            "method": "TurboQuant/PolarQuant",
+            "quantized_sdpa": sdpa_patched,
+        }
     handler_class = ReapAPIHandler.create_handler_class(
         accumulator, moe_blocks=moe_blocks, num_experts=n_experts,
+        kv_compress_info=kv_compress_info,
     )
 
     # Auto-save on shutdown

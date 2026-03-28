@@ -2,7 +2,7 @@
 
 **Expert Pruning and Merging for Mixture-of-Experts models on Apple Silicon**
 
-MLX-FUN is an MLX-native toolkit for compressing and analyzing MoE language models on Apple Silicon via [MLX](https://github.com/ml-explore/mlx). It implements seven complementary techniques:
+MLX-FUN is an MLX-native toolkit for compressing and analyzing MoE language models on Apple Silicon via [MLX](https://github.com/ml-explore/mlx). It implements eight complementary techniques:
 
 - **REAP** (Routing-based Expert Activation Pruning) — removes the least important experts by measuring saliency from calibration data, then slicing weight tensors. Based on [Cerebras Research's REAP](https://github.com/CerebrasResearch/reap).
 - **REAM** (Router-weighted Expert Activation Merging) — instead of discarding experts, groups them around high-saliency centroids and merges via neuron-aligned weighted averaging. Preserves knowledge from all experts while still reducing the model size. Based on [REAM](https://bknyaz.github.io/blog/2026/moe/).
@@ -11,6 +11,7 @@ MLX-FUN is an MLX-native toolkit for compressing and analyzing MoE language mode
 - **Abliteration** — removes refusal directions from model weight matrices by orthogonalization, adapted for MoE architectures with per-expert targeting. Based on [Arditi et al. (NeurIPS 2024)](https://proceedings.neurips.cc/paper_files/paper/2024/file/f545448535dfde4f9786555403ab7c49-Paper-Conference.pdf).
 - **Domain Scan** — identifies domain-specialized experts by comparing routing patterns on domain-specific data (e.g. Solidity, medical text) vs general data, using the same differential analysis as SAFEx.
 - **Amplify** — permanently modifies gate weights/biases so domain-specialized experts are favored natively, producing a model that works with standard `mlx_lm.load()` without runtime hooks.
+- **TurboQuant** (KV Cache Compression) — compresses the KV cache at inference time using PolarQuant rotation-based quantization. Reduces KV cache memory by 4-6x at 3-4 bits with near-zero accuracy loss, enabling longer contexts and larger models on Apple Silicon. Based on [TurboQuant (ICLR 2026)](https://arxiv.org/abs/2504.19874).
 
 MLX-FUN supports two collection modes:
 - **Offline calibration** (`mlx-fun collect`) — run a dataset through the model in batch
@@ -449,6 +450,8 @@ mlx-fun smoke-test \
 | `--model` | *(required)* | Path to pruned model directory |
 | `--prompt` | `pragma solidity ^0.8.0;` | Generation prompt |
 | `--max-tokens` | 100 | Maximum tokens to generate |
+| `--kv-compress` | `false` | Enable TurboQuant KV cache compression |
+| `--kv-compress-bits` | 4 | Bits per channel for KV compression (2-8) |
 
 ### Online Collection: Serve with Expert Counting
 
@@ -475,6 +478,8 @@ mlx-fun serve \
 | `--steering-mode` | *(none)* | `safe` (boost safety experts) or `unsafe` (mask them) |
 | `--domain-map` | *(none)* | Path to `domain_report.json` for domain boosting at startup |
 | `--domain-steering-mode` | *(none)* | `boost` (activate domain experts) or `suppress` (deactivate general experts) |
+| `--kv-compress` | `false` | Enable TurboQuant KV cache compression |
+| `--kv-compress-bits` | 4 | Bits per channel for KV compression (2-8). Mutually exclusive with `--max-kv-size`. |
 
 The server is fully OpenAI-compatible — use it as a drop-in replacement:
 
@@ -634,6 +639,8 @@ mlx-fun steer \
 | `--max-tokens` | 100 | Max tokens to generate |
 | `--mask-value` | -1e9 | Gate logit bias for deactivation |
 | `--boost-value` | 1e4 | Gate logit bias for activation |
+| `--kv-compress` | `false` | Enable TurboQuant KV cache compression |
+| `--kv-compress-bits` | 4 | Bits per channel for KV compression (2-8) |
 
 **How it works:** A pre-computed bias array of shape `(num_experts,)` is added to raw gate logits before top-k selection. In `safe` mode, HRCG experts get `+boost_value` bias (ensuring they're selected). In `unsafe` mode, all safety-critical experts get `mask_value` bias (effectively removing them from selection).
 
@@ -754,6 +761,59 @@ mlx-fun serve --model ... --domain-map domain_report.json --domain-steering-mode
 # Via the steer command (combine with safety steering)
 mlx-fun steer --model ... --safety-map safety_report.json --mode safe --prompt "..."
 ```
+
+### TurboQuant: KV Cache Compression
+
+Compress the KV cache at inference time using PolarQuant rotation-based quantization from [TurboQuant (Google Research, ICLR 2026)](https://arxiv.org/abs/2504.19874). This reduces KV cache memory by 4-6x while maintaining near-zero accuracy loss, enabling longer contexts and larger models on Apple Silicon.
+
+```bash
+# Smoke test with 4-bit KV compression
+mlx-fun smoke-test \
+    --model ./pruned_model \
+    --prompt "pragma solidity ^0.8.0;" \
+    --kv-compress --kv-compress-bits 4
+
+# Serve with KV compression
+mlx-fun serve \
+    --model mlx-community/MiniMax-M1-40k-4bit \
+    --port 8080 \
+    --kv-compress --kv-compress-bits 3
+
+# Combine with expert steering
+mlx-fun steer \
+    --model mlx-community/Qwen3-30B-A3B-4bit \
+    --safety-map safety_report.json --mode safe \
+    --prompt "How do I make a bomb?" \
+    --kv-compress --kv-compress-bits 4
+```
+
+**How it works:**
+
+1. **Random rotation** — A Haar-distributed orthogonal matrix is generated per attention head via QR decomposition. This rotation spreads outlier channel values across all dimensions, making the distribution more uniform.
+
+2. **Quantize** — The rotated keys and values are quantized using MLX's native `mx.quantize()` with the configured bit-width. Because the rotation removed channel outliers, quantization error is significantly lower at the same bit budget compared to vanilla quantization.
+
+3. **Store** — Rotated-quantized K/V are stored in the same packed format as MLX's built-in `QuantizedKVCache`, using pre-allocated buffers with 256-token step allocation.
+
+4. **Attention** — For supported models (MiniMax, GLM4, Qwen3, Qwen3-Next), the SDPA function is patched to rotate queries with the same rotation matrix, enabling hardware-accelerated `mx.quantized_matmul`. Since `(Q @ R.T) @ (K @ R.T).T = Q @ K.T` for orthogonal R, attention scores are mathematically identical. For unsupported models (DeepSeek V3.2, GLM-5), it falls back to dequantize + inverse-rotate, still providing full memory savings.
+
+**Two operating modes:**
+
+| Mode | Memory savings | Speed | Supported models |
+|------|---------------|-------|-----------------|
+| **Quantized SDPA** (default) | 4-6x KV cache reduction | Hardware-accelerated `quantized_matmul` | MiniMax, GLM4, Qwen3, Qwen3-Next |
+| **Plain SDPA** (fallback) | 4-6x KV cache reduction | Standard SDPA (dequantize on read) | All models |
+
+**Bit-width guidelines:**
+
+| Bits | Quality | Memory reduction | Recommended use |
+|------|---------|-----------------|----------------|
+| 8 | Near-lossless | ~2x | When quality is critical |
+| 4 | Excellent | ~4x | General use (default) |
+| 3 | Good | ~5.3x | Memory-constrained devices |
+| 2 | Acceptable | ~8x | Extreme compression |
+
+TurboQuant is complementary to weight quantization (GPTQ, AWQ) — use both for maximum compression: 4-bit model weights + 3-bit KV cache.
 
 ### Statistics Operations: Diff, Merge, Purge
 
@@ -1144,6 +1204,7 @@ All model types (pruned, merged, abliterated, amplified) load with standard `mlx
 - **Steering** (`steering.py`) injects pre-computed bias arrays into gate logits before top-k selection. Per-model-type hooks handle different gating mechanisms (sigmoid for MiniMax/GLM4, softmax for Qwen3). Biases can be hot-swapped at runtime.
 - **Abliterate** (`abliterate.py`) hooks decoder layers (not MoE blocks) to capture residual stream, computes refusal directions, and orthogonalizes weight matrices. Supports per-expert targeting via `_orthogonalize_expert_proj`.
 - **Domain** (`domain.py`) reuses `DifferentialAccumulator` from `safety.py` for domain-vs-general differential analysis, classifies experts into domain-specialized and general groups via `DomainReport`, computes amplification biases, and permanently modifies gate parameters (nn.Linear bias or correction_bias) for hook-free inference
+- **KV Compress** (`kv_compress.py`) implements TurboQuant PolarQuant rotation-based KV cache compression. `TurboQuantKVCache` stores rotated-quantized K/V in MLX's native packed format. For supported models, patches the model module's `scaled_dot_product_attention` to rotate queries, enabling `mx.quantized_matmul` for hardware-accelerated attention. Falls back to dequantize+inverse-rotate for unsupported architectures.
 - **Server** composes on mlx-lm's `APIHandler` and `ResponseGenerator`, uses compound counting+steering hooks that accumulate statistics AND apply steering in a single `__call__`, with REST endpoints for runtime steering control (supports safety_map, domain_map, and direct config)
 - **Frontend** (`frontend.py`) is a Gradio web app that connects to the running server via HTTP. Provides chat (streaming via SSE), expert activation heatmaps (matplotlib), steering controls, and server management. Launched via `mlx-fun ui`.
 
@@ -1154,7 +1215,7 @@ uv pip install -e ".[dev]"
 pytest tests/ -v
 ```
 
-227 tests covering:
+322 tests covering:
 - Adapter factory detection and attribute access (MiniMax, MiniMax-M2, GLM4-MoE, GLM4-MoE-Lite, Qwen3-MoE, Qwen3-Next)
 - Saliency math (formula verification, zero-division guards, save/load roundtrip)
 - Observer hooks (install/remove, capture shapes, numerical equivalence with/without hooks)
@@ -1168,6 +1229,7 @@ pytest tests/ -v
 - Abliteration (linear orthogonalization removes direction component, preserves orthogonal directions, idempotent, batched SwitchLinear orthogonalization, single expert orthogonalization, auto layer selection)
 - Domain identification (DomainReport save/load, domain/general classification, amplification bias computation with scale/threshold, gate weight amplification for MiniMax/GLM4/Qwen3, steering from domain report boost/suppress modes, pruner domain constraints and protection)
 - Frontend (API client helpers, streaming chat, heatmap/bar chart visualization, error handling with mock HTTP server)
+- KV cache compression (rotation matrix orthogonality, PolarQuant roundtrip error, inner product preservation, rotation quality improvement, TurboQuantKVCache plain/quantized modes, SDPA patching install/remove/passthrough, setup with fallback)
 - CLI (command registration, required arguments)
 
 ## References
@@ -1177,5 +1239,6 @@ pytest tests/ -v
 - **SAFEx paper**: [Are Safety Experts Safe? Stable Safety-Critical Expert Identification in MoE](https://arxiv.org/abs/2506.17368) — NeurIPS 2025
 - **SteerMoE paper**: [SteerMoE: Adaptive Expert Steering for MoE Safety](https://arxiv.org/abs/2509.09660)
 - **Abliteration paper**: [Refusal in Language Models Is Mediated by a Single Direction](https://proceedings.neurips.cc/paper_files/paper/2024/file/f545448535dfde4f9786555403ab7c49-Paper-Conference.pdf) — Arditi et al., NeurIPS 2024
+- **TurboQuant paper**: [TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate](https://arxiv.org/abs/2504.19874) — Google Research, ICLR 2026
 - **MLX**: [ml-explore/mlx](https://github.com/ml-explore/mlx) — Apple's array framework for Apple Silicon
 - **mlx-lm**: [ml-explore/mlx-lm](https://github.com/ml-explore/mlx-lm) — Language model tooling for MLX

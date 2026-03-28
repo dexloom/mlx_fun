@@ -553,6 +553,9 @@ def smoke_test(model, prompt, max_tokens):
               help="Hook mode: 'lightweight' skips activation norms, 'full' computes all metrics.")
 @click.option("--auto-save", default=None, help="Path to auto-save stats on shutdown.")
 @click.option("--max-tokens", default=512, type=int, help="Default max tokens for generation.")
+@click.option("--max-kv-size", default=None, type=int,
+              help="Max KV cache size per layer (tokens). Uses RotatingKVCache sliding window "
+                   "to cap memory usage for long conversations.")
 @click.option("--chat-template", default=None, help="Chat template override.")
 @click.option("--safety-map", default=None, help="Path to safety_report.json for steering.")
 @click.option("--steering-mode", default=None, type=click.Choice(["safe", "unsafe"]),
@@ -560,8 +563,9 @@ def smoke_test(model, prompt, max_tokens):
 @click.option("--domain-map", default=None, help="Path to domain_report.json for domain boosting.")
 @click.option("--domain-steering-mode", default=None, type=click.Choice(["boost", "suppress"]),
               help="Domain steering: 'boost' activates domain experts, 'suppress' deactivates general.")
-def serve(model, host, port, mode, auto_save, max_tokens, chat_template,
-          safety_map, steering_mode, domain_map, domain_steering_mode):
+def serve(model, host, port, mode, auto_save, max_tokens, max_kv_size,
+          chat_template, safety_map, steering_mode, domain_map,
+          domain_steering_mode):
     """Serve model with online expert counting and optional steering.
 
     Starts an OpenAI-compatible server that counts expert activations from
@@ -581,6 +585,7 @@ def serve(model, host, port, mode, auto_save, max_tokens, chat_template,
         mode=mode,
         auto_save=auto_save,
         max_tokens=max_tokens,
+        max_kv_size=max_kv_size,
         chat_template=chat_template,
         safety_map=safety_map,
         steering_mode=steering_mode,

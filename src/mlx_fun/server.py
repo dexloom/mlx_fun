@@ -760,6 +760,7 @@ def run_reap_server(
     chat_template: Optional[str] = None,
     safety_map: Optional[str] = None,
     steering_mode: Optional[str] = None,
+    max_kv_size: Optional[int] = None,
     domain_map: Optional[str] = None,
     domain_steering_mode: Optional[str] = None,
 ):
@@ -772,6 +773,9 @@ def run_reap_server(
         mode: 'lightweight' (freq/weighted_freq only) or 'full' (all metrics).
         auto_save: If set, save accumulator to this path on shutdown.
         max_tokens: Default max tokens for generation.
+        max_kv_size: If set, cap KV cache to this many tokens per layer
+            using RotatingKVCache (sliding window). Limits memory for long
+            conversations while preserving recent context.
         chat_template: Optional chat template override.
         safety_map: Optional path to safety_report.json for steering.
         steering_mode: Optional 'safe' or 'unsafe' steering mode.
@@ -835,6 +839,23 @@ def run_reap_server(
         domain_config = SteeringConfig.from_domain_report(domain_map, domain_steering_mode)
         _update_steering_bias(moe_blocks, domain_config, n_experts)
         logging.info(f"Domain steering enabled: mode={domain_steering_mode}, domain_map={domain_map}")
+
+    # Apply KV cache size limit if specified
+    if max_kv_size is not None:
+        from mlx_lm.models.cache import RotatingKVCache
+
+        _num_model_layers = len(model.layers)
+
+        def _make_cache():
+            return [
+                RotatingKVCache(max_size=max_kv_size, keep=4)
+                for _ in range(_num_model_layers)
+            ]
+
+        model.make_cache = _make_cache
+        logging.info(
+            f"KV cache limited to {max_kv_size} tokens per layer (RotatingKVCache)"
+        )
 
     # Build cli_args namespace for mlx-lm server
     cli_kwargs = dict(

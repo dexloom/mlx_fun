@@ -515,9 +515,14 @@ def merge(model, saliency, expert_list, dataset, output, n_prune, metric, model_
 @click.option("--model", required=True, help="Path to pruned model.")
 @click.option("--prompt", default="pragma solidity ^0.8.0;", help="Test prompt.")
 @click.option("--max-tokens", default=100, help="Maximum tokens to generate.")
-def smoke_test(model, prompt, max_tokens):
+@click.option("--kv-compress", is_flag=True, default=False,
+              help="Enable TurboQuant KV cache compression (PolarQuant).")
+@click.option("--kv-compress-bits", default=4, type=int,
+              help="Bits per channel for KV compression (2-8). Default: 4.")
+def smoke_test(model, prompt, max_tokens, kv_compress, kv_compress_bits):
     """Verify generation works with a pruned model."""
-    from mlx_lm import load as mlx_load, generate
+    from mlx_lm import load as mlx_load
+    from mlx_lm.generate import generate_step, stream_generate
 
     # Expand user path and validate if it's a local path
     expanded_model = os.path.expanduser(model)
@@ -526,7 +531,7 @@ def smoke_test(model, prompt, max_tokens):
         click.echo(f"Loading model from local path: {model}")
     else:
         click.echo(f"Loading model: {model}")
-    
+
     try:
         mlx_model, tokenizer = mlx_load(model)
     except Exception as e:
@@ -538,10 +543,32 @@ def smoke_test(model, prompt, max_tokens):
             raise
         raise
 
+    prompt_cache = None
+    if kv_compress:
+        from .kv_compress import TurboQuantConfig, setup_turbo_quant
+
+        # Load config to get model_type for SDPA patching
+        import json
+        config_path = os.path.join(os.path.expanduser(model), "config.json")
+        model_type = ""
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                model_type = json.load(f).get("model_type", "")
+
+        cfg = TurboQuantConfig(bits=kv_compress_bits)
+        prompt_cache, sdpa_patched = setup_turbo_quant(mlx_model, model_type, cfg)
+        mode_str = "quantized SDPA" if sdpa_patched else "plain SDPA"
+        click.echo(f"TurboQuant KV compression enabled ({kv_compress_bits}-bit, {mode_str})")
+
     click.echo(f"Generating with prompt: {prompt!r}")
-    result = generate(
-        mlx_model, tokenizer, prompt=prompt, max_tokens=max_tokens, verbose=True,
-    )
+    result = ""
+    for response in stream_generate(
+        mlx_model, tokenizer, prompt=prompt, max_tokens=max_tokens,
+        prompt_cache=prompt_cache,
+    ):
+        click.echo(response.text, nl=False)
+        result += response.text
+    click.echo()
     click.echo(f"\nGeneration successful ({len(result)} chars)")
 
 
@@ -553,6 +580,9 @@ def smoke_test(model, prompt, max_tokens):
               help="Hook mode: 'lightweight' skips activation norms, 'full' computes all metrics.")
 @click.option("--auto-save", default=None, help="Path to auto-save stats on shutdown.")
 @click.option("--max-tokens", default=512, type=int, help="Default max tokens for generation.")
+@click.option("--max-kv-size", default=None, type=int,
+              help="Max KV cache size per layer (tokens). Uses RotatingKVCache sliding window "
+                   "to cap memory usage for long conversations.")
 @click.option("--chat-template", default=None, help="Chat template override.")
 @click.option("--safety-map", default=None, help="Path to safety_report.json for steering.")
 @click.option("--steering-mode", default=None, type=click.Choice(["safe", "unsafe"]),
@@ -560,8 +590,13 @@ def smoke_test(model, prompt, max_tokens):
 @click.option("--domain-map", default=None, help="Path to domain_report.json for domain boosting.")
 @click.option("--domain-steering-mode", default=None, type=click.Choice(["boost", "suppress"]),
               help="Domain steering: 'boost' activates domain experts, 'suppress' deactivates general.")
-def serve(model, host, port, mode, auto_save, max_tokens, chat_template,
-          safety_map, steering_mode, domain_map, domain_steering_mode):
+@click.option("--kv-compress", is_flag=True, default=False,
+              help="Enable TurboQuant KV cache compression (PolarQuant).")
+@click.option("--kv-compress-bits", default=4, type=int,
+              help="Bits per channel for KV compression (2-8). Default: 4.")
+def serve(model, host, port, mode, auto_save, max_tokens, max_kv_size,
+          chat_template, safety_map, steering_mode, domain_map,
+          domain_steering_mode, kv_compress, kv_compress_bits):
     """Serve model with online expert counting and optional steering.
 
     Starts an OpenAI-compatible server that counts expert activations from
@@ -581,11 +616,14 @@ def serve(model, host, port, mode, auto_save, max_tokens, chat_template,
         mode=mode,
         auto_save=auto_save,
         max_tokens=max_tokens,
+        max_kv_size=max_kv_size,
         chat_template=chat_template,
         safety_map=safety_map,
         steering_mode=steering_mode,
         domain_map=domain_map,
         domain_steering_mode=domain_steering_mode,
+        kv_compress=kv_compress,
+        kv_compress_bits=kv_compress_bits,
     )
 
 
@@ -688,7 +726,12 @@ def safety_scan(model, harmful_dataset, benign_dataset, output, max_samples,
 @click.option("--max-tokens", default=100, type=int, help="Max tokens to generate.")
 @click.option("--mask-value", default=-1e9, type=float, help="Gate logit bias for deactivation.")
 @click.option("--boost-value", default=1e4, type=float, help="Gate logit bias for activation.")
-def steer(model, safety_map, mode, prompt, max_tokens, mask_value, boost_value):
+@click.option("--kv-compress", is_flag=True, default=False,
+              help="Enable TurboQuant KV cache compression (PolarQuant).")
+@click.option("--kv-compress-bits", default=4, type=int,
+              help="Bits per channel for KV compression (2-8). Default: 4.")
+def steer(model, safety_map, mode, prompt, max_tokens, mask_value, boost_value,
+          kv_compress, kv_compress_bits):
     """Generate text with expert steering based on safety analysis.
 
     Uses SteerMoE-style gate logit injection to selectively activate or
@@ -726,11 +769,26 @@ def steer(model, safety_map, mode, prompt, max_tokens, mask_value, boost_value):
     moe_blocks = [adapter.get_moe_block(i) for i in moe_indices]
     install_steering_hooks(moe_blocks, model_type, steer_config, n_experts)
 
+    prompt_cache = None
+    if kv_compress:
+        from .kv_compress import TurboQuantConfig, setup_turbo_quant
+
+        cfg = TurboQuantConfig(bits=kv_compress_bits)
+        prompt_cache, sdpa_patched = setup_turbo_quant(mlx_model, model_type, cfg)
+        mode_str = "quantized SDPA" if sdpa_patched else "plain SDPA"
+        click.echo(f"TurboQuant KV compression enabled ({kv_compress_bits}-bit, {mode_str})")
+
     click.echo(f"Generating with prompt: {prompt!r}")
     result = generate(
         mlx_model, tokenizer, prompt=prompt, max_tokens=max_tokens, verbose=True,
+        prompt_cache=prompt_cache,
     )
     remove_steering_hooks(moe_blocks)
+
+    if kv_compress:
+        from .kv_compress import remove_turbo_quant_sdpa
+        remove_turbo_quant_sdpa(model_type)
+
     click.echo(f"\nGeneration successful ({len(result)} chars)")
 
 

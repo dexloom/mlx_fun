@@ -1,17 +1,51 @@
 # MLX-FUN
 
-**Expert Pruning and Merging for Mixture-of-Experts models on Apple Silicon**
+**Expert Pruning, Merging, Steering and Inference Optimization for Mixture-of-Experts models on Apple Silicon**
 
-MLX-FUN is an MLX-native toolkit for compressing and analyzing MoE language models on Apple Silicon via [MLX](https://github.com/ml-explore/mlx). It implements eight complementary techniques:
+MLX-FUN is an MLX-native toolkit for compressing, analyzing and optimizing MoE language models on Apple Silicon via [MLX](https://github.com/ml-explore/mlx).
 
-- **REAP** (Routing-based Expert Activation Pruning) — removes the least important experts by measuring saliency from calibration data, then slicing weight tensors. Based on [Cerebras Research's REAP](https://github.com/CerebrasResearch/reap).
-- **REAM** (Router-weighted Expert Activation Merging) — instead of discarding experts, groups them around high-saliency centroids and merges via neuron-aligned weighted averaging. Preserves knowledge from all experts while still reducing the model size. Based on [REAM](https://bknyaz.github.io/blog/2026/moe/).
-- **SAFEx** (Safety-critical Expert identification) — compares expert routing patterns between harmful and benign datasets to classify experts into HCDG (detect harmful content) and HRCG (control harmful responses) groups. Based on [SAFEx (NeurIPS 2025)](https://arxiv.org/abs/2506.17368).
-- **SteerMoE** (Expert Steering) — inference-time expert (de)activation by injecting bias into gate logits before top-k selection. Supports both offline generation and real-time server steering via REST API. Based on [SteerMoE](https://arxiv.org/abs/2509.09660).
-- **Abliteration** — removes refusal directions from model weight matrices by orthogonalization, adapted for MoE architectures with per-expert targeting. Based on [Arditi et al. (NeurIPS 2024)](https://proceedings.neurips.cc/paper_files/paper/2024/file/f545448535dfde4f9786555403ab7c49-Paper-Conference.pdf).
-- **Domain Scan** — identifies domain-specialized experts by comparing routing patterns on domain-specific data (e.g. Solidity, medical text) vs general data, using the same differential analysis as SAFEx.
-- **Amplify** — permanently modifies gate weights/biases so domain-specialized experts are favored natively, producing a model that works with standard `mlx_lm.load()` without runtime hooks.
-- **TurboQuant** (KV Cache Compression) — compresses the KV cache at inference time using PolarQuant rotation-based quantization. Reduces KV cache memory by 4-6x at 3-4 bits with near-zero accuracy loss, enabling longer contexts and larger models on Apple Silicon. Based on [TurboQuant (ICLR 2026)](https://arxiv.org/abs/2504.19874).
+---
+
+## Features at a Glance
+
+### Model Compression
+
+| Feature | Description | Learn more |
+|---|---|---|
+| [REAP](#the-reap-algorithm) | Remove least important experts by saliency scoring + weight slicing | [Cerebras Research](https://github.com/CerebrasResearch/reap) |
+| [REAM](#ream-expert-merging) | Merge experts around centroids via neuron-aligned weighted averaging | [REAM](https://bknyaz.github.io/blog/2026/moe/) |
+
+### Safety & Steering
+
+| Feature | Description | Learn more |
+|---|---|---|
+| [SAFEx](#safety-scan-identify-safety-critical-experts) | Identify safety-critical experts via differential routing analysis | [SAFEx (NeurIPS 2025)](https://arxiv.org/abs/2506.17368) |
+| [SteerMoE](#steer-inference-with-expert-steering) | Inject bias into gate logits to (de)activate experts at inference time | [SteerMoE](https://arxiv.org/abs/2509.09660) |
+| [Abliteration](#abliterate-refusal-direction-removal) | Remove refusal directions from weight matrices via orthogonalization | [Arditi et al. (NeurIPS 2024)](https://proceedings.neurips.cc/paper_files/paper/2024/file/f545448535dfde4f9786555403ab7c49-Paper-Conference.pdf) |
+
+### Domain Specialization
+
+| Feature | Description | Learn more |
+|---|---|---|
+| [Domain Scan](#domain-scan-identify-domain-specialized-experts) | Find domain-specialized experts by comparing routing on domain vs general data | Differential analysis |
+| [Amplify](#amplify-permanent-domain-expert-gate-modification) | Permanently modify gate weights so domain experts are favored natively | No runtime hooks needed |
+
+### Inference Optimization
+
+| Feature | Description | Learn more |
+|---|---|---|
+| [TurboQuant](#turboquant-kv-cache-compression) | Compress KV cache 4-6x via PolarQuant rotation-based quantization | [TurboQuant (ICLR 2026)](https://arxiv.org/abs/2504.19874) |
+| [Sliding Window](#turboquant-kv-cache-compression) | Cap KV cache to N tokens per layer for bounded memory | `--max-kv-size` flag |
+
+### Tools & Dashboard
+
+| Feature | Description | Learn more |
+|---|---|---|
+| [Online Serving](#online-collection-serve-with-expert-counting) | OpenAI-compatible API server with live expert counting + steering | `mlx-fun serve` |
+| [Web Dashboard](#web-dashboard) | Gradio UI with heatmaps, steering controls, diff analysis | `mlx-fun ui` |
+| [Stats Operations](#statistics-operations-diff-merge-purge) | Diff, merge, and purge saliency files across datasets | `mlx-fun stats-*` |
+
+---
 
 MLX-FUN supports two collection modes:
 - **Offline calibration** (`mlx-fun collect`) — run a dataset through the model in batch

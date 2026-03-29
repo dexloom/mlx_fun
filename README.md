@@ -35,6 +35,7 @@ MLX-FUN is an MLX-native toolkit for compressing, analyzing and optimizing MoE l
 | Feature | Description | Learn more |
 |---|---|---|
 | [TurboQuant](#turboquant-kv-cache-compression) | Compress KV cache 4-6x via PolarQuant rotation-based quantization | [TurboQuant (ICLR 2026)](https://arxiv.org/abs/2504.19874) |
+| [RotorQuant](#rotorquant-kv-cache-compression) | Compress KV cache via Clifford algebra rotors — 44x fewer parameters than TurboQuant | [RotorQuant (Scrya, 2026)](https://www.scrya.com/rotorquant/) |
 | [Sliding Window](#turboquant-kv-cache-compression) | Cap KV cache to N tokens per layer for bounded memory | `--max-kv-size` flag |
 
 ### Tools & Dashboard
@@ -513,7 +514,7 @@ mlx-fun serve \
 | `--domain-map` | *(none)* | Path to `domain_report.json` for domain boosting at startup |
 | `--domain-steering-mode` | *(none)* | `boost` (activate domain experts) or `suppress` (deactivate general experts) |
 | `--max-kv-size` | *(none)* | Max KV cache size per layer (tokens). Uses sliding window to cap memory. |
-| `--kv-compress` | `false` | Enable TurboQuant KV cache compression |
+| `--kv-compress` | *(none)* | KV compression method: `turbo` (TurboQuant/PolarQuant) or `rotor` (RotorQuant/Clifford) |
 | `--kv-compress-bits` | 4 | Bits per channel for KV compression (2-8). Can be combined with `--max-kv-size`. |
 
 The server is fully OpenAI-compatible — use it as a drop-in replacement:
@@ -861,7 +862,46 @@ mlx-fun steer \
 
 TurboQuant is complementary to weight quantization (GPTQ, AWQ) — use both for maximum compression: 4-bit model weights + 3-bit KV cache.
 
-**Sliding window support:** TurboQuant can be combined with `--max-kv-size` to cap the KV cache to a fixed number of tokens. When the cache exceeds the limit, the oldest tokens are dropped (while preserving the first 4 tokens for BOS/system prompt). This provides both memory savings from compression AND bounded memory from windowing. Without `--max-kv-size`, the cache grows unbounded (full context attention).
+**Sliding window support:** Both TurboQuant and RotorQuant can be combined with `--max-kv-size` to cap the KV cache to a fixed number of tokens. When the cache exceeds the limit, the oldest tokens are dropped (while preserving the first 4 tokens for BOS/system prompt). This provides both memory savings from compression AND bounded memory from windowing. Without `--max-kv-size`, the cache grows unbounded (full context attention).
+
+### RotorQuant: KV Cache Compression
+
+An alternative to TurboQuant that replaces dense d×d orthogonal rotation matrices with [Clifford algebra](https://en.wikipedia.org/wiki/Clifford_algebra) rotors in Cl(3,0). This achieves **44× fewer rotation parameters** (4 per 3D group vs d² for a full matrix) while matching TurboQuant's compression fidelity. Based on [RotorQuant (Scrya, 2026)](https://www.scrya.com/rotorquant/).
+
+```bash
+# Serve with RotorQuant (3-bit default)
+mlx-fun serve \
+    --model mlx-community/MiniMax-M1-40k-4bit \
+    --kv-compress rotor --kv-compress-bits 3
+
+# Combine with sliding window
+mlx-fun serve \
+    --model mlx-community/MiniMax-M1-40k-4bit \
+    --kv-compress rotor --kv-compress-bits 3 \
+    --max-kv-size 4096
+
+# Smoke test
+mlx-fun smoke-test --model ./pruned_model \
+    --kv-compress rotor --kv-compress-bits 3
+```
+
+**How it works:**
+
+1. **Chunk** — K/V vectors (d dimensions) are split into groups of 3.
+2. **Embed** — Each group becomes a grade-1 Cl(3,0) multivector `(e1, e2, e3)`.
+3. **Rotor sandwich** — Per-group random rotor R decorrelates via `R v R̃`. Each rotor has only 4 parameters (scalar + 3 bivector), vs d² for a dense rotation matrix.
+4. **Lloyd-Max quantize** — Grade-1 components are quantized using a precomputed optimal codebook for the Gaussian distribution arising from random rotation.
+5. **Dequantize on read** — Look up centroids, undo rotor rotation, reconstruct vectors. Plain SDPA (no `quantized_matmul`).
+
+**TurboQuant vs RotorQuant:**
+
+| | TurboQuant (`--kv-compress turbo`) | RotorQuant (`--kv-compress rotor`) |
+|---|---|---|
+| **Rotation** | Dense d×d orthogonal matrix (QR decomposition) | Cl(3,0) rotors (4 params per 3D group) |
+| **Rotation params** | d² (e.g. 16,384 for d=128) | ~4 × d/3 (e.g. 172 for d=128) |
+| **Quantization** | MLX native `mx.quantize` (affine) | Lloyd-Max optimal codebook |
+| **Hardware accel** | `mx.quantized_matmul` for supported models | Plain SDPA only |
+| **Best for** | Models with quantized SDPA support | All models, minimal parameter overhead |
 
 ### Statistics Operations: Diff, Merge, Purge
 

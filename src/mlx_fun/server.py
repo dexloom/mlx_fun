@@ -769,7 +769,7 @@ def run_reap_server(
     max_kv_size: Optional[int] = None,
     domain_map: Optional[str] = None,
     domain_steering_mode: Optional[str] = None,
-    kv_compress: bool = False,
+    kv_compress: Optional[str] = None,
     kv_compress_bits: int = 4,
 ):
     """Load model, install counting hooks, and start the server.
@@ -789,7 +789,8 @@ def run_reap_server(
         steering_mode: Optional 'safe' or 'unsafe' steering mode.
         domain_map: Optional path to domain_report.json for domain boosting.
         domain_steering_mode: Optional 'boost' or 'suppress' domain mode.
-        kv_compress: Enable TurboQuant KV cache compression (PolarQuant).
+        kv_compress: KV compression method — 'turbo' (TurboQuant/PolarQuant),
+            'rotor' (RotorQuant/Clifford), or None (disabled).
         kv_compress_bits: Bits per channel for KV compression (2-8).
     """
     from mlx_lm import load as mlx_load
@@ -867,8 +868,9 @@ def run_reap_server(
             f"KV cache limited to {max_kv_size} tokens per layer (RotatingKVCache)"
         )
 
-    # Apply TurboQuant KV cache compression if specified
-    if kv_compress:
+    # Apply KV cache compression if specified
+    sdpa_patched = False
+    if kv_compress == "turbo":
         from .kv_compress import TurboQuantConfig, TurboQuantKVCache, setup_turbo_quant
 
         _tq_cfg = TurboQuantConfig(
@@ -876,7 +878,6 @@ def run_reap_server(
             max_size=max_kv_size,  # None if not set — unbounded
         )
         _tq_caches_template, sdpa_patched = setup_turbo_quant(model, model_type, _tq_cfg)
-        # We need make_cache to create fresh caches per conversation
         _tq_effective_cfg = _tq_caches_template[0].config if _tq_caches_template else _tq_cfg
         _num_model_layers = len(model.layers)
 
@@ -891,6 +892,26 @@ def run_reap_server(
         window_str = f", window={max_kv_size}" if max_kv_size else ""
         logging.info(
             f"TurboQuant KV compression enabled ({kv_compress_bits}-bit PolarQuant, {mode_str}{window_str})"
+        )
+    elif kv_compress == "rotor":
+        from .rotor_quant import RotorQuantConfig, RotorQuantKVCache
+
+        _rq_cfg = RotorQuantConfig(
+            bits=kv_compress_bits,
+            max_size=max_kv_size,
+        )
+        _num_model_layers = len(model.layers)
+
+        def _make_cache():
+            return [
+                RotorQuantKVCache(config=_rq_cfg)
+                for _ in range(_num_model_layers)
+            ]
+
+        model.make_cache = _make_cache
+        window_str = f", window={max_kv_size}" if max_kv_size else ""
+        logging.info(
+            f"RotorQuant KV compression enabled ({kv_compress_bits}-bit Clifford rotors, plain SDPA{window_str})"
         )
 
     # Build cli_args namespace for mlx-lm server
@@ -909,12 +930,20 @@ def run_reap_server(
 
     # Create handler class with accumulator and steering access
     kv_compress_info = None
-    if kv_compress:
+    if kv_compress == "turbo":
         kv_compress_info = {
             "enabled": True,
             "bits": kv_compress_bits,
             "method": "TurboQuant/PolarQuant",
             "quantized_sdpa": sdpa_patched,
+            "max_size": max_kv_size,
+        }
+    elif kv_compress == "rotor":
+        kv_compress_info = {
+            "enabled": True,
+            "bits": kv_compress_bits,
+            "method": "RotorQuant/Clifford",
+            "quantized_sdpa": False,
             "max_size": max_kv_size,
         }
     handler_class = ReapAPIHandler.create_handler_class(

@@ -1240,5 +1240,47 @@ def ui(server_url, host, port, share):
     )
 
 
+@main.command("convert-nvfp4")
+@click.option("--model", required=True,
+              help="HuggingFace repo ID or local path to NVIDIA NVFP4 checkpoint.")
+@click.option("--output", required=True,
+              help="Output directory for MLX checkpoint.")
+@click.option("--mode", default="nvfp4",
+              type=click.Choice(["nvfp4", "dequant"]),
+              help="Output mode: 'nvfp4' preserves native FP4 codes, "
+                   "'dequant' converts everything to bfloat16.")
+def convert_nvfp4_cmd(model, output, mode):
+    """Convert NVIDIA NVFP4 (modelopt) checkpoint to MLX-native format.
+
+    Repacks natively-trained NVFP4 weights into MLX's NVFP4 format,
+    preserving the trained FP4 weight codes. FP8 layers (Mamba, shared
+    experts) are dequantized to bfloat16.
+
+    \b
+    Examples:
+      # Convert keeping native NVFP4 (recommended for QAT models)
+      mlx-fun convert-nvfp4 \\
+          --model nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \\
+          --output ./nemotron-120b-mlx
+
+      # Convert to full bfloat16 (no quantization)
+      mlx-fun convert-nvfp4 \\
+          --model nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \\
+          --output ./nemotron-120b-bf16 --mode dequant
+    """
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    from .convert_nvfp4 import convert_nvfp4
+
+    click.echo(f"Converting NVIDIA NVFP4 checkpoint: {model}")
+    click.echo(f"Output mode: {mode}")
+    click.echo(f"Output path: {output}")
+
+    convert_nvfp4(model, output, output_mode=mode)
+
+    click.echo("Conversion complete!")
+
+
 if __name__ == "__main__":
     main()

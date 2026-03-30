@@ -194,7 +194,8 @@ def amplify_gate_weights(
             else:
                 block.gate.bias = bias_mx
 
-        elif model_type in ("glm4_moe", "glm4_moe_lite", "glm_moe_dsa", "deepseek_v32"):
+        elif model_type in ("glm4_moe", "glm4_moe_lite", "glm_moe_dsa", "deepseek_v32",
+                             "nemotron_h"):
             # Custom MoEGate: add to e_score_correction_bias (post-sigmoid)
             block.gate.e_score_correction_bias = (
                 block.gate.e_score_correction_bias + bias_mx

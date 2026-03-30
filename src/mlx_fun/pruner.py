@@ -503,7 +503,8 @@ def prune_moe_layer(
         moe_block.e_score_correction_bias = mx.take(
             moe_block.e_score_correction_bias, keep, axis=0
         )
-    elif model_type in ("glm4_moe", "glm4_moe_lite", "glm_moe_dsa", "deepseek_v32"):
+    elif model_type in ("glm4_moe", "glm4_moe_lite", "glm_moe_dsa", "deepseek_v32",
+                         "nemotron_h"):
         # MoEGate: raw weight + bias (not nn.Linear, slice manually)
         moe_block.gate.weight = mx.take(moe_block.gate.weight, keep, axis=0)
         moe_block.gate.e_score_correction_bias = mx.take(

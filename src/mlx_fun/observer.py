@@ -50,7 +50,7 @@ def _minimax_hooked_call(self, x: mx.array) -> mx.array:
 
 def _glm4_hooked_call(self, x: mx.array) -> mx.array:
     """Replacement __call__ for GLM4 MoE block that captures metrics."""
-    if self.sharding_group is not None:
+    if getattr(self, "sharding_group", None) is not None:
         raise RuntimeError(
             "Pruning sharded models not supported in v1. Load without sharding."
         )
@@ -141,6 +141,7 @@ _HOOK_MAP = {
     "glm4_moe_lite": _glm4_hooked_call,
     "glm_moe_dsa": _glm4_hooked_call,
     "deepseek_v32": _glm4_hooked_call,
+    "nemotron_h": _glm4_hooked_call,
     "qwen3_moe": _qwen3_moe_hooked_call,
     "qwen3_next": _qwen3_next_hooked_call,
 }

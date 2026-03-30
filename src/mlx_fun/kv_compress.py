@@ -450,6 +450,7 @@ _MODEL_MODULE_MAP: Dict[str, str] = {
     "glm4_moe_lite": "mlx_lm.models.glm4_moe_lite",
     "qwen3_moe": "mlx_lm.models.qwen3_moe",
     "qwen3_next": "mlx_lm.models.qwen3_next",
+    "nemotron_h": "mlx_lm.models.nemotron_h",
     # DeepSeek V3.2 / GLM-5 use latent-compression attention with CacheList —
     # not supported for quantized SDPA yet (Phase 1 fallback works fine).
 }

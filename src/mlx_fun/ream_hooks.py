@@ -38,7 +38,7 @@ def _minimax_ream_call(self, x: mx.array) -> mx.array:
 
 def _glm4_ream_call(self, x: mx.array) -> mx.array:
     """Capture input + full gate logits, then run normal GLM4 forward."""
-    if self.sharding_group is not None:
+    if getattr(self, "sharding_group", None) is not None:
         raise RuntimeError(
             "Merging sharded models not supported. Load without sharding."
         )
@@ -106,6 +106,7 @@ _REAM_HOOK_MAP = {
     "glm4_moe_lite": _glm4_ream_call,
     "glm_moe_dsa": _glm4_ream_call,
     "deepseek_v32": _glm4_ream_call,
+    "nemotron_h": _glm4_ream_call,
     "qwen3_moe": _qwen3_moe_ream_call,
     "qwen3_next": _qwen3_next_ream_call,
 }

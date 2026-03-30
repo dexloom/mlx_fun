@@ -20,6 +20,7 @@ dev = ["pytest>=7.0"]
 dataset = ["datasets>=2.14", "huggingface-hub>=0.20"]
 ream = ["scipy>=1.10"]
 ui = ["gradio>=4.0", "matplotlib>=3.7", "requests>=2.28"]
+convert = ["safetensors>=0.4", "huggingface-hub>=0.20"]
 
 [project.scripts]
 mlx-fun = "mlx_fun.cli:main"

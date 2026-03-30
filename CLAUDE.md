@@ -27,6 +27,7 @@ mlx-fun steer --help
 mlx-fun abliterate --help
 mlx-fun domain-scan --help
 mlx-fun amplify --help
+mlx-fun convert-nvfp4 --help
 mlx-fun ui --help
 ```
 
@@ -39,7 +40,8 @@ src/mlx_fun/
 │   ├── glm4_moe.py       # GLM4: MoE layers >= first_k_dense_replace, mlp
 │   ├── glm4_moe_lite.py  # GLM4-Lite: adds moe_layer_freq stride
 │   ├── glm_moe_dsa.py    # GLM-5/DeepSeek V3.2: DeepseekV32MoE with MoEGate
-│   └── qwen3_moe.py      # Qwen3/Qwen3-Next: sparse layers by decoder_sparse_step, mlp
+│   ├── qwen3_moe.py      # Qwen3/Qwen3-Next: sparse layers by decoder_sparse_step, mlp
+│   └── nemotron_h.py      # Nemotron-H: hybrid Mamba-2/Attn/MoE via hybrid_override_pattern
 ├── observer.py            # Hooks via __class__ swap (not MethodType — special methods)
 ├── ream_hooks.py          # REAM hooks: capture MoE inputs + full gate logits
 ├── saliency.py            # numpy float64 accumulator with np.add.at() scatter-add
@@ -48,6 +50,7 @@ src/mlx_fun/
 ├── safety.py              # SAFEx: differential accumulator, safety report, expert classification
 ├── steering.py            # SteerMoE: gate logit bias injection for expert (de)activation
 ├── abliterate.py          # Abliteration: residual hooks, refusal direction orthogonalization
+├── convert_nvfp4.py       # NVIDIA NVFP4 (modelopt) -> MLX NVFP4 checkpoint converter
 ├── domain.py              # Domain expert identification, amplification bias computation, gate modification
 ├── frontend.py            # Gradio web dashboard: chat, heatmaps, steering controls, server management
 ├── data.py                # JSONL + directory dataset loading with random subsampling
@@ -85,6 +88,8 @@ src/mlx_fun/
 
 - **Pruner domain constraints** (`load_domain_constraints`) only support `"protect"` mode (never prune domain experts). Domain and safety constraints merge via union of protected sets.
 
+- **NVFP4 conversion** (`convert_nvfp4.py`): NVIDIA's `modelopt` NVFP4 checkpoints use a two-level scale hierarchy (`fp4_val * e4m3_group_scale * f32_global_scale`) that MLX Metal doesn't support. The converter folds `weight_scale_2` into per-group E4M3 scales via `from_fp8()` → multiply → `to_fp8()`, preserving trained FP4 codes exactly while accepting ~1-2% scale rounding. FP8 layers (Mamba, shared experts) are dequantized to bfloat16. Expert weights are repacked from uint8 `[M, N/2]` to uint32 `[M, N/8]` via `numpy.view` (lossless).
+
 ## Supported Models
 
 | Type | Config `model_type` | Expert count key | MoE block path |
@@ -97,14 +102,16 @@ src/mlx_fun/
 | Qwen3-Next | `qwen3_next` | `num_experts` | Same as Qwen3 + sigmoid-gated shared expert |
 | GLM-5 | `glm_moe_dsa` | `n_routed_experts` | `model.model.layers[i].mlp` (DeepSeek V3.2 MoE) |
 | DeepSeek V3.2 | `deepseek_v32` | `n_routed_experts` | Same as GLM-5 (shared architecture) |
+| Nemotron-H | `nemotron_h` | `n_routed_experts` | `model.backbone.layers[i].mixer` (hybrid Mamba-2/Attn/MoE) |
 
-Reference source files (mlx-lm 0.30.7):
+Reference source files (mlx-lm 0.31.2):
 - MiniMax: `mlx_lm/models/minimax.py` — `MiniMaxSparseMoeBlock`
 - GLM4: `mlx_lm/models/glm4_moe.py` — `MoE`, `MoEGate`
 - GLM4-Lite: `mlx_lm/models/glm4_moe_lite.py` — `Glm4MoeLiteMoE`, `MoEGate`
 - Qwen3: `mlx_lm/models/qwen3_moe.py` — `Qwen3MoeSparseMoeBlock`
 - Qwen3-Next: `mlx_lm/models/qwen3_next.py` — `Qwen3NextSparseMoeBlock`
 - GLM-5 / DeepSeek V3.2: `mlx_lm/models/deepseek_v32.py` — `DeepseekV32MoE`, `MoEGate`
+- Nemotron-H: `mlx_lm/models/nemotron_h.py` — `NemotronHMoE`, `MoEGate` (hybrid Mamba-2/Attention/MoE)
 - Switch layers: `mlx_lm/models/switch_layers.py` — `SwitchGLU`, `SwitchLinear`, `QuantizedSwitchLinear`
 
 ## Testing
@@ -119,6 +126,7 @@ pytest tests/test_steering.py -v    # Steering hook tests
 pytest tests/test_abliterate.py -v  # Abliteration tests
 pytest tests/test_domain.py -v      # Domain identification + amplification tests
 pytest tests/test_frontend.py -v   # Frontend API + visualization tests
+pytest tests/test_convert_nvfp4.py -v  # NVFP4 converter tests
 ```
 
 ## Dependencies
@@ -127,4 +135,5 @@ Runtime: `mlx >= 0.30.0`, `mlx-lm >= 0.30.7`, `click`, `tqdm`, `numpy`
 Dev: `pytest`
 REAM merging: `scipy` (optional extra `.[ream]`)
 Web dashboard: `gradio`, `matplotlib`, `requests` (optional extra `.[ui]`)
+NVFP4 conversion: `safetensors`, `huggingface-hub` (optional extra `.[convert]`)
 Dataset prep: `datasets`, `huggingface-hub` (optional extra `.[dataset]`)

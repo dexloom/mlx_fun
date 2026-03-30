@@ -142,7 +142,7 @@ def _minimax_counting_call(self, x: mx.array) -> mx.array:
 
 
 def _glm4_counting_call(self, x: mx.array) -> mx.array:
-    if self.sharding_group is not None:
+    if getattr(self, "sharding_group", None) is not None:
         raise RuntimeError(
             "Pruning sharded models not supported in v1. Load without sharding."
         )
@@ -239,7 +239,7 @@ def _minimax_full_counting_call(self, x: mx.array) -> mx.array:
 
 
 def _glm4_full_counting_call(self, x: mx.array) -> mx.array:
-    if self.sharding_group is not None:
+    if getattr(self, "sharding_group", None) is not None:
         raise RuntimeError(
             "Pruning sharded models not supported in v1. Load without sharding."
         )
@@ -318,6 +318,7 @@ _COUNTING_HOOK_MAP = {
     "glm4_moe_lite": _glm4_counting_call,
     "glm_moe_dsa": _glm4_counting_call,
     "deepseek_v32": _glm4_counting_call,
+    "nemotron_h": _glm4_counting_call,
     "qwen3_moe": _qwen3_moe_counting_call,
     "qwen3_next": _qwen3_next_counting_call,
 }
@@ -329,6 +330,7 @@ _FULL_COUNTING_HOOK_MAP = {
     "glm4_moe_lite": _glm4_full_counting_call,
     "glm_moe_dsa": _glm4_full_counting_call,
     "deepseek_v32": _glm4_full_counting_call,
+    "nemotron_h": _glm4_full_counting_call,
     "qwen3_moe": _qwen3_moe_full_counting_call,
     "qwen3_next": _qwen3_next_full_counting_call,
 }
@@ -364,7 +366,7 @@ def _minimax_counting_steering_call(self, x: mx.array) -> mx.array:
 
 
 def _glm4_counting_steering_call(self, x: mx.array) -> mx.array:
-    if self.sharding_group is not None:
+    if getattr(self, "sharding_group", None) is not None:
         raise RuntimeError(
             "Sharded models not supported. Load without sharding."
         )
@@ -453,6 +455,7 @@ _COUNTING_STEERING_HOOK_MAP = {
     "glm4_moe_lite": _glm4_counting_steering_call,
     "glm_moe_dsa": _glm4_counting_steering_call,
     "deepseek_v32": _glm4_counting_steering_call,
+    "nemotron_h": _glm4_counting_steering_call,
     "qwen3_moe": _qwen3_moe_counting_steering_call,
     "qwen3_next": _qwen3_next_counting_steering_call,
 }

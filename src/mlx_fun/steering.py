@@ -146,7 +146,7 @@ def _minimax_steering_call(self, x: mx.array) -> mx.array:
 
 def _glm4_steering_call(self, x: mx.array) -> mx.array:
     """GLM4 forward with gate logit steering."""
-    if self.sharding_group is not None:
+    if getattr(self, "sharding_group", None) is not None:
         raise RuntimeError(
             "Steering sharded models not supported. Load without sharding."
         )
@@ -218,6 +218,7 @@ _STEERING_HOOK_MAP = {
     "glm4_moe_lite": _glm4_steering_call,
     "glm_moe_dsa": _glm4_steering_call,
     "deepseek_v32": _glm4_steering_call,
+    "nemotron_h": _glm4_steering_call,
     "qwen3_moe": _qwen3_moe_steering_call,
     "qwen3_next": _qwen3_next_steering_call,
 }

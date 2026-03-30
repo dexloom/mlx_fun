@@ -8,6 +8,7 @@ from .glm4_moe import GLM4MoEAdapter
 from .glm4_moe_lite import GLM4MoELiteAdapter
 from .qwen3_moe import Qwen3MoEAdapter
 from .glm_moe_dsa import GLMMoeDsaAdapter
+from .nemotron_h import NemotronHAdapter
 
 _ADAPTER_MAP = {
     "minimax": MiniMaxAdapter,
@@ -18,6 +19,7 @@ _ADAPTER_MAP = {
     "qwen3_next": Qwen3MoEAdapter,
     "glm_moe_dsa": GLMMoeDsaAdapter,
     "deepseek_v32": GLMMoeDsaAdapter,
+    "nemotron_h": NemotronHAdapter,
 }
 
 

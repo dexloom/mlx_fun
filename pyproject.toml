@@ -9,7 +9,7 @@ description = "MLX-native toolkit for MoE model compression, analysis, and domai
 requires-python = ">=3.11"
 dependencies = [
     "mlx>=0.30.0",
-    "mlx-lm>=0.30.7",
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm.git@main",
     "click>=8.0",
     "tqdm>=4.60",
     "numpy>=1.24",
@@ -27,6 +27,9 @@ mlx-fun = "mlx_fun.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+mlx_fun = ["templates/*.jinja"]
 
 [tool.pytest.ini_options]
 filterwarnings = [

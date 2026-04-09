@@ -99,6 +99,23 @@ def _qwen3_next_ream_call(self, x: mx.array) -> mx.array:
     return y + shared_y
 
 
+def _gemma4_ream_call(self, h: mx.array) -> mx.array:
+    """Capture input + full gate logits, then run normal Gemma4 forward."""
+    router = self.router
+
+    # Get raw gate logits (before softmax / top-k)
+    x_normed = mx.fast.rms_norm(h, router.scale * router._root_size, router.eps)
+    gates_raw = router.proj(x_normed)
+
+    mx.eval(h, gates_raw)
+    self._ream_captures.append((_to_numpy(h), _to_numpy(gates_raw)))
+
+    # Normal forward
+    top_k_indices, top_k_weights = self.router(h)
+    h2 = self.pre_feedforward_layernorm_2(h)
+    return self.experts(h2, top_k_indices, top_k_weights)
+
+
 _REAM_HOOK_MAP = {
     "minimax": _minimax_ream_call,
     "minimax_m2": _minimax_ream_call,
@@ -109,6 +126,7 @@ _REAM_HOOK_MAP = {
     "nemotron_h": _glm4_ream_call,
     "qwen3_moe": _qwen3_moe_ream_call,
     "qwen3_next": _qwen3_next_ream_call,
+    "gemma4": _gemma4_ream_call,
 }
 
 

@@ -514,6 +514,12 @@ def prune_moe_layer(
     elif model_type in ("qwen3_moe", "qwen3_next"):
         _slice_linear(moe_block.gate, keep)
         moe_block.num_experts = len(keep_indices)
+    elif model_type == "gemma4":
+        # Router: nn.Linear proj + per_expert_scale
+        _slice_linear(moe_block.router.proj, keep)
+        moe_block.router.per_expert_scale = mx.take(
+            moe_block.router.per_expert_scale, keep, axis=0
+        )
 
 
 def prune_model(
@@ -556,6 +562,11 @@ def prune_model(
     config = adapter.config.copy()
     # Use the count from the first layer's keep set
     first_keep = next(iter(keep_map.values()))
-    config[adapter.config_expert_count_key()] = len(first_keep)
+    key = adapter.config_expert_count_key()
+    config[key] = len(first_keep)
+    # Update nested text_config if present (e.g. gemma4)
+    if "text_config" in config and key in config.get("text_config", {}):
+        config["text_config"] = dict(config["text_config"])
+        config["text_config"][key] = len(first_keep)
 
     return config

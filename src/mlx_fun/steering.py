@@ -211,6 +211,27 @@ def _qwen3_next_steering_call(self, x: mx.array) -> mx.array:
     return y + shared_y
 
 
+def _gemma4_steering_call(self, h: mx.array) -> mx.array:
+    """Gemma4 forward with gate logit steering."""
+    router = self.router
+
+    x_normed = mx.fast.rms_norm(h, router.scale * router._root_size, router.eps)
+    expert_scores = router.proj(x_normed)
+
+    if self._steering_bias is not None:
+        expert_scores = expert_scores + self._steering_bias
+
+    router_probs = mx.softmax(expert_scores, axis=-1)
+    k = router.config.top_k_experts
+    inds = mx.argpartition(-expert_scores, kth=k - 1, axis=-1)[..., :k]
+    scores = mx.take_along_axis(router_probs, inds, axis=-1)
+    scores = scores / mx.sum(scores, axis=-1, keepdims=True)
+    scores = scores * router.per_expert_scale[inds]
+
+    h2 = self.pre_feedforward_layernorm_2(h)
+    return self.experts(h2, inds, scores)
+
+
 _STEERING_HOOK_MAP = {
     "minimax": _minimax_steering_call,
     "minimax_m2": _minimax_steering_call,
@@ -221,6 +242,7 @@ _STEERING_HOOK_MAP = {
     "nemotron_h": _glm4_steering_call,
     "qwen3_moe": _qwen3_moe_steering_call,
     "qwen3_next": _qwen3_next_steering_call,
+    "gemma4": _gemma4_steering_call,
 }
 
 

@@ -134,6 +134,39 @@ def _qwen3_next_hooked_call(self, x: mx.array) -> mx.array:
     return y + shared_y
 
 
+def _gemma4_hooked_call(self, h: mx.array) -> mx.array:
+    """Replacement __call__ for Gemma4MoEBlock that captures metrics."""
+    router = self.router
+
+    # Replicate Router.forward to capture per-expert activation norms
+    x_normed = mx.fast.rms_norm(h, router.scale * router._root_size, router.eps)
+    expert_scores = router.proj(x_normed)
+    router_probs = mx.softmax(expert_scores, axis=-1)
+    k = router.config.top_k_experts
+    inds = mx.argpartition(-expert_scores, kth=k - 1, axis=-1)[..., :k]
+    scores = mx.take_along_axis(router_probs, inds, axis=-1)
+    scores = scores / mx.sum(scores, axis=-1, keepdims=True)
+    scores = scores * router.per_expert_scale[inds]
+
+    # Expert forward (decomposed to capture per-expert norms before reduction)
+    h2 = self.pre_feedforward_layernorm_2(h)
+    B, S, H = h2.shape
+    x_flat = h2.reshape(B * S, H)
+    indices_flat = inds.reshape(B * S, k)
+    expert_out = self.switch_glu(x_flat, indices_flat)
+    activation_norms = mx.linalg.norm(expert_out, axis=-1)
+
+    mx.eval(inds, scores, activation_norms)
+    self._reap_captures.append((
+        _to_numpy(inds),
+        _to_numpy(scores),
+        _to_numpy(activation_norms.reshape(B, S, k)),
+    ))
+
+    weights = scores.reshape(B * S, k)[..., None]
+    return (expert_out * weights).sum(axis=-2).reshape(B, S, H)
+
+
 _HOOK_MAP = {
     "minimax": _minimax_hooked_call,
     "minimax_m2": _minimax_hooked_call,
@@ -144,6 +177,7 @@ _HOOK_MAP = {
     "nemotron_h": _glm4_hooked_call,
     "qwen3_moe": _qwen3_moe_hooked_call,
     "qwen3_next": _qwen3_next_hooked_call,
+    "gemma4": _gemma4_hooked_call,
 }
 
 

@@ -208,5 +208,12 @@ def amplify_gate_weights(
             else:
                 block.gate.bias = bias_mx
 
+        elif model_type == "gemma4":
+            # Gemma4 Router: softmax routing, bias on router.proj (pre-softmax)
+            if "bias" in block.router.proj:
+                block.router.proj.bias = block.router.proj.bias + bias_mx
+            else:
+                block.router.proj.bias = bias_mx
+
         else:
             raise ValueError(f"No amplification support for model_type '{model_type}'")

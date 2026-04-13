@@ -699,6 +699,9 @@ class ModelManager:
         draft_model_path: Optional[str] = None,
         num_draft_tokens: int = 3,
         capture_layers: Optional[str] = None,
+        dflash_block_size: Optional[int] = None,
+        dflash_num_layers: int = 5,
+        dflash_num_heads: int = 8,
     ):
         # Config (immutable for server lifetime)
         self._mode = mode
@@ -711,6 +714,9 @@ class ModelManager:
         self._draft_model_path = draft_model_path
         self._num_draft_tokens = num_draft_tokens
         self._capture_layers = capture_layers
+        self._dflash_block_size = dflash_block_size
+        self._dflash_num_layers = dflash_num_layers
+        self._dflash_num_heads = dflash_num_heads
 
         # Mutable state (protected by _lock)
         self._lock = threading.RLock()
@@ -851,11 +857,22 @@ class ModelManager:
             )
 
         # Install hidden state capture hooks if requested (Phase 2)
-        if self._capture_layers is not None:
+        # When DFlash is enabled, auto-configure capture layers if not set
+        capture_layers = self._capture_layers
+        if self._dflash_block_size is not None and capture_layers is None:
+            from .dflash_draft import build_target_layer_ids
+            num_model_layers = len(model.model.layers)
+            auto_layer_ids = build_target_layer_ids(num_model_layers, self._dflash_num_layers)
+            capture_layers = ",".join(str(i) for i in auto_layer_ids)
+            logging.info(
+                f"DFlash auto-configured capture layers: {auto_layer_ids}"
+            )
+
+        if capture_layers is not None:
             from .hidden_state_capture import HiddenStateCapture, parse_capture_layers
 
             num_model_layers = len(model.model.layers)
-            layer_indices = parse_capture_layers(self._capture_layers, num_model_layers)
+            layer_indices = parse_capture_layers(capture_layers, num_model_layers)
             if layer_indices is not None:
                 hsc = HiddenStateCapture(model, layer_indices)
                 hsc.install()
@@ -864,6 +881,24 @@ class ModelManager:
                     f"Hidden state capture enabled on {len(layer_indices)} "
                     f"decoder layers: {layer_indices}"
                 )
+
+        # Create DFlash block diffusion draft model (Phase 3)
+        if self._dflash_block_size is not None:
+            from .dflash_draft import create_dflash_draft_model
+
+            dflash_model = create_dflash_draft_model(
+                target_model=model,
+                num_layers=self._dflash_num_layers,
+                num_heads=self._dflash_num_heads,
+                block_size=self._dflash_block_size,
+            )
+            mx.eval(dflash_model.parameters())
+            provider.dflash_draft_model = dflash_model
+            logging.info(
+                f"DFlash draft model enabled: block_size={self._dflash_block_size}, "
+                f"layers={self._dflash_num_layers}, heads={self._dflash_num_heads}, "
+                f"target_layers={dflash_model.target_layer_ids}"
+            )
 
         prompt_cache = LRUPromptCache()
         response_generator = ResponseGenerator(provider, prompt_cache)
@@ -1158,6 +1193,7 @@ class ReapModelProvider:
         self.tokenizer = tokenizer
         self.draft_model = None
         self.hidden_state_capture = None  # HiddenStateCapture (Phase 2)
+        self.dflash_draft_model = None   # DFlash draft model (Phase 3)
         self.model_key = ("reap_preloaded", None, None)
 
         group = mx.distributed.init()
@@ -2057,6 +2093,9 @@ def run_reap_server(
     draft_model_path: Optional[str] = None,
     num_draft_tokens: int = 3,
     capture_layers: Optional[str] = None,
+    dflash_block_size: Optional[int] = None,
+    dflash_num_layers: int = 5,
+    dflash_num_heads: int = 8,
 ):
     """Start the server with on-demand model loading.
 
@@ -2117,6 +2156,9 @@ def run_reap_server(
         draft_model_path=draft_model_path,
         num_draft_tokens=num_draft_tokens,
         capture_layers=capture_layers,
+        dflash_block_size=dflash_block_size,
+        dflash_num_layers=dflash_num_layers,
+        dflash_num_heads=dflash_num_heads,
     )
 
     # Apply initial steering if configured
@@ -2150,6 +2192,7 @@ def run_reap_server(
     placeholder_provider.tokenizer = None
     placeholder_provider.draft_model = None
     placeholder_provider.hidden_state_capture = None
+    placeholder_provider.dflash_draft_model = None
     placeholder_provider.model_key = ("placeholder", None, None)
     placeholder_provider.pipeline_group = None
     placeholder_provider.tensor_group = None

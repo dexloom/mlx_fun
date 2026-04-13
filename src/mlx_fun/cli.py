@@ -610,10 +610,19 @@ def smoke_test(model, prompt, max_tokens, kv_compress, kv_compress_bits):
 @click.option("--capture-layers", default=None,
               help="Capture hidden states from these decoder layers during prefill. "
                    "Comma-separated indices (e.g. '0,4,8') or 'all'. For speculative decoding Phase 2.")
+@click.option("--dflash-block-size", default=None,
+              help="Enable DFlash block diffusion draft model with this block size. "
+                   "Accepts 'b16', 'b32', or plain integers like '16'. "
+                   "Auto-configures capture layers if --capture-layers is not set.")
+@click.option("--dflash-num-layers", default=5, type=int,
+              help="Number of transformer layers in the DFlash draft model. Default: 5.")
+@click.option("--dflash-num-heads", default=8, type=int,
+              help="Number of attention heads in the DFlash draft model. Default: 8.")
 def serve(model, host, port, mode, auto_save, max_tokens, max_kv_size,
           chat_template, safety_map, steering_mode, domain_map,
           domain_steering_mode, kv_compress, kv_compress_bits, idle_timeout,
-          draft_model, num_draft_tokens, capture_layers):
+          draft_model, num_draft_tokens, capture_layers,
+          dflash_block_size, dflash_num_layers, dflash_num_heads):
     """Serve model with on-demand loading and online expert counting.
 
     Starts an OpenAI and Anthropic compatible server. Models are loaded on
@@ -632,6 +641,12 @@ def serve(model, host, port, mode, auto_save, max_tokens, max_kv_size,
       mlx-fun serve --model /path/to/model --idle-timeout 0
     """
     from .server import run_reap_server
+
+    # Parse DFlash block size if provided
+    parsed_dflash_block_size = None
+    if dflash_block_size is not None:
+        from .dflash_draft import parse_block_size
+        parsed_dflash_block_size = parse_block_size(dflash_block_size)
 
     run_reap_server(
         host=host,
@@ -652,6 +667,9 @@ def serve(model, host, port, mode, auto_save, max_tokens, max_kv_size,
         draft_model_path=draft_model,
         num_draft_tokens=num_draft_tokens,
         capture_layers=capture_layers,
+        dflash_block_size=parsed_dflash_block_size,
+        dflash_num_layers=dflash_num_layers,
+        dflash_num_heads=dflash_num_heads,
     )
 
 

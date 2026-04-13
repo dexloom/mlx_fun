@@ -696,6 +696,8 @@ class ModelManager:
         max_kv_size: Optional[int] = None,
         kv_compress: Optional[str] = None,
         kv_compress_bits: int = 4,
+        draft_model_path: Optional[str] = None,
+        num_draft_tokens: int = 3,
     ):
         # Config (immutable for server lifetime)
         self._mode = mode
@@ -705,6 +707,8 @@ class ModelManager:
         self._max_kv_size = max_kv_size
         self._kv_compress = kv_compress
         self._kv_compress_bits = kv_compress_bits
+        self._draft_model_path = draft_model_path
+        self._num_draft_tokens = num_draft_tokens
 
         # Mutable state (protected by _lock)
         self._lock = threading.RLock()
@@ -826,12 +830,23 @@ class ModelManager:
         chat_template_content = _resolve_chat_template(self._chat_template, model_type)
 
         # Build cli_args and provider
-        cli_kwargs = dict(model=resolved_path, max_tokens=self._max_tokens)
+        cli_kwargs = dict(
+            model=resolved_path,
+            max_tokens=self._max_tokens,
+            num_draft_tokens=self._num_draft_tokens,
+        )
         if chat_template_content:
             cli_kwargs["chat_template"] = chat_template_content
+        if self._draft_model_path:
+            cli_kwargs["draft_model"] = self._draft_model_path
         cli_args = _make_cli_args(**cli_kwargs)
 
         provider = ReapModelProvider(model, tokenizer, cli_args)
+        if provider.draft_model is not None:
+            logging.info(
+                f"Speculative decoding enabled: draft_model={self._draft_model_path}, "
+                f"num_draft_tokens={self._num_draft_tokens}"
+            )
         prompt_cache = LRUPromptCache()
         response_generator = ResponseGenerator(provider, prompt_cache)
 
@@ -1112,6 +1127,11 @@ class ReapModelProvider:
 
     This avoids double-loading: the model is loaded once at startup (so we can
     inspect config and install hooks), then wrapped here for mlx-lm's server.
+
+    Supports speculative decoding: when ``cli_args.draft_model`` is set, the
+    draft model is loaded once at init and exposed via ``self.draft_model``.
+    ResponseGenerator reads this attribute to decide whether to use
+    ``speculative_generate_step``.
     """
 
     def __init__(self, model, tokenizer, cli_args: argparse.Namespace):
@@ -1128,14 +1148,50 @@ class ReapModelProvider:
         )
         self.is_distributed = group.size() > 1
 
-        # Check batchability
+        # Load draft model for speculative decoding if specified
+        if getattr(cli_args, "draft_model", None) is not None:
+            self._load_draft_model(cli_args.draft_model)
+
+        # Check batchability — disabled when draft model is present
         from mlx_lm.server import make_prompt_cache
-        self.is_batchable = all(
-            hasattr(c, "merge") for c in make_prompt_cache(self.model)
-        )
+        if self.draft_model is None:
+            self.is_batchable = all(
+                hasattr(c, "merge") for c in make_prompt_cache(self.model)
+            )
+        else:
+            self.is_batchable = False
+
+    def _load_draft_model(self, draft_model_path: str):
+        """Load and validate a draft model for speculative decoding."""
+        from mlx_lm import load as mlx_load
+
+        logging.info(f"Loading draft model: {draft_model_path}")
+        draft_model, draft_tokenizer = mlx_load(draft_model_path)
+
+        if draft_tokenizer.vocab_size != self.tokenizer.vocab_size:
+            logging.warning(
+                "Draft model tokenizer does not match model tokenizer "
+                f"(draft vocab={draft_tokenizer.vocab_size}, "
+                f"target vocab={self.tokenizer.vocab_size}). "
+                "Speculative decoding may not work as expected."
+            )
+
+        self.draft_model = draft_model
+        self.model_key = ("reap_preloaded", None, draft_model_path)
 
     def load(self, model_path=None, adapter_path=None, draft_model_path=None):
-        """Return the pre-loaded model — no actual loading occurs."""
+        """Return the pre-loaded model — no actual loading occurs.
+
+        Handles draft_model_path for compatibility with mlx-lm's server:
+        - ``"default_model"``: use the draft model from CLI args (already loaded)
+        - explicit path: load that specific draft model
+        - ``None``: no draft model
+        """
+        if draft_model_path == "default_model":
+            pass  # Already loaded in __init__ from cli_args
+        elif draft_model_path is not None:
+            self._load_draft_model(draft_model_path)
+
         return self.model, self.tokenizer
 
 
@@ -1979,6 +2035,8 @@ def run_reap_server(
     kv_compress: Optional[str] = None,
     kv_compress_bits: int = 4,
     idle_timeout: float = 1800.0,
+    draft_model_path: Optional[str] = None,
+    num_draft_tokens: int = 3,
 ):
     """Start the server with on-demand model loading.
 
@@ -2004,6 +2062,10 @@ def run_reap_server(
         kv_compress_bits: Bits per channel for KV compression (2-8).
         idle_timeout: Seconds of inactivity before auto-unloading model.
             0 disables auto-unload.
+        draft_model_path: Optional path/repo ID for a draft model
+            (speculative decoding). When set, the server uses mlx-lm's
+            speculative decoding loop with the draft model.
+        num_draft_tokens: Number of tokens to draft per speculative step.
     """
     from mlx_lm.server import (
         LRUPromptCache,
@@ -2029,6 +2091,8 @@ def run_reap_server(
         max_kv_size=max_kv_size,
         kv_compress=kv_compress,
         kv_compress_bits=kv_compress_bits,
+        draft_model_path=draft_model_path,
+        num_draft_tokens=num_draft_tokens,
     )
 
     # Apply initial steering if configured

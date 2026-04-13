@@ -607,10 +607,13 @@ def smoke_test(model, prompt, max_tokens, kv_compress, kv_compress_bits):
               help="Path or HuggingFace repo ID for a draft model (speculative decoding).")
 @click.option("--num-draft-tokens", default=3, type=int,
               help="Number of tokens to draft per speculative decoding step. Default: 3.")
+@click.option("--capture-layers", default=None,
+              help="Capture hidden states from these decoder layers during prefill. "
+                   "Comma-separated indices (e.g. '0,4,8') or 'all'. For speculative decoding Phase 2.")
 def serve(model, host, port, mode, auto_save, max_tokens, max_kv_size,
           chat_template, safety_map, steering_mode, domain_map,
           domain_steering_mode, kv_compress, kv_compress_bits, idle_timeout,
-          draft_model, num_draft_tokens):
+          draft_model, num_draft_tokens, capture_layers):
     """Serve model with on-demand loading and online expert counting.
 
     Starts an OpenAI and Anthropic compatible server. Models are loaded on
@@ -648,6 +651,7 @@ def serve(model, host, port, mode, auto_save, max_tokens, max_kv_size,
         idle_timeout=float(idle_timeout),
         draft_model_path=draft_model,
         num_draft_tokens=num_draft_tokens,
+        capture_layers=capture_layers,
     )
 
 

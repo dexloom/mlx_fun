@@ -698,6 +698,7 @@ class ModelManager:
         kv_compress_bits: int = 4,
         draft_model_path: Optional[str] = None,
         num_draft_tokens: int = 3,
+        capture_layers: Optional[str] = None,
     ):
         # Config (immutable for server lifetime)
         self._mode = mode
@@ -709,6 +710,7 @@ class ModelManager:
         self._kv_compress_bits = kv_compress_bits
         self._draft_model_path = draft_model_path
         self._num_draft_tokens = num_draft_tokens
+        self._capture_layers = capture_layers
 
         # Mutable state (protected by _lock)
         self._lock = threading.RLock()
@@ -847,6 +849,22 @@ class ModelManager:
                 f"Speculative decoding enabled: draft_model={self._draft_model_path}, "
                 f"num_draft_tokens={self._num_draft_tokens}"
             )
+
+        # Install hidden state capture hooks if requested (Phase 2)
+        if self._capture_layers is not None:
+            from .hidden_state_capture import HiddenStateCapture, parse_capture_layers
+
+            num_model_layers = len(model.model.layers)
+            layer_indices = parse_capture_layers(self._capture_layers, num_model_layers)
+            if layer_indices is not None:
+                hsc = HiddenStateCapture(model, layer_indices)
+                hsc.install()
+                provider.hidden_state_capture = hsc
+                logging.info(
+                    f"Hidden state capture enabled on {len(layer_indices)} "
+                    f"decoder layers: {layer_indices}"
+                )
+
         prompt_cache = LRUPromptCache()
         response_generator = ResponseGenerator(provider, prompt_cache)
 
@@ -1139,6 +1157,7 @@ class ReapModelProvider:
         self.model = model
         self.tokenizer = tokenizer
         self.draft_model = None
+        self.hidden_state_capture = None  # HiddenStateCapture (Phase 2)
         self.model_key = ("reap_preloaded", None, None)
 
         group = mx.distributed.init()
@@ -2037,6 +2056,7 @@ def run_reap_server(
     idle_timeout: float = 1800.0,
     draft_model_path: Optional[str] = None,
     num_draft_tokens: int = 3,
+    capture_layers: Optional[str] = None,
 ):
     """Start the server with on-demand model loading.
 
@@ -2066,6 +2086,9 @@ def run_reap_server(
             (speculative decoding). When set, the server uses mlx-lm's
             speculative decoding loop with the draft model.
         num_draft_tokens: Number of tokens to draft per speculative step.
+        capture_layers: Optional comma-separated layer indices or "all".
+            When set, installs hidden state capture hooks on the specified
+            decoder layers for speculative decoding (Phase 2).
     """
     from mlx_lm.server import (
         LRUPromptCache,
@@ -2093,6 +2116,7 @@ def run_reap_server(
         kv_compress_bits=kv_compress_bits,
         draft_model_path=draft_model_path,
         num_draft_tokens=num_draft_tokens,
+        capture_layers=capture_layers,
     )
 
     # Apply initial steering if configured
@@ -2125,6 +2149,7 @@ def run_reap_server(
     placeholder_provider.model = None
     placeholder_provider.tokenizer = None
     placeholder_provider.draft_model = None
+    placeholder_provider.hidden_state_capture = None
     placeholder_provider.model_key = ("placeholder", None, None)
     placeholder_provider.pipeline_group = None
     placeholder_provider.tensor_group = None

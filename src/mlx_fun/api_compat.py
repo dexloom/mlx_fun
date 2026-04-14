@@ -198,13 +198,22 @@ def build_anthropic_response(
         content.append({"type": "text", "text": text})
 
     if tool_calls:
+        import json as _json
         for tc in tool_calls:
             fn = tc.get("function", tc)
+            args = fn.get("arguments", {})
+            # ToolCallFormatter returns arguments as a JSON string —
+            # parse it back to a dict for Anthropic format.
+            if isinstance(args, str):
+                try:
+                    args = _json.loads(args)
+                except (_json.JSONDecodeError, ValueError):
+                    args = {"_raw": args}
             content.append({
                 "type": "tool_use",
                 "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:12]}"),
                 "name": fn["name"],
-                "input": fn.get("arguments", {}),
+                "input": args,
             })
 
     stop_reason = map_stop_reason(finish_reason)

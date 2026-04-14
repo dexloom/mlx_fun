@@ -50,8 +50,14 @@ def _glm4_ream_call(self, x: mx.array) -> mx.array:
 
     # Normal forward
     inds, scores = self.gate(x)
-    y = self.switch_mlp(x, inds)
+    # Latent projection (Nemotron-H): hidden → moe_latent_size before experts
+    x_experts = x
+    if hasattr(self, "fc1_latent_proj"):
+        x_experts = self.fc1_latent_proj(x)
+    y = self.switch_mlp(x_experts, inds)
     y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+    if hasattr(self, "fc2_latent_proj"):
+        y = self.fc2_latent_proj(y)
     if hasattr(self, "shared_experts") and self.shared_experts is not None:
         y = y + self.shared_experts(x)
     return y

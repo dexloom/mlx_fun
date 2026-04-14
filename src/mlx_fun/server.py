@@ -10,8 +10,11 @@ same generation pipeline — jinja templates always receive OpenAI-style message
 """
 
 import argparse
+import gc
+import io
 import json
 import logging
+import re
 import signal
 import threading
 import time
@@ -153,7 +156,11 @@ def _glm4_counting_call(self, x: mx.array) -> mx.array:
         )
 
     inds, scores = self.gate(x)
-    y = self.switch_mlp(x, inds)
+    # Latent projection (Nemotron-H): 4096 → moe_latent_size before experts
+    x_experts = x
+    if hasattr(self, "fc1_latent_proj"):
+        x_experts = self.fc1_latent_proj(x)
+    y = self.switch_mlp(x_experts, inds)
 
     mx.eval(inds, scores)
     np_inds = _to_numpy(inds).reshape(-1, inds.shape[-1])
@@ -161,6 +168,9 @@ def _glm4_counting_call(self, x: mx.array) -> mx.array:
     self._reap_accumulator.update(self._reap_layer_idx, np_inds, np_scores)
 
     y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+    # Latent back-projection: moe_latent_size → 4096
+    if hasattr(self, "fc2_latent_proj"):
+        y = self.fc2_latent_proj(y)
     if hasattr(self, "shared_experts") and self.shared_experts is not None:
         y = y + self.shared_experts(x)
 
@@ -250,7 +260,10 @@ def _glm4_full_counting_call(self, x: mx.array) -> mx.array:
         )
 
     inds, scores = self.gate(x)
-    y = self.switch_mlp(x, inds)
+    x_experts = x
+    if hasattr(self, "fc1_latent_proj"):
+        x_experts = self.fc1_latent_proj(x)
+    y = self.switch_mlp(x_experts, inds)
     activation_norms = mx.linalg.norm(y, axis=-1)
 
     mx.eval(inds, scores, activation_norms)
@@ -260,6 +273,8 @@ def _glm4_full_counting_call(self, x: mx.array) -> mx.array:
     self._reap_accumulator.update(self._reap_layer_idx, np_inds, np_scores, np_norms)
 
     y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+    if hasattr(self, "fc2_latent_proj"):
+        y = self.fc2_latent_proj(y)
     if hasattr(self, "shared_experts") and self.shared_experts is not None:
         y = y + self.shared_experts(x)
 
@@ -432,7 +447,11 @@ def _glm4_counting_steering_call(self, x: mx.array) -> mx.array:
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
     scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
 
-    y = self.switch_mlp(x, inds)
+    # Latent projection (Nemotron-H): 4096 → moe_latent_size before experts
+    x_experts = x
+    if hasattr(self, "fc1_latent_proj"):
+        x_experts = self.fc1_latent_proj(x)
+    y = self.switch_mlp(x_experts, inds)
 
     mx.eval(inds, scores)
     np_inds = _to_numpy(inds).reshape(-1, inds.shape[-1])
@@ -440,6 +459,9 @@ def _glm4_counting_steering_call(self, x: mx.array) -> mx.array:
     self._reap_accumulator.update(self._reap_layer_idx, np_inds, np_scores)
 
     y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+    # Latent back-projection: moe_latent_size → 4096
+    if hasattr(self, "fc2_latent_proj"):
+        y = self.fc2_latent_proj(y)
     if hasattr(self, "shared_experts") and self.shared_experts is not None:
         y = y + self.shared_experts(x)
 
@@ -609,6 +631,395 @@ def remove_counting_hooks(moe_blocks: List) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Model path resolution
+# ---------------------------------------------------------------------------
+
+_LMSTUDIO_ROOT = Path.home() / ".lmstudio" / "models"
+
+
+def _resolve_model_path(model_id: str) -> str:
+    """Resolve a model identifier to a filesystem path.
+
+    Resolution order:
+      1. Absolute path that exists → use it.
+      2. Exact relative path under ~/.lmstudio/models/ → use it.
+      3. Partial name match (directory name ends with model_id) → use it.
+      4. Pass through as-is (HuggingFace repo ID for mlx_lm.load).
+
+    Raises ValueError on ambiguous partial match.
+    """
+    # 1. Absolute path
+    p = Path(model_id)
+    if p.is_absolute() and p.exists():
+        return str(p)
+
+    # 2-3. Search lmstudio models directory
+    if _LMSTUDIO_ROOT.exists():
+        # 2. Exact relative match
+        candidate = _LMSTUDIO_ROOT / model_id
+        if candidate.exists() and (candidate / "config.json").exists():
+            return str(candidate)
+
+        # 3. Partial / suffix match
+        matches = []
+        for config_path in _LMSTUDIO_ROOT.rglob("config.json"):
+            model_dir = config_path.parent
+            rel = str(model_dir.relative_to(_LMSTUDIO_ROOT))
+            if rel.endswith(model_id) or model_id in rel:
+                matches.append(str(model_dir))
+
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous model ID '{model_id}' matches {len(matches)} models: "
+                + ", ".join(matches[:5])
+            )
+
+    # 4. Pass through (HF repo ID or local relative path)
+    return model_id
+
+
+# ---------------------------------------------------------------------------
+# On-demand model manager
+# ---------------------------------------------------------------------------
+
+class ModelManager:
+    """Manages single-model lifecycle: on-demand load, hook install, auto-unload."""
+
+    def __init__(
+        self,
+        mode: str = "lightweight",
+        max_tokens: int = 512,
+        chat_template: Optional[str] = None,
+        idle_timeout: float = 1800.0,
+        max_kv_size: Optional[int] = None,
+        kv_compress: Optional[str] = None,
+        kv_compress_bits: int = 4,
+    ):
+        # Config (immutable for server lifetime)
+        self._mode = mode
+        self._max_tokens = max_tokens
+        self._chat_template = chat_template
+        self._idle_timeout = idle_timeout
+        self._max_kv_size = max_kv_size
+        self._kv_compress = kv_compress
+        self._kv_compress_bits = kv_compress_bits
+
+        # Mutable state (protected by _lock)
+        self._lock = threading.RLock()
+        self._model = None
+        self._tokenizer = None
+        self._config: Optional[dict] = None
+        self._model_path: Optional[str] = None
+        self._model_type: Optional[str] = None
+        self._adapter = None
+        self._moe_blocks: List = []
+        self._accumulator: Optional[OnlineAccumulator] = None
+        self._response_generator = None
+        self._provider = None
+        self._n_experts: int = 0
+        self._kv_compress_info: Optional[dict] = None
+        self._steering_config = None  # Persists across model swaps
+
+        # Loading state
+        self._loading = False
+        self._load_condition = threading.Condition(self._lock)
+
+        # Idle timer
+        self._last_request_time: float = 0.0
+        self._unload_timer: Optional[threading.Timer] = None
+
+    # --- Properties ---
+
+    @property
+    def is_loaded(self) -> bool:
+        return self._model is not None
+
+    @property
+    def loaded_model_path(self) -> Optional[str]:
+        return self._model_path
+
+    @property
+    def accumulator(self) -> Optional[OnlineAccumulator]:
+        return self._accumulator
+
+    @property
+    def moe_blocks(self) -> List:
+        return self._moe_blocks
+
+    @property
+    def n_experts(self) -> int:
+        return self._n_experts
+
+    @property
+    def kv_compress_info(self) -> Optional[dict]:
+        return self._kv_compress_info
+
+    @property
+    def max_kv_size(self) -> Optional[int]:
+        return self._max_kv_size
+
+    @property
+    def steering_config(self):
+        return self._steering_config
+
+    @steering_config.setter
+    def steering_config(self, value):
+        self._steering_config = value
+
+    # --- Core lifecycle ---
+
+    def ensure_loaded(self, model_id: str):
+        """Ensure model_id is loaded. Returns the ResponseGenerator.
+
+        If a different model is loaded, unloads it first.
+        If the same model is loaded, resets the idle timer.
+        Blocks concurrent callers while loading is in progress.
+        """
+        resolved = _resolve_model_path(model_id)
+
+        with self._lock:
+            # Same model already loaded
+            if self._model_path == resolved and self._response_generator is not None:
+                self._reset_idle_timer()
+                return self._response_generator
+
+            # Wait if another thread is loading
+            while self._loading:
+                self._load_condition.wait()
+
+            # Re-check after wait (other thread may have loaded our model)
+            if self._model_path == resolved and self._response_generator is not None:
+                self._reset_idle_timer()
+                return self._response_generator
+
+            self._loading = True
+
+        # Load outside lock (long operation)
+        try:
+            self._do_load(resolved)
+        finally:
+            with self._lock:
+                self._loading = False
+                self._load_condition.notify_all()
+
+        return self._response_generator
+
+    def _do_load(self, resolved_path: str):
+        """Load model, install hooks, create ResponseGenerator."""
+        from mlx_lm import load as mlx_load
+        from mlx_lm.server import LRUPromptCache, ResponseGenerator
+
+        logging.info(f"Loading model: {resolved_path}")
+        model, tokenizer, config = mlx_load(resolved_path, return_config=True)
+
+        model_type = config.get("model_type", "")
+
+        # Set up MoE adapter + hooks
+        adapter, moe_blocks, accumulator, n_experts = self._setup_hooks(model, config)
+
+        # Apply KV compression
+        kv_compress_info = self._setup_kv_compression(model, model_type)
+
+        # Resolve chat template
+        chat_template_content = _resolve_chat_template(self._chat_template, model_type)
+
+        # Build cli_args and provider
+        cli_kwargs = dict(model=resolved_path, max_tokens=self._max_tokens)
+        if chat_template_content:
+            cli_kwargs["chat_template"] = chat_template_content
+        cli_args = _make_cli_args(**cli_kwargs)
+
+        provider = ReapModelProvider(model, tokenizer, cli_args)
+        prompt_cache = LRUPromptCache()
+        response_generator = ResponseGenerator(provider, prompt_cache)
+
+        # Swap state under lock
+        with self._lock:
+            old_rg = self._response_generator
+            old_moe = list(self._moe_blocks)
+
+            self._model = model
+            self._tokenizer = tokenizer
+            self._config = config
+            self._model_path = resolved_path
+            self._model_type = model_type
+            self._adapter = adapter
+            self._moe_blocks = moe_blocks
+            self._accumulator = accumulator
+            self._n_experts = n_experts
+            self._response_generator = response_generator
+            self._provider = provider
+            self._kv_compress_info = kv_compress_info
+            self._reset_idle_timer()
+
+        # Clean up old resources outside lock
+        if old_rg is not None:
+            old_rg.stop_and_join()
+        if old_moe:
+            remove_counting_hooks(old_moe)
+        gc.collect()
+
+        # Re-apply steering if configured
+        if self._steering_config is not None and moe_blocks:
+            _update_steering_bias(moe_blocks, self._steering_config, n_experts)
+
+        if accumulator:
+            logging.info(
+                f"Model loaded: {model_type}, MoE layers: {accumulator.num_layers}, "
+                f"Experts: {n_experts}"
+            )
+        else:
+            logging.info(f"Model loaded: {model_type} (plain inference, no MoE)")
+
+    def _setup_hooks(self, model, config):
+        """Install MoE hooks. Returns (adapter, moe_blocks, accumulator, n_experts)."""
+        from .adapters import get_adapter
+
+        model_type = config.get("model_type", "")
+        try:
+            adapter = get_adapter(model, config)
+            moe_indices = adapter.moe_layer_indices()
+        except (ValueError, KeyError, TypeError):
+            logging.info(f"Model type '{model_type}' has no MoE adapter — plain inference")
+            return None, [], None, 0
+
+        # Dense model (no MoE layers) — skip hook installation
+        if not moe_indices:
+            logging.info(f"Model type '{model_type}' has no MoE layers — plain inference")
+            return None, [], None, 0
+
+        try:
+            n_experts = adapter.num_routed_experts()
+        except (ValueError, KeyError, TypeError):
+            n_experts = None
+
+        if not n_experts:
+            logging.info(f"Model type '{model_type}' has no routed experts — plain inference")
+            return None, [], None, 0
+
+        accumulator = OnlineAccumulator(len(moe_indices), n_experts)
+        moe_blocks = [adapter.get_moe_block(i) for i in moe_indices]
+        install_counting_hooks(
+            moe_blocks, model_type, accumulator, mode=self._mode, steering=True,
+        )
+        return adapter, moe_blocks, accumulator, n_experts
+
+    def _setup_kv_compression(self, model, model_type):
+        """Apply KV compression if configured. Returns kv_compress_info dict or None."""
+        kv_compress_info = None
+
+        if self._max_kv_size is not None and not self._kv_compress:
+            from mlx_lm.models.cache import RotatingKVCache
+            _num_layers = len(model.layers)
+            _max_kv = self._max_kv_size
+
+            def _make_cache():
+                return [RotatingKVCache(max_size=_max_kv, keep=4) for _ in range(_num_layers)]
+
+            model.make_cache = _make_cache
+
+        if self._kv_compress == "turbo":
+            from .kv_compress import TurboQuantConfig, TurboQuantKVCache, setup_turbo_quant
+            cfg = TurboQuantConfig(bits=self._kv_compress_bits, max_size=self._max_kv_size)
+            caches, sdpa_patched = setup_turbo_quant(model, model_type, cfg)
+            eff_cfg = caches[0].config if caches else cfg
+            _num_layers = len(model.layers)
+
+            def _make_cache():
+                return [TurboQuantKVCache(config=eff_cfg) for _ in range(_num_layers)]
+
+            model.make_cache = _make_cache
+            kv_compress_info = {
+                "enabled": True, "bits": self._kv_compress_bits,
+                "method": "TurboQuant/PolarQuant", "quantized_sdpa": sdpa_patched,
+                "max_size": self._max_kv_size,
+            }
+        elif self._kv_compress == "rotor":
+            from .rotor_quant import RotorQuantConfig, RotorQuantKVCache
+            cfg = RotorQuantConfig(bits=self._kv_compress_bits, max_size=self._max_kv_size)
+            _num_layers = len(model.layers)
+
+            def _make_cache():
+                return [RotorQuantKVCache(config=cfg) for _ in range(_num_layers)]
+
+            model.make_cache = _make_cache
+            kv_compress_info = {
+                "enabled": True, "bits": self._kv_compress_bits,
+                "method": "RotorQuant/Clifford", "quantized_sdpa": False,
+                "max_size": self._max_kv_size,
+            }
+
+        return kv_compress_info
+
+    def _unload_model(self):
+        """Unload current model and free memory. Must be called with _lock held."""
+        if self._response_generator is not None:
+            self._response_generator.stop_and_join()
+        if self._moe_blocks:
+            remove_counting_hooks(self._moe_blocks)
+
+        model_path = self._model_path
+        self._model = None
+        self._tokenizer = None
+        self._config = None
+        self._model_path = None
+        self._model_type = None
+        self._adapter = None
+        self._moe_blocks = []
+        self._accumulator = None
+        self._response_generator = None
+        self._provider = None
+        self._n_experts = 0
+        self._kv_compress_info = None
+
+        if self._unload_timer is not None:
+            self._unload_timer.cancel()
+            self._unload_timer = None
+
+        gc.collect()
+        try:
+            mx.metal.reset_peak_memory()
+        except Exception:
+            pass
+
+        logging.info(f"Model unloaded: {model_path}")
+
+    def _reset_idle_timer(self):
+        """Cancel existing timer and start a new one. Caller holds _lock."""
+        if self._unload_timer is not None:
+            self._unload_timer.cancel()
+        self._last_request_time = time.time()
+        if self._idle_timeout > 0:
+            self._unload_timer = threading.Timer(self._idle_timeout, self._on_idle_timeout)
+            self._unload_timer.daemon = True
+            self._unload_timer.start()
+
+    def _on_idle_timeout(self):
+        """Called by Timer thread when idle timeout expires."""
+        with self._lock:
+            elapsed = time.time() - self._last_request_time
+            if elapsed < self._idle_timeout:
+                return  # Request came in since timer was set
+            if self._loading:
+                return  # Load in progress
+            if not self.is_loaded:
+                return  # Already unloaded
+            logging.info(f"Model idle for {elapsed:.0f}s, unloading...")
+            self._unload_model()
+
+    def shutdown(self):
+        """Clean shutdown: cancel timer, unload model."""
+        with self._lock:
+            if self._unload_timer is not None:
+                self._unload_timer.cancel()
+                self._unload_timer = None
+            if self.is_loaded:
+                self._unload_model()
+
+
+# ---------------------------------------------------------------------------
 # Chat template auto-detection
 # ---------------------------------------------------------------------------
 
@@ -770,31 +1181,26 @@ def _build_perf_block(
 
 class ReapAPIHandler:
     """Mixin-style handler factory that creates an APIHandler subclass
-    with access to the OnlineAccumulator and steering controls."""
+    with access to the ModelManager and steering controls."""
 
     @staticmethod
-    def create_handler_class(
-        accumulator: OnlineAccumulator,
-        moe_blocks: List = None,
-        num_experts: int = 0,
-        kv_compress_info: Optional[dict] = None,
-        max_kv_size: Optional[int] = None,
-    ):
-        """Dynamically create a handler class with accumulator reference.
+    def create_handler_class(model_manager: ModelManager):
+        """Dynamically create a handler class with ModelManager reference.
 
         We need to do this because BaseHTTPRequestHandler is instantiated
         per-request and the mlx-lm factory pattern passes response_generator
-        to __init__. We attach the accumulator as a class attribute.
+        to __init__. We attach the model_manager as a class attribute.
         """
         from mlx_lm.server import APIHandler
 
         class _ReapHandler(APIHandler):
-            _reap_accumulator = accumulator
-            _reap_moe_blocks = moe_blocks
-            _reap_num_experts = num_experts
-            _reap_steering_config = None  # Current SteeringConfig or None
-            _reap_kv_compress_info = kv_compress_info
-            _reap_max_kv_size = max_kv_size
+            _model_manager = model_manager
+
+            def _ensure_model(self, model_id: str):
+                """Load model on demand and update self.response_generator."""
+                rg = self._model_manager.ensure_loaded(model_id)
+                self.response_generator = rg
+                return rg
 
             def do_GET(self):
                 try:
@@ -810,34 +1216,25 @@ class ReapAPIHandler:
                     logging.debug("Client disconnected (GET %s)", self.path)
 
             def handle_models_request(self):
-                """List models from ~/.lmstudio/models instead of HF cache."""
-                lmstudio_root = Path.home() / ".lmstudio" / "models"
+                """List models from ~/.lmstudio/models with loaded status."""
                 models = []
-                if lmstudio_root.exists():
-                    for config_path in lmstudio_root.rglob("config.json"):
+                loaded_path = self._model_manager.loaded_model_path
+                loaded_resolved = str(Path(loaded_path).resolve()) if loaded_path else None
+
+                if _LMSTUDIO_ROOT.exists():
+                    for config_path in _LMSTUDIO_ROOT.rglob("config.json"):
                         model_dir = config_path.parent
-                        model_id = str(model_dir.relative_to(lmstudio_root))
-                        models.append(
-                            {
-                                "id": model_id,
-                                "object": "model",
-                                "created": self.created,
-                            }
+                        model_id = str(model_dir.relative_to(_LMSTUDIO_ROOT))
+                        is_loaded = (
+                            loaded_resolved is not None
+                            and str(model_dir.resolve()) == loaded_resolved
                         )
-                # Also include the currently loaded model
-                cli_model = self.response_generator.cli_args.model
-                if cli_model:
-                    model_path = Path(cli_model)
-                    if model_path.exists():
-                        model_id = str(model_path.resolve())
-                        if not any(m["id"] == model_id for m in models):
-                            models.append(
-                                {
-                                    "id": model_id,
-                                    "object": "model",
-                                    "created": self.created,
-                                }
-                            )
+                        models.append({
+                            "id": model_id,
+                            "object": "model",
+                            "created": self.created,
+                            "loaded": is_loaded,
+                        })
                 response = {"object": "list", "data": models}
                 self._json_response(200, response)
 
@@ -851,6 +1248,40 @@ class ReapAPIHandler:
                         self._handle_steer_post()
                     elif self.path == "/v1/messages":
                         self._handle_anthropic_messages()
+                    elif self.path in ("/v1/chat/completions", "/v1/completions",
+                                       "/chat/completions"):
+                        # Pre-read body to peek at model field, load on demand,
+                        # then re-inject body for parent's do_POST to parse.
+                        content_length = self.headers.get("Content-Length")
+                        if content_length is None:
+                            self._set_completion_headers(411)
+                            self.end_headers()
+                            self.wfile.write(
+                                json.dumps({"error": "Content-Length required"}).encode()
+                            )
+                            return
+                        raw = self.rfile.read(int(content_length))
+                        try:
+                            body = json.loads(raw)
+                        except json.JSONDecodeError as e:
+                            self._set_completion_headers(400)
+                            self.end_headers()
+                            self.wfile.write(
+                                json.dumps({"error": f"Invalid JSON: {e}"}).encode()
+                            )
+                            return
+
+                        model_id = body.get("model", "default")
+                        try:
+                            self._ensure_model(model_id)
+                        except Exception as e:
+                            logging.error(f"Model load failed for '{model_id}': {e}", exc_info=True)
+                            self._json_response(503, {"error": f"Model load failed: {e}"})
+                            return
+
+                        # Re-stuff body for parent do_POST
+                        self.rfile = io.BytesIO(raw)
+                        super().do_POST()
                     else:
                         super().do_POST()
                 except BrokenPipeError:
@@ -940,7 +1371,23 @@ class ReapAPIHandler:
                 else:
                     self._set_completion_headers(200)
 
-                tool_formatter = ToolCallFormatter(ctx.tool_parser, request.tools, self.stream)
+                _raw_formatter = ToolCallFormatter(ctx.tool_parser, request.tools, self.stream)
+
+                def tool_formatter(tc):
+                    """Safe wrapper: log raw input and fall back to empty on parse errors."""
+                    try:
+                        return _raw_formatter(tc)
+                    except (ValueError, SyntaxError, KeyError) as e:
+                        logging.warning(
+                            "Tool call parse FAILED: %s\n"
+                            "  Raw tool_text from model:\n%s\n"
+                            "  Tools available: %s",
+                            e,
+                            tc,
+                            [t.get("function", {}).get("name", "?")
+                             for t in (request.tools or [])],
+                        )
+                        return []
 
                 prev_state = None
                 finish_reason = "stop"
@@ -1059,22 +1506,33 @@ class ReapAPIHandler:
                 self.wfile.write(body)
 
             def _handle_reap_stats(self):
-                self._json_response(200, self._reap_accumulator.get_stats())
+                acc = self._model_manager.accumulator
+                if acc is None:
+                    self._json_response(200, {"status": "no_model_loaded"})
+                    return
+                self._json_response(200, acc.get_stats())
 
             def _handle_reap_info(self):
-                acc = self._reap_accumulator
+                mm = self._model_manager
+                acc = mm.accumulator
                 info = {
-                    "num_layers": acc.num_layers,
-                    "num_experts": acc.num_experts,
-                    "request_count": acc._request_count,
-                    "token_count": acc._token_count,
-                    "steering_active": self._reap_steering_config is not None,
-                    "max_kv_size": self._reap_max_kv_size,
-                    "kv_compress": self._reap_kv_compress_info,
+                    "model_loaded": mm.is_loaded,
+                    "model_path": mm.loaded_model_path,
+                    "num_layers": acc.num_layers if acc else 0,
+                    "num_experts": acc.num_experts if acc else 0,
+                    "request_count": acc._request_count if acc else 0,
+                    "token_count": acc._token_count if acc else 0,
+                    "steering_active": mm.steering_config is not None,
+                    "max_kv_size": mm.max_kv_size,
+                    "kv_compress": mm.kv_compress_info,
                 }
                 self._json_response(200, info)
 
             def _handle_reap_save(self):
+                acc = self._model_manager.accumulator
+                if acc is None:
+                    self._json_response(400, {"error": "no model loaded"})
+                    return
                 try:
                     content_length = int(self.headers.get("Content-Length", 0))
                     if content_length > 0:
@@ -1083,31 +1541,29 @@ class ReapAPIHandler:
                     else:
                         data = {}
                     path = data.get("path", "reap_saliency.npz")
-                    self._reap_accumulator.save(path)
+                    acc.save(path)
                     self._json_response(200, {"status": "saved", "path": path})
                 except Exception as e:
                     self._json_response(500, {"error": str(e)})
 
             def _handle_reap_reset(self):
-                self._reap_accumulator.reset()
+                acc = self._model_manager.accumulator
+                if acc is None:
+                    self._json_response(400, {"error": "no model loaded"})
+                    return
+                acc.reset()
                 self._json_response(200, {"status": "reset"})
 
             def _handle_steer_get(self):
                 """GET /v1/reap/steer — return current steering config."""
-                cfg = _ReapHandler._reap_steering_config
+                cfg = self._model_manager.steering_config
                 if cfg is None:
                     self._json_response(200, {"active": False})
                 else:
                     self._json_response(200, {"active": True, "config": cfg.to_dict()})
 
             def _handle_steer_post(self):
-                """POST /v1/reap/steer — update steering config.
-
-                Body can be either:
-                  {"safety_map": "/path/to/report.json", "mode": "safe"|"unsafe"}
-                or direct config:
-                  {"deactivate": {"0": [1, 2]}, "activate": {"3": [5]}, ...}
-                """
+                """POST /v1/reap/steer — update steering config."""
                 from .steering import SteeringConfig
 
                 try:
@@ -1126,11 +1582,10 @@ class ReapAPIHandler:
                     else:
                         config = SteeringConfig.from_dict(data)
 
-                    if self._reap_moe_blocks:
-                        _update_steering_bias(
-                            self._reap_moe_blocks, config, self._reap_num_experts,
-                        )
-                    _ReapHandler._reap_steering_config = config
+                    mm = self._model_manager
+                    if mm.moe_blocks:
+                        _update_steering_bias(mm.moe_blocks, config, mm.n_experts)
+                    mm.steering_config = config
                     self._json_response(200, {"status": "steering_updated", "config": config.to_dict()})
                 except Exception as e:
                     self._json_response(500, {"error": str(e)})
@@ -1139,12 +1594,11 @@ class ReapAPIHandler:
                 """DELETE /v1/reap/steer — remove all steering."""
                 from .steering import SteeringConfig
 
-                if self._reap_moe_blocks:
+                mm = self._model_manager
+                if mm.moe_blocks:
                     empty = SteeringConfig()
-                    _update_steering_bias(
-                        self._reap_moe_blocks, empty, self._reap_num_experts,
-                    )
-                _ReapHandler._reap_steering_config = None
+                    _update_steering_bias(mm.moe_blocks, empty, mm.n_experts)
+                mm.steering_config = None
                 self._json_response(200, {"status": "steering_removed"})
 
             # ---------------------------------------------------------------
@@ -1217,6 +1671,18 @@ class ReapAPIHandler:
                     })
                     return
 
+                # Load model on demand
+                model_name = body.get("model", "default")
+                try:
+                    self._ensure_model(model_name)
+                except Exception as e:
+                    logging.error(f"Model load failed for '{model_name}': {e}", exc_info=True)
+                    self._json_response(503, {
+                        "type": "error",
+                        "error": {"type": "api_error", "message": f"Model load failed: {e}"},
+                    })
+                    return
+
                 # Convert Anthropic -> OpenAI internal format
                 try:
                     messages, tools, stop_words = anthropic_to_openai_messages(body)
@@ -1228,7 +1694,6 @@ class ReapAPIHandler:
                     return
 
                 stream = body.get("stream", False)
-                model_name = body.get("model", "default")
                 max_tokens = body.get("max_tokens", 1024)
                 temperature = body.get("temperature", self.response_generator.cli_args.temp)
                 top_p = body.get("top_p", self.response_generator.cli_args.top_p)
@@ -1283,20 +1748,27 @@ class ReapAPIHandler:
                         anthropic_stream_content_block_stop,
                         anthropic_stream_message_delta,
                         anthropic_stream_message_stop,
-                        map_stop_reason,
+                        map_stop_reason, request_tools=tools,
                     )
                 else:
                     self._anthropic_batch_response(
                         ctx, response, model_name, build_anthropic_response,
-                        map_stop_reason,
+                        map_stop_reason, request_tools=tools,
                     )
 
             def _anthropic_batch_response(self, ctx, response, model_name,
-                                          build_response, map_stop_reason_fn):
+                                          build_response, map_stop_reason_fn,
+                                          request_tools=None):
                 """Collect full generation and return Anthropic JSON response."""
+                from mlx_lm.server import ToolCallFormatter
+
                 text = ""
                 tokens = []
                 finish_reason = "stop"
+                tool_text = ""
+                tool_calls = []
+                made_tool_call = False
+                prev_state = None
                 t_generate_start = time.perf_counter()
                 t_first_token = None
 
@@ -1304,15 +1776,42 @@ class ReapAPIHandler:
                     for gen in response:
                         if t_first_token is None:
                             t_first_token = time.perf_counter()
-                        if gen.state == "normal":
+
+                        if gen.state == "tool":
+                            tool_text += gen.text
+                        elif gen.state == "normal":
+                            if prev_state == "tool":
+                                tool_calls.append(tool_text)
+                                tool_text = ""
+                                made_tool_call = True
                             text += gen.text
-                        elif gen.state == "reasoning":
-                            pass  # Skip thinking tokens in Anthropic format
+                        # reasoning state: tokens skipped in Anthropic output
+
                         tokens.append(gen.token)
                         if gen.finish_reason is not None:
                             finish_reason = gen.finish_reason
+                        prev_state = gen.state
+
+                    if prev_state == "tool" and tool_text:
+                        tool_calls.append(tool_text)
+                        made_tool_call = True
                 finally:
                     ctx.stop()
+
+                # Parse tool call XML/text into structured tool_calls
+                parsed_tool_calls = []
+                if tool_calls:
+                    raw_formatter = ToolCallFormatter(
+                        ctx.tool_parser, request_tools, False,
+                    )
+                    try:
+                        parsed_tool_calls = raw_formatter(tool_calls)
+                    except (ValueError, SyntaxError, KeyError) as e:
+                        logging.warning(
+                            "Anthropic tool call parse FAILED: %s\n  Raw: %s",
+                            e, tool_calls,
+                        )
+                        parsed_tool_calls = []
 
                 t_end = time.perf_counter()
                 resp = build_response(
@@ -1321,6 +1820,7 @@ class ReapAPIHandler:
                     prompt_tokens=len(ctx.prompt),
                     completion_tokens=len(tokens),
                     model=model_name,
+                    tool_calls=parsed_tool_calls or None,
                 )
                 resp["perf"] = _build_perf_block(
                     len(ctx.prompt), len(tokens),
@@ -1339,8 +1839,11 @@ class ReapAPIHandler:
             def _anthropic_stream_response(self, ctx, response, model_name,
                                            fmt_sse, msg_start, cb_start,
                                            cb_delta, cb_stop, msg_delta,
-                                           msg_stop, map_stop_reason_fn):
+                                           msg_stop, map_stop_reason_fn,
+                                           request_tools=None):
                 """Stream generation as Anthropic SSE events."""
+                from mlx_lm.server import ToolCallFormatter
+
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
@@ -1358,6 +1861,10 @@ class ReapAPIHandler:
                 # 3. Stream content_block_delta for each token
                 tokens = []
                 finish_reason = "stop"
+                tool_text = ""
+                tool_calls = []
+                prev_state = None
+                text_block_open = True
                 t_generate_start = time.perf_counter()
                 t_first_token = None
                 try:
@@ -1366,23 +1873,77 @@ class ReapAPIHandler:
                             t_first_token = time.perf_counter()
                         tokens.append(gen.token)
 
-                        if gen.state == "normal" and gen.text:
-                            self.wfile.write(fmt_sse("content_block_delta", cb_delta(0, gen.text)))
-                            self.wfile.flush()
+                        if gen.state == "tool":
+                            tool_text += gen.text
+                        elif gen.state == "normal":
+                            if prev_state == "tool" and tool_text:
+                                tool_calls.append(tool_text)
+                                tool_text = ""
+                            if gen.text:
+                                self.wfile.write(
+                                    fmt_sse("content_block_delta", cb_delta(0, gen.text))
+                                )
+                                self.wfile.flush()
 
                         if gen.finish_reason is not None:
                             finish_reason = gen.finish_reason
+                        prev_state = gen.state
+
+                    if prev_state == "tool" and tool_text:
+                        tool_calls.append(tool_text)
                 finally:
                     ctx.stop()
 
                 t_end = time.perf_counter()
 
-                # 4. content_block_stop
+                # 4. close text block
                 self.wfile.write(fmt_sse("content_block_stop", cb_stop(0)))
                 self.wfile.flush()
 
-                # 5. message_delta with stop_reason + usage + perf
-                stop_reason = map_stop_reason_fn(finish_reason)
+                # 5. emit tool_use blocks if any
+                parsed_tool_calls = []
+                if tool_calls:
+                    raw_formatter = ToolCallFormatter(
+                        ctx.tool_parser, request_tools, False,
+                    )
+                    try:
+                        parsed_tool_calls = raw_formatter(tool_calls)
+                    except (ValueError, SyntaxError, KeyError) as e:
+                        logging.warning(
+                            "Anthropic stream tool parse FAILED: %s\n  Raw: %s",
+                            e, tool_calls,
+                        )
+
+                for idx, tc in enumerate(parsed_tool_calls, start=1):
+                    fn = tc.get("function", tc)
+                    args = fn.get("arguments", {})
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except (json.JSONDecodeError, ValueError):
+                            args = {"_raw": args}
+                    tu_block = {
+                        "type": "tool_use",
+                        "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:12]}"),
+                        "name": fn["name"],
+                        "input": {},
+                    }
+                    self.wfile.write(fmt_sse("content_block_start", {
+                        "type": "content_block_start",
+                        "index": idx,
+                        "content_block": tu_block,
+                    }))
+                    self.wfile.write(fmt_sse("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": {"type": "input_json_delta",
+                                  "partial_json": json.dumps(args)},
+                    }))
+                    self.wfile.write(fmt_sse("content_block_stop", cb_stop(idx)))
+                    self.wfile.flush()
+
+                # 6. message_delta with stop_reason + usage + perf
+                stop_reason = "tool_use" if parsed_tool_calls else map_stop_reason_fn(finish_reason)
                 delta_data = msg_delta(stop_reason, len(tokens))
                 delta_data["perf"] = _build_perf_block(
                     len(ctx.prompt), len(tokens),
@@ -1391,7 +1952,7 @@ class ReapAPIHandler:
                 self.wfile.write(fmt_sse("message_delta", delta_data))
                 self.wfile.flush()
 
-                # 6. message_stop
+                # 7. message_stop
                 self.wfile.write(fmt_sse("message_stop", msg_stop()))
                 self.wfile.flush()
 
@@ -1405,7 +1966,7 @@ class ReapAPIHandler:
 def run_reap_server(
     host: str,
     port: int,
-    model_path: str,
+    model_path: Optional[str] = None,
     mode: str = "lightweight",
     auto_save: Optional[str] = None,
     max_tokens: int = 512,
@@ -1417,37 +1978,38 @@ def run_reap_server(
     domain_steering_mode: Optional[str] = None,
     kv_compress: Optional[str] = None,
     kv_compress_bits: int = 4,
+    idle_timeout: float = 1800.0,
 ):
-    """Load model, install counting hooks, and start the server.
+    """Start the server with on-demand model loading.
+
+    Models are loaded when the first request specifying a model arrives.
+    After ``idle_timeout`` seconds of inactivity, the model is unloaded
+    to free memory.
 
     Args:
         host: Bind address.
         port: Bind port.
-        model_path: HuggingFace repo ID or local model path.
+        model_path: Optional default model to load eagerly at startup.
+            If None, the server starts empty and loads on first request.
         mode: 'lightweight' (freq/weighted_freq only) or 'full' (all metrics).
         auto_save: If set, save accumulator to this path on shutdown.
         max_tokens: Default max tokens for generation.
-        max_kv_size: If set, cap KV cache to this many tokens per layer
-            using RotatingKVCache (sliding window). Limits memory for long
-            conversations while preserving recent context.
+        max_kv_size: If set, cap KV cache to this many tokens per layer.
         chat_template: Optional chat template override.
         safety_map: Optional path to safety_report.json for steering.
         steering_mode: Optional 'safe' or 'unsafe' steering mode.
         domain_map: Optional path to domain_report.json for domain boosting.
         domain_steering_mode: Optional 'boost' or 'suppress' domain mode.
-        kv_compress: KV compression method — 'turbo' (TurboQuant/PolarQuant),
-            'rotor' (RotorQuant/Clifford), or None (disabled).
+        kv_compress: KV compression method ('turbo', 'rotor', or None).
         kv_compress_bits: Bits per channel for KV compression (2-8).
+        idle_timeout: Seconds of inactivity before auto-unloading model.
+            0 disables auto-unload.
     """
-    from mlx_lm import load as mlx_load
     from mlx_lm.server import (
         LRUPromptCache,
         ResponseGenerator,
         _run_http_server,
-        get_system_fingerprint,
     )
-
-    from .adapters import get_adapter
 
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
@@ -1458,195 +2020,89 @@ def run_reap_server(
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
 
-    # Load model
-    logging.info(f"Loading model: {model_path}")
-    model, tokenizer, config = mlx_load(model_path, return_config=True)
-
-    # Set up adapter and get MoE info (optional — non-MoE models skip hooks)
-    model_type = config.get("model_type", "")
-    adapter = None
-    moe_indices = []
-    n_experts = 0
-    accumulator = None
-    moe_blocks = []
-
-    try:
-        adapter = get_adapter(model, config)
-        moe_indices = adapter.moe_layer_indices()
-        n_experts = adapter.num_routed_experts()
-    except (ValueError, KeyError):
-        logging.info(
-            f"Model type '{model_type}' has no MoE adapter — "
-            "serving without REAP hooks (plain inference mode)"
-        )
-
-    if adapter and moe_indices:
-        logging.info(
-            f"Model type: {model_type}, MoE layers: {len(moe_indices)}, "
-            f"Experts per layer: {n_experts}"
-        )
-
-        # Create accumulator and install hooks
-        # Always use compound steering hooks — when no steering is active,
-        # _steering_bias is None and the if-branch is skipped (negligible overhead)
-        accumulator = OnlineAccumulator(num_layers=len(moe_indices), num_experts=n_experts)
-        moe_blocks = [adapter.get_moe_block(i) for i in moe_indices]
-        install_counting_hooks(
-            moe_blocks, model_type, accumulator, mode=mode, steering=True,
-        )
-        logging.info(f"Installed {mode}+steering counting hooks on {len(moe_blocks)} MoE blocks")
-
-        # Apply initial steering if safety map provided
-        if safety_map and steering_mode:
-            from .steering import SteeringConfig
-            steer_config = SteeringConfig.from_safety_report(safety_map, steering_mode)
-            _update_steering_bias(moe_blocks, steer_config, n_experts)
-            logging.info(f"Steering enabled: mode={steering_mode}, safety_map={safety_map}")
-
-        # Apply initial domain steering if domain map provided
-        if domain_map and domain_steering_mode:
-            from .steering import SteeringConfig
-            domain_config = SteeringConfig.from_domain_report(domain_map, domain_steering_mode)
-            _update_steering_bias(moe_blocks, domain_config, n_experts)
-            logging.info(f"Domain steering enabled: mode={domain_steering_mode}, domain_map={domain_map}")
-    else:
-        logging.info(f"Model type: {model_type} — plain inference (no MoE hooks)")
-
-    # Apply KV cache size limit if specified (standalone, without TurboQuant)
-    if max_kv_size is not None and not kv_compress:
-        from mlx_lm.models.cache import RotatingKVCache
-
-        _num_model_layers = len(model.layers)
-
-        def _make_cache():
-            return [
-                RotatingKVCache(max_size=max_kv_size, keep=4)
-                for _ in range(_num_model_layers)
-            ]
-
-        model.make_cache = _make_cache
-        logging.info(
-            f"KV cache limited to {max_kv_size} tokens per layer (RotatingKVCache)"
-        )
-
-    # Apply KV cache compression if specified
-    sdpa_patched = False
-    if kv_compress == "turbo":
-        from .kv_compress import TurboQuantConfig, TurboQuantKVCache, setup_turbo_quant
-
-        _tq_cfg = TurboQuantConfig(
-            bits=kv_compress_bits,
-            max_size=max_kv_size,  # None if not set — unbounded
-        )
-        _tq_caches_template, sdpa_patched = setup_turbo_quant(model, model_type, _tq_cfg)
-        _tq_effective_cfg = _tq_caches_template[0].config if _tq_caches_template else _tq_cfg
-        _num_model_layers = len(model.layers)
-
-        def _make_cache():
-            return [
-                TurboQuantKVCache(config=_tq_effective_cfg)
-                for _ in range(_num_model_layers)
-            ]
-
-        model.make_cache = _make_cache
-        mode_str = "quantized SDPA" if sdpa_patched else "plain SDPA"
-        window_str = f", window={max_kv_size}" if max_kv_size else ""
-        logging.info(
-            f"TurboQuant KV compression enabled ({kv_compress_bits}-bit PolarQuant, {mode_str}{window_str})"
-        )
-    elif kv_compress == "rotor":
-        from .rotor_quant import RotorQuantConfig, RotorQuantKVCache
-
-        _rq_cfg = RotorQuantConfig(
-            bits=kv_compress_bits,
-            max_size=max_kv_size,
-        )
-        _num_model_layers = len(model.layers)
-
-        def _make_cache():
-            return [
-                RotorQuantKVCache(config=_rq_cfg)
-                for _ in range(_num_model_layers)
-            ]
-
-        model.make_cache = _make_cache
-        window_str = f", window={max_kv_size}" if max_kv_size else ""
-        logging.info(
-            f"RotorQuant KV compression enabled ({kv_compress_bits}-bit Clifford rotors, plain SDPA{window_str})"
-        )
-
-    # Resolve chat template: explicit path/string > auto-detect from model_type
-    chat_template_content = _resolve_chat_template(chat_template, model_type)
-
-    # Build cli_args namespace for mlx-lm server
-    cli_kwargs = dict(
-        model=model_path,
+    # Create model manager
+    model_manager = ModelManager(
+        mode=mode,
         max_tokens=max_tokens,
-    )
-    if chat_template_content:
-        cli_kwargs["chat_template"] = chat_template_content
-    cli_args = _make_cli_args(**cli_kwargs)
-
-    # Create model provider and response generator
-    provider = ReapModelProvider(model, tokenizer, cli_args)
-    prompt_cache = LRUPromptCache()
-    response_generator = ResponseGenerator(provider, prompt_cache)
-
-    # Create handler class with accumulator and steering access
-    kv_compress_info = None
-    if kv_compress == "turbo":
-        kv_compress_info = {
-            "enabled": True,
-            "bits": kv_compress_bits,
-            "method": "TurboQuant/PolarQuant",
-            "quantized_sdpa": sdpa_patched,
-            "max_size": max_kv_size,
-        }
-    elif kv_compress == "rotor":
-        kv_compress_info = {
-            "enabled": True,
-            "bits": kv_compress_bits,
-            "method": "RotorQuant/Clifford",
-            "quantized_sdpa": False,
-            "max_size": max_kv_size,
-        }
-    handler_class = ReapAPIHandler.create_handler_class(
-        accumulator, moe_blocks=moe_blocks, num_experts=n_experts,
-        kv_compress_info=kv_compress_info,
+        chat_template=chat_template,
+        idle_timeout=idle_timeout,
         max_kv_size=max_kv_size,
+        kv_compress=kv_compress,
+        kv_compress_bits=kv_compress_bits,
     )
+
+    # Apply initial steering if configured
+    if safety_map and steering_mode:
+        from .steering import SteeringConfig
+        model_manager.steering_config = SteeringConfig.from_safety_report(
+            safety_map, steering_mode,
+        )
+        logging.info(f"Steering configured: mode={steering_mode}")
+
+    if domain_map and domain_steering_mode:
+        from .steering import SteeringConfig
+        model_manager.steering_config = SteeringConfig.from_domain_report(
+            domain_map, domain_steering_mode,
+        )
+        logging.info(f"Domain steering configured: mode={domain_steering_mode}")
+
+    # Eagerly load default model if specified
+    if model_path:
+        model_manager.ensure_loaded(model_path)
+
+    # Create handler class
+    handler_class = ReapAPIHandler.create_handler_class(model_manager)
+
+    # Placeholder ResponseGenerator for _run_http_server's handler factory.
+    # The real ResponseGenerator is set per-request via _ensure_model().
+    placeholder_args = _make_cli_args(max_tokens=max_tokens)
+    placeholder_provider = ReapModelProvider.__new__(ReapModelProvider)
+    placeholder_provider.cli_args = placeholder_args
+    placeholder_provider.model = None
+    placeholder_provider.tokenizer = None
+    placeholder_provider.draft_model = None
+    placeholder_provider.model_key = ("placeholder", None, None)
+    placeholder_provider.pipeline_group = None
+    placeholder_provider.tensor_group = None
+    placeholder_provider.is_distributed = False
+    placeholder_provider.is_batchable = False
+    placeholder_rg = ResponseGenerator(placeholder_provider, LRUPromptCache())
 
     # Auto-save on shutdown
     def _shutdown_save(signum, frame):
-        if auto_save and accumulator is not None:
+        acc = model_manager.accumulator
+        if auto_save and acc is not None:
             logging.info(f"Saving accumulator to {auto_save}")
-            accumulator.save(auto_save)
+            acc.save(auto_save)
         raise KeyboardInterrupt
 
     if auto_save:
         signal.signal(signal.SIGTERM, _shutdown_save)
 
     # Start server
-    server_label = "REAP server" if accumulator else "server (plain inference)"
-    logging.info(f"Starting {server_label} at {host}:{port}")
+    if model_path:
+        logging.info(f"Server ready at {host}:{port} (model: {model_path})")
+    else:
+        logging.info(f"Server ready at {host}:{port} (no model loaded — will load on first request)")
+    timeout_str = f"{idle_timeout:.0f}s" if idle_timeout > 0 else "disabled"
+    logging.info(f"Auto-unload after inactivity: {timeout_str}")
     logging.info(
-        "API endpoints: POST /v1/chat/completions (OpenAI), /v1/messages (Anthropic)"
+        "API: POST /v1/chat/completions (OpenAI), /v1/messages (Anthropic)"
     )
-    if accumulator:
-        logging.info(
-            "REAP endpoints: GET /v1/reap/stats, /v1/reap/info, /v1/reap/steer | "
-            "POST /v1/reap/save, /v1/reap/reset, /v1/reap/steer | "
-            "DELETE /v1/reap/steer"
-        )
+    logging.info(
+        "REAP: GET /v1/reap/stats, /v1/reap/info, /v1/reap/steer | "
+        "POST /v1/reap/save, /v1/reap/reset, /v1/reap/steer | "
+        "DELETE /v1/reap/steer"
+    )
     try:
-        _run_http_server(host, port, response_generator, handler_class=handler_class)
+        _run_http_server(host, port, placeholder_rg, handler_class=handler_class)
     except KeyboardInterrupt:
         pass
     finally:
-        if auto_save and accumulator is not None:
+        acc = model_manager.accumulator
+        if auto_save and acc is not None:
             logging.info(f"Auto-saving accumulator to {auto_save}")
-            accumulator.save(auto_save)
-        response_generator.stop_and_join()
-        if moe_blocks:
-            remove_counting_hooks(moe_blocks)
+            acc.save(auto_save)
+        model_manager.shutdown()
+        placeholder_rg.stop_and_join()
         logging.info("Server stopped.")

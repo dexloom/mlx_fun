@@ -579,7 +579,8 @@ def smoke_test(model, prompt, max_tokens, kv_compress, kv_compress_bits):
 
 
 @main.command()
-@click.option("--model", required=True, help="Model path or HuggingFace repo ID.")
+@click.option("--model", required=False, default=None,
+              help="Model path or HuggingFace repo ID. If omitted, loads on first request.")
 @click.option("--host", default="127.0.0.1", help="Server bind address.")
 @click.option("--port", default=8080, type=int, help="Server port.")
 @click.option("--mode", default="lightweight", type=click.Choice(["lightweight", "full"]),
@@ -600,18 +601,27 @@ def smoke_test(model, prompt, max_tokens, kv_compress, kv_compress_bits):
               help="KV cache compression method: 'turbo' (TurboQuant/PolarQuant) or 'rotor' (RotorQuant/Clifford).")
 @click.option("--kv-compress-bits", default=4, type=int,
               help="Bits per channel for KV compression (2-8). Default: 4 (turbo), 3 (rotor).")
+@click.option("--idle-timeout", default=1800, type=int,
+              help="Auto-unload model after N seconds of inactivity. 0 to disable. Default: 1800 (30 min).")
 def serve(model, host, port, mode, auto_save, max_tokens, max_kv_size,
           chat_template, safety_map, steering_mode, domain_map,
-          domain_steering_mode, kv_compress, kv_compress_bits):
-    """Serve model with online expert counting and optional steering.
+          domain_steering_mode, kv_compress, kv_compress_bits, idle_timeout):
+    """Serve model with on-demand loading and online expert counting.
 
-    Starts an OpenAI-compatible server that counts expert activations from
-    real traffic. Use /v1/reap/stats to view stats, /v1/reap/save to export.
+    Starts an OpenAI and Anthropic compatible server. Models are loaded on
+    demand when the first request arrives. After --idle-timeout seconds of
+    inactivity, the model is unloaded to free memory.
 
-    With --safety-map, enables SteerMoE-style expert steering. Steering can
-    also be configured at runtime via POST /v1/reap/steer.
+    \b
+    Examples:
+      # Start empty, load model on first request
+      mlx-fun serve --port 8080
 
-    With --domain-map, enables domain expert boosting via steering hooks.
+      # Start with a specific model pre-loaded
+      mlx-fun serve --model /path/to/model --port 8080
+
+      # Disable auto-unload
+      mlx-fun serve --model /path/to/model --idle-timeout 0
     """
     from .server import run_reap_server
 
@@ -630,6 +640,7 @@ def serve(model, host, port, mode, auto_save, max_tokens, max_kv_size,
         domain_steering_mode=domain_steering_mode,
         kv_compress=kv_compress,
         kv_compress_bits=kv_compress_bits,
+        idle_timeout=float(idle_timeout),
     )
 
 

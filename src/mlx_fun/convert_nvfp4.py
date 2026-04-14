@@ -282,11 +282,14 @@ def convert_nvfp4(
         with open(hf_quant_path) as f:
             hf_quant_config = json.load(f)
 
-    # Parse per-layer quantization info from both configs
+    # Parse per-layer quantization info from both configs.
+    # config.json has the actual training config (config_groups with explicit
+    # num_bits), hf_quant_config.json is a derived summary that may mislabel
+    # layers (e.g. marking FP8 shared experts as NVFP4). config.json wins.
     layer_algo_1, layer_params_1 = _parse_quant_config(config)
     layer_algo_2, layer_params_2 = _parse_quant_config(hf_quant_config)
-    layer_algo = {**layer_algo_1, **layer_algo_2}
-    layer_params = {**layer_params_1, **layer_params_2}
+    layer_algo = {**layer_algo_2, **layer_algo_1}   # config.json takes priority
+    layer_params = {**layer_params_2, **layer_params_1}
 
     n_experts = config.get("n_routed_experts", 0)
     n_layers = config["num_hidden_layers"]
@@ -317,68 +320,172 @@ def convert_nvfp4(
         shard_path = str(src_path / shard_name)
         logger.info("Processing shard: %s", shard_name)
 
-        with safe_open(shard_path, framework="numpy") as f:
-            for tensor_name in f.keys():
-                tensor_np = f.get_tensor(tensor_name)
-                algo = _find_layer_algo(tensor_name, layer_algo)
+        # Load shard via mx.load — handles all dtypes (bfloat16, float8, uint8)
+        # that numpy/safetensors-numpy cannot represent.
+        shard_mx = mx.load(shard_path)
 
-                # Skip auxiliary quantization tensors (handled inline)
-                if tensor_name.endswith(".input_scale"):
-                    stats["skipped"] += 1
-                    continue
+        # Also open via safetensors for numpy access (NVFP4/FP8 repacking
+        # uses numpy views).  Tensor names that fail (bfloat16, float8)
+        # fall back to the mx.load dict above.
+        try:
+            np_handle = safe_open(shard_path, framework="numpy")
+        except Exception:
+            np_handle = None
 
-                if tensor_name.endswith(".weight_scale_2"):
-                    stats["skipped"] += 1
-                    continue
+        def _get_np(name: str) -> np.ndarray:
+            """Get tensor as numpy, falling back to mx->numpy for exotic dtypes."""
+            if np_handle is not None:
+                try:
+                    return np_handle.get_tensor(name)
+                except (TypeError, AttributeError):
+                    pass
+            # bfloat16 / float8_e4m3 / float8_e5m2 — numpy has no such dtype
+            t = shard_mx[name]
+            try:
+                return np.array(t)
+            except (TypeError, ValueError):
+                # Cast exotic dtypes (bfloat16, float8) to float32
+                return np.array(t.astype(mx.float32))
 
-                if tensor_name.endswith(".weight_scale"):
-                    # Will be consumed when processing the .weight tensor
-                    stats["skipped"] += 1
-                    continue
+        for tensor_name in shard_mx.keys():
+            algo = _find_layer_algo(tensor_name, layer_algo)
 
-                if algo == "NVFP4" and tensor_name.endswith(".weight"):
-                    # Load companion tensors from this shard
-                    scale_name = tensor_name.replace(".weight", ".weight_scale")
-                    scale2_name = tensor_name.replace(".weight", ".weight_scale_2")
+            # Skip auxiliary quantization tensors (handled inline)
+            if tensor_name.endswith(".input_scale"):
+                stats["skipped"] += 1
+                continue
 
-                    scales_np = f.get_tensor(scale_name)
-                    global_scale = float(f.get_tensor(scale2_name))
+            # Skip FP8 KV cache quantization scales (NVIDIA training artifact,
+            # not used by MLX inference)
+            if tensor_name.endswith((".k_scale", ".v_scale")):
+                stats["skipped"] += 1
+                continue
 
-                    if output_mode == "nvfp4":
-                        # Repack: uint8 [M, N/2] -> uint32 [M, N/8]
-                        wq = _repack_nvfp4_weight(tensor_np)
-                        # Fold global scale into per-group e4m3 scales
-                        scales_folded = _fold_global_scale(scales_np, global_scale)
+            if tensor_name.endswith(".weight_scale_2"):
+                stats["skipped"] += 1
+                continue
 
-                        # Store as quantized weight + scales
-                        # MLX QuantizedLinear expects: weight (uint32), scales (uint8)
-                        w_key = tensor_name  # .weight
-                        s_key = tensor_name.replace(".weight", ".scales")
-                        all_weights[w_key] = mx.array(wq)
-                        all_weights[s_key] = mx.array(scales_folded)
-                    else:  # dequant mode
-                        # Full dequant: fp4 * e4m3_scale * global_scale -> bf16
-                        wq = mx.array(_repack_nvfp4_weight(tensor_np))
-                        scales = mx.array(scales_np)
-                        w_deq = mx.dequantize(wq, scales, mode="nvfp4")
-                        w_deq = w_deq.astype(mx.float32) * global_scale
-                        all_weights[tensor_name] = w_deq.astype(mx.bfloat16)
+            if tensor_name.endswith(".weight_scale"):
+                # Will be consumed when processing the .weight tensor
+                stats["skipped"] += 1
+                continue
 
-                    stats["nvfp4_repacked"] += 1
+            # Validate / auto-detect quantization algo.
+            # hf_quant_config.json may mislabel some FP8 layers as NVFP4.
+            # Distinguish by checking for weight_scale_2 (NVFP4 has it, pure
+            # FP8 doesn't) and by verifying the weight is half-packed
+            # (NVFP4: last_dim = N/2) vs full-size (FP8: last_dim = N).
+            if tensor_name.endswith(".weight"):
+                t = shard_mx[tensor_name]
+                is_uint8 = (t.dtype == mx.uint8)
+                scale_name = tensor_name.replace(".weight", ".weight_scale")
+                scale2_name = tensor_name.replace(".weight", ".weight_scale_2")
+                has_scale = scale_name in shard_mx
+                has_scale2 = scale2_name in shard_mx
 
-                elif algo == "FP8" and tensor_name.endswith(".weight"):
-                    # FP8 e4m3: dequantize to bf16
-                    scale_name = tensor_name.replace(".weight", ".weight_scale")
-                    fp8_scale = float(f.get_tensor(scale_name))
+                if is_uint8 and has_scale:
+                    if has_scale2:
+                        # Both weight_scale and weight_scale_2 present.
+                        # NVFP4: weight is half-packed (last_dim = N/2),
+                        #        scale has (M, N/16) with N = last_dim * 2.
+                        # FP8 with global scale: weight is full-size (last_dim = N),
+                        #        scale is scalar or per-tensor.
+                        s = shard_mx[scale_name]
+                        if s.ndim >= 2 and t.ndim >= 2:
+                            # Per-group scales: check if NVFP4 or FP8 by group ratio.
+                            # NVFP4 group_size=16: s_last = (w_last * 2) / 16 = w_last / 8
+                            # FP8   group_size=8:  s_last = w_last / 8
+                            # Same ratio! Use first dimension instead:
+                            # For a (M, N) weight, NVFP4 stores (M, N/2) and FP8 stores (M, N).
+                            # Scale first dim always matches weight first dim.
+                            # If w_last * 2 > w_first → likely FP4-packed (in < out), else FP8.
+                            # Actually simplest: NVFP4 always has weight_scale_2 as scalar.
+                            # If scale is per-group AND scale2 is scalar, could be either.
+                            # Just trust the quant config for NVFP4, or auto-detect.
+                            algo = algo or "NVFP4"  # trust config if set, else default NVFP4
+                        elif s.ndim == 0:
+                            # Scalar scale + scalar scale2 → FP8 with per-tensor scales
+                            algo = "FP8"
+                        else:
+                            algo = algo or "NVFP4"
+                    else:
+                        # Only weight_scale, no weight_scale_2 → pure FP8
+                        algo = "FP8"
+                elif algo is None and not is_uint8:
+                    pass  # will hit passthrough
+
+            if algo == "NVFP4" and tensor_name.endswith(".weight"):
+                # Load companion tensors from this shard
+                scale_name = tensor_name.replace(".weight", ".weight_scale")
+                scale2_name = tensor_name.replace(".weight", ".weight_scale_2")
+
+                scales_np = _get_np(scale_name)
+                global_scale = float(np.array(shard_mx[scale2_name]).item())
+
+                tensor_np = _get_np(tensor_name)
+
+                if output_mode == "nvfp4":
+                    # Repack: uint8 [M, N/2] -> uint32 [M, N/8]
+                    wq = _repack_nvfp4_weight(tensor_np)
+                    # Fold global scale into per-group e4m3 scales
+                    scales_folded = _fold_global_scale(scales_np, global_scale)
+
+                    # Store as quantized weight + scales
+                    # MLX QuantizedLinear expects: weight (uint32), scales (uint8)
+                    w_key = tensor_name  # .weight
+                    s_key = tensor_name.replace(".weight", ".scales")
+                    all_weights[w_key] = mx.array(wq)
+                    all_weights[s_key] = mx.array(scales_folded)
+                else:  # dequant mode
+                    # Full dequant: fp4 * e4m3_scale * global_scale -> bf16
+                    wq = mx.array(_repack_nvfp4_weight(tensor_np))
+                    scales = mx.array(scales_np)
+                    w_deq = mx.dequantize(wq, scales, mode="nvfp4")
+                    w_deq = w_deq.astype(mx.float32) * global_scale
+                    all_weights[tensor_name] = w_deq.astype(mx.bfloat16)
+
+                stats["nvfp4_repacked"] += 1
+
+            elif algo == "FP8" and tensor_name.endswith(".weight"):
+                # FP8 e4m3: dequantize to bf16
+                scale_name = tensor_name.replace(".weight", ".weight_scale")
+                scale2_name = tensor_name.replace(".weight", ".weight_scale_2")
+                scale_t = shard_mx[scale_name]
+
+                if scale_t.ndim == 0:
+                    # Simple FP8: scalar per-tensor scale
+                    fp8_scale = float(np.array(scale_t).item())
+                    tensor_np = _get_np(tensor_name)
                     w_bf16 = _dequant_fp8(tensor_np, fp8_scale)
-                    mx.eval(w_bf16)
-                    all_weights[tensor_name] = w_bf16
-                    stats["fp8_dequantized"] += 1
-
                 else:
-                    # BF16 / F32 passthrough (embeddings, norms, gates, etc.)
-                    all_weights[tensor_name] = mx.array(tensor_np)
-                    stats["passthrough"] += 1
+                    # FP8 with per-group e4m3 scales + optional global scale
+                    # (mislabeled NVFP4 in hf_quant_config — actually FP8 e4m3)
+                    # Dequant: fp8_val * e4m3_group_scale * global_scale
+                    w_mx = shard_mx[tensor_name]
+                    w_float = mx.from_fp8(w_mx, dtype=mx.float32)
+                    scales_float = mx.from_fp8(scale_t, dtype=mx.float32)
+                    # Broadcast scales: weight (M, N), scales (M, N/group_size)
+                    group_size = w_mx.shape[-1] // scale_t.shape[-1]
+                    # Repeat scales to match weight columns
+                    scales_expanded = mx.repeat(scales_float, group_size, axis=-1)
+                    # Trim if weight dim isn't exact multiple of group_size
+                    scales_expanded = scales_expanded[..., :w_mx.shape[-1]]
+                    w_float = w_float * scales_expanded
+                    if scale2_name in shard_mx:
+                        global_scale = float(np.array(shard_mx[scale2_name]).item())
+                        w_float = w_float * global_scale
+                    w_bf16 = w_float.astype(mx.bfloat16)
+
+                mx.eval(w_bf16)
+                all_weights[tensor_name] = w_bf16
+                stats["fp8_dequantized"] += 1
+
+            else:
+                # BF16 / F32 passthrough (embeddings, norms, gates, etc.)
+                all_weights[tensor_name] = shard_mx[tensor_name]
+                stats["passthrough"] += 1
+
+        del shard_mx, np_handle
 
         # Eval periodically to free memory
         mx.eval(*[v for v in all_weights.values() if not isinstance(v, mx.array)])

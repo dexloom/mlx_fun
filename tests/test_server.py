@@ -11,6 +11,7 @@ import pytest
 
 from mlx_fun.server import (
     OnlineAccumulator,
+    ModelManager,
     install_counting_hooks,
     remove_counting_hooks,
     ReapAPIHandler,
@@ -517,16 +518,33 @@ class TestMultipleForwardPasses:
 class TestReapEndpoints:
     """Test the ReapAPIHandler endpoint logic using mock request/response."""
 
+    def _make_manager_with_accumulator(self, accumulator):
+        """Create a ModelManager with a pre-set accumulator for testing."""
+        mm = ModelManager.__new__(ModelManager)
+        mm._lock = threading.RLock()
+        mm._accumulator = accumulator
+        mm._moe_blocks = []
+        mm._n_experts = accumulator.num_experts
+        mm._model_path = "/test/model"
+        mm._model = True  # truthy sentinel
+        mm._kv_compress_info = None
+        mm._max_kv_size = None
+        mm._steering_config = None
+        mm._idle_timeout = 0
+        mm._unload_timer = None
+        mm._loading = False
+        mm._load_condition = threading.Condition(mm._lock)
+        return mm
+
     def _make_handler(self, accumulator, method, path, body=None):
         """Create a handler instance and simulate a request."""
-        from http.server import HTTPServer
         from unittest.mock import MagicMock
 
-        handler_class = ReapAPIHandler.create_handler_class(accumulator)
+        mm = self._make_manager_with_accumulator(accumulator)
+        handler_class = ReapAPIHandler.create_handler_class(mm)
 
         # Create a mock request
         handler = object.__new__(handler_class)
-        handler._reap_accumulator = accumulator
         handler.path = path
         handler.headers = {}
         handler.wfile = io.BytesIO()
@@ -567,6 +585,7 @@ class TestReapEndpoints:
         handler._handle_reap_info()
 
         response = json.loads(handler.wfile.getvalue().decode())
+        assert response["model_loaded"] is True
         assert response["num_layers"] == 2
         assert response["num_experts"] == 8
         assert response["request_count"] == 1

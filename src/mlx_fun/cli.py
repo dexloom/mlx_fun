@@ -581,7 +581,9 @@ def smoke_test(model, prompt, max_tokens, kv_compress, kv_compress_bits):
 @main.command()
 @click.option("--model", required=False, default=None,
               help="Model path or HuggingFace repo ID. If omitted, loads on first request.")
-@click.option("--host", default="127.0.0.1", help="Server bind address.")
+@click.option("--host", default="0.0.0.0",
+              help="Server bind address. Default 0.0.0.0 binds all interfaces "
+                   "(localhost, LAN, UTM guests). Use 127.0.0.1 for loopback only.")
 @click.option("--port", default=8080, type=int, help="Server port.")
 @click.option("--mode", default="lightweight", type=click.Choice(["lightweight", "full"]),
               help="Hook mode: 'lightweight' skips activation norms, 'full' computes all metrics.")

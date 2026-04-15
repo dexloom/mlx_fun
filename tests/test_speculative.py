@@ -64,7 +64,8 @@ class TestReapModelProviderDraft:
             mx.eval(draft.parameters())
         draft_tok = _FakeTokenizer() if draft_model else None
 
-        with patch("mlx_lm.load") as mock_load:
+        with patch("mlx_lm.load") as mock_load, \
+             patch("mlx_fun.server._resolve_model_path", side_effect=lambda p: p):
             mock_load.return_value = (draft, draft_tok)
             provider = ReapModelProvider(model, tokenizer, cli_args)
 
@@ -112,7 +113,8 @@ class TestReapModelProviderDraft:
         mx.eval(new_draft.parameters())
         new_tok = _FakeTokenizer()
 
-        with patch("mlx_lm.load") as mock_load:
+        with patch("mlx_lm.load") as mock_load, \
+             patch("mlx_fun.server._resolve_model_path", side_effect=lambda p: p):
             mock_load.return_value = (new_draft, new_tok)
             provider.load(draft_model_path="/tmp/other_draft")
 
@@ -132,7 +134,8 @@ class TestReapModelProviderDraft:
 
         import logging as _logging
         with patch("mlx_lm.load") as mock_load, \
-             patch.object(_logging, "warning") as mock_warn:
+             patch.object(_logging, "warning") as mock_warn, \
+             patch("mlx_fun.server._resolve_model_path", side_effect=lambda p: p):
             mock_load.return_value = (draft, draft_tok)
             provider = ReapModelProvider(model, tokenizer, cli_args)
 

@@ -14,6 +14,7 @@ import gc
 import io
 import json
 import logging
+import os
 import re
 import signal
 import threading
@@ -638,15 +639,16 @@ _LMSTUDIO_ROOT = Path.home() / ".lmstudio" / "models"
 
 
 def _resolve_model_path(model_id: str) -> str:
-    """Resolve a model identifier to a filesystem path.
+    """Resolve a model identifier to a locally available filesystem path.
 
-    Resolution order:
+    The server never downloads models. Resolution order:
       1. Absolute path that exists → use it.
       2. Exact relative path under ~/.lmstudio/models/ → use it.
       3. Partial name match (directory name ends with model_id) → use it.
-      4. Pass through as-is (HuggingFace repo ID for mlx_lm.load).
+      4. HuggingFace cache snapshot for a repo ID → use it.
 
-    Raises ValueError on ambiguous partial match.
+    Raises ValueError if the model cannot be found locally, or on ambiguous
+    partial match.
     """
     # 1. Absolute path
     p = Path(model_id)
@@ -676,8 +678,28 @@ def _resolve_model_path(model_id: str) -> str:
                 + ", ".join(matches[:5])
             )
 
-    # 4. Pass through (HF repo ID or local relative path)
-    return model_id
+    # 4. HuggingFace cache lookup (local_files_only — no download).
+    # Only attempt for strings that look like repo IDs ("org/name").
+    if "/" in model_id and not model_id.startswith("/"):
+        try:
+            from huggingface_hub import snapshot_download
+            from huggingface_hub.errors import LocalEntryNotFoundError
+
+            try:
+                cached = snapshot_download(model_id, local_files_only=True)
+                if (Path(cached) / "config.json").exists():
+                    return cached
+            except LocalEntryNotFoundError:
+                pass
+        except ImportError:
+            pass
+
+    raise ValueError(
+        f"Model '{model_id}' is not available locally. "
+        f"The server is configured to never download models. "
+        f"Place the model under {_LMSTUDIO_ROOT} or pre-download it into "
+        f"the HuggingFace cache (~/.cache/huggingface/hub)."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1220,8 +1242,9 @@ class ReapModelProvider:
         """Load and validate a draft model for speculative decoding."""
         from mlx_lm import load as mlx_load
 
-        logging.info(f"Loading draft model: {draft_model_path}")
-        draft_model, draft_tokenizer = mlx_load(draft_model_path)
+        resolved = _resolve_model_path(draft_model_path)
+        logging.info(f"Loading draft model: {resolved}")
+        draft_model, draft_tokenizer = mlx_load(resolved)
 
         if draft_tokenizer.vocab_size != self.tokenizer.vocab_size:
             logging.warning(
@@ -2134,6 +2157,10 @@ def run_reap_server(
         ResponseGenerator,
         _run_http_server,
     )
+
+    # Force HuggingFace offline mode — the server never downloads models.
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]

@@ -620,11 +620,37 @@ def smoke_test(model, prompt, max_tokens, kv_compress, kv_compress_bits):
               help="Number of transformer layers in the DFlash draft model. Default: 5.")
 @click.option("--dflash-num-heads", default=8, type=int,
               help="Number of attention heads in the DFlash draft model. Default: 8.")
+@click.option("--log-level",
+              type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
+              default="INFO",
+              help="Log verbosity. DEBUG includes per-request hook + tool-call traces.")
+@click.option("--default-temperature", default=None, type=float,
+              help="Server-wide default temperature applied when the request omits it.")
+@click.option("--default-top-p", default=None, type=float,
+              help="Server-wide default top_p applied when the request omits it.")
+@click.option("--default-top-k", default=None, type=int,
+              help="Server-wide default top_k applied when the request omits it. "
+                   "GLM-5.1 Q3 works well at 100.")
+@click.option("--default-min-p", default=None, type=float,
+              help="Server-wide default min_p applied when the request omits it.")
+@click.option("--default-repetition-penalty", default=None, type=float,
+              help="Server-wide default repetition_penalty applied when the request omits it. "
+                   "GLM-5.1 Q3 works well at 1.1.")
+@click.option("--default-repetition-context-size", default=None, type=int,
+              help="Token window for the repetition penalty (default upstream: 20).")
+@click.option("--enable-counting", is_flag=True, default=False,
+              help="Install MoE expert-counting hooks so /v1/reap/save and "
+                   "/v1/reap/stats return routing data. Off by default — "
+                   "plain inference is the common case and the hooks add a "
+                   "small per-token overhead.")
 def serve(model, host, port, mode, auto_save, max_tokens, max_kv_size,
           chat_template, safety_map, steering_mode, domain_map,
           domain_steering_mode, kv_compress, kv_compress_bits, idle_timeout,
           draft_model, num_draft_tokens, capture_layers,
-          dflash_block_size, dflash_num_layers, dflash_num_heads):
+          dflash_block_size, dflash_num_layers, dflash_num_heads, log_level,
+          default_temperature, default_top_p, default_top_k, default_min_p,
+          default_repetition_penalty, default_repetition_context_size,
+          enable_counting):
     """Serve model with on-demand loading and online expert counting.
 
     Starts an OpenAI and Anthropic compatible server. Models are loaded on
@@ -672,6 +698,14 @@ def serve(model, host, port, mode, auto_save, max_tokens, max_kv_size,
         dflash_block_size=parsed_dflash_block_size,
         dflash_num_layers=dflash_num_layers,
         dflash_num_heads=dflash_num_heads,
+        log_level=log_level,
+        default_temperature=default_temperature,
+        default_top_p=default_top_p,
+        default_top_k=default_top_k,
+        default_min_p=default_min_p,
+        default_repetition_penalty=default_repetition_penalty,
+        default_repetition_context_size=default_repetition_context_size,
+        enable_counting=enable_counting,
     )
 
 

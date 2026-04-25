@@ -22,7 +22,7 @@ import time
 import uuid
 import warnings
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -37,7 +37,25 @@ from .saliency import SaliencyAccumulator
 # ---------------------------------------------------------------------------
 
 class OnlineAccumulator:
-    """Thread-safe wrapper around SaliencyAccumulator."""
+    """Thread-safe wrapper around SaliencyAccumulator.
+
+    Routing data is collected via ``queue_lazy`` which stores **lazy MLX
+    array refs only** — no ``mx.eval`` and no numpy conversion happens
+    inline with the model forward pass. This is critical for inference
+    quality: forcing eager evaluation per-layer per-token fragments
+    MLX's lazy compute graph and changes intermediate-precision rounding
+    enough to push the model into a different greedy trajectory (e.g.
+    GLM-5.1 fails to emit clean ``<tool_call>`` blocks).
+
+    Pending entries drain into the underlying numpy accumulator either
+    automatically (``_auto_flush_size`` cap) or on demand via
+    ``flush()`` — called by ``save``, ``get_stats`` and ``reset``.
+    """
+
+    # Auto-flush threshold tuned for typical 60–80 MoE-layer models:
+    # ~4 tokens' worth of routing data, bounded so the lazy graph
+    # never grows unbounded across long generations.
+    _AUTO_FLUSH_SIZE = 256
 
     def __init__(self, num_layers: int, num_experts: int):
         self._lock = threading.Lock()
@@ -46,6 +64,58 @@ class OnlineAccumulator:
         self._token_count = 0
         self.num_layers = num_layers
         self.num_experts = num_experts
+        # Pending lazy entries: list of (layer_idx, inds_mx, scores_mx, norms_mx_or_None)
+        self._pending: List[Tuple[int, mx.array, mx.array, Optional[mx.array]]] = []
+
+    def queue_lazy(
+        self,
+        layer_idx: int,
+        expert_indices: mx.array,
+        router_weights: mx.array,
+        activation_norms: Optional[mx.array] = None,
+    ):
+        """Queue routing data lazily — no MLX eval forced here.
+
+        Holds references to the lazy ``mx.array`` nodes; they are
+        materialized in batch by ``flush()``.
+        """
+        with self._lock:
+            self._pending.append(
+                (layer_idx, expert_indices, router_weights, activation_norms)
+            )
+            if len(self._pending) >= self._AUTO_FLUSH_SIZE:
+                self._flush_locked()
+
+    def _flush_locked(self):
+        """Materialize and consume pending lazy entries. Caller holds the lock."""
+        if not self._pending:
+            return
+        # Single mx.eval over every queued tensor: MLX picks an efficient
+        # batched evaluation pass instead of the per-block eager flush
+        # that was breaking inference quality.
+        arrays: List[mx.array] = []
+        for _, inds, scores, norms in self._pending:
+            arrays.append(inds)
+            arrays.append(scores)
+            if norms is not None:
+                arrays.append(norms)
+        mx.eval(*arrays)
+
+        for layer_idx, inds, scores, norms in self._pending:
+            np_inds = _to_numpy(inds).reshape(-1, inds.shape[-1])
+            np_scores = _to_numpy(scores).reshape(-1, scores.shape[-1])
+            np_norms = (
+                _to_numpy(norms).reshape(-1, norms.shape[-1])
+                if norms is not None
+                else np.zeros_like(np_scores)
+            )
+            self._acc.update(layer_idx, np_inds, np_scores, np_norms)
+        self._pending.clear()
+
+    def flush(self):
+        """Drain the lazy queue. Call before reading stats or saving."""
+        with self._lock:
+            self._flush_locked()
 
     def update(
         self,
@@ -54,11 +124,8 @@ class OnlineAccumulator:
         router_weights: np.ndarray,
         activation_norms: Optional[np.ndarray] = None,
     ):
-        """Accumulate statistics for one forward pass at one layer.
-
-        When activation_norms is None (lightweight mode), zeros are used for
-        reap_sum/ean_sum fields — only freq/weighted_freq are meaningful.
-        """
+        """Eager numpy update path — kept for non-server callers (e.g. CLI
+        ``collect`` / ``safety-scan`` that already work with numpy)."""
         if activation_norms is None:
             activation_norms = np.zeros_like(router_weights)
         with self._lock:
@@ -74,11 +141,12 @@ class OnlineAccumulator:
 
     def get_stats(self) -> dict:
         """Return current accumulator state as JSON-serializable dict.
-        
+
         Includes both raw accumulator arrays and computed scores for easy
         comparison with stats-diff, stats-merge, and stats-purge operations.
         """
         with self._lock:
+            self._flush_locked()
             # Compute scores for all metrics
             reap_scores = self._acc.compute_scores("reap").tolist()
             ean_scores = self._acc.compute_scores("ean").tolist()
@@ -110,6 +178,7 @@ class OnlineAccumulator:
     def save(self, path: str):
         """Save accumulator state to .npz (compatible with SaliencyAccumulator.load)."""
         with self._lock:
+            self._flush_locked()
             self._acc.save(path)
 
     def reset(self):
@@ -120,6 +189,7 @@ class OnlineAccumulator:
             self._acc = SaliencyAccumulator(n_layers, n_experts)
             self._request_count = 0
             self._token_count = 0
+            self._pending.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -141,10 +211,7 @@ def _minimax_counting_call(self, x: mx.array) -> mx.array:
     y = self.switch_mlp(x, inds)
 
     # Materialize routing decisions and accumulate
-    mx.eval(inds, scores)
-    np_inds = _to_numpy(inds).reshape(-1, inds.shape[-1])
-    np_scores = _to_numpy(scores).reshape(-1, scores.shape[-1])
-    self._reap_accumulator.update(self._reap_layer_idx, np_inds, np_scores)
+    self._reap_accumulator.queue_lazy(self._reap_layer_idx, inds, scores)
 
     y = (y * scores[..., None]).sum(axis=-2)
     return y
@@ -163,10 +230,7 @@ def _glm4_counting_call(self, x: mx.array) -> mx.array:
         x_experts = self.fc1_latent_proj(x)
     y = self.switch_mlp(x_experts, inds)
 
-    mx.eval(inds, scores)
-    np_inds = _to_numpy(inds).reshape(-1, inds.shape[-1])
-    np_scores = _to_numpy(scores).reshape(-1, scores.shape[-1])
-    self._reap_accumulator.update(self._reap_layer_idx, np_inds, np_scores)
+    self._reap_accumulator.queue_lazy(self._reap_layer_idx, inds, scores)
 
     y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
     # Latent back-projection: moe_latent_size → 4096
@@ -190,10 +254,7 @@ def _qwen3_moe_counting_call(self, x: mx.array) -> mx.array:
 
     y = self.switch_mlp(x, inds)
 
-    mx.eval(inds, scores)
-    np_inds = _to_numpy(inds).reshape(-1, inds.shape[-1])
-    np_scores = _to_numpy(scores).reshape(-1, scores.shape[-1])
-    self._reap_accumulator.update(self._reap_layer_idx, np_inds, np_scores)
+    self._reap_accumulator.queue_lazy(self._reap_layer_idx, inds, scores)
 
     y = (y * scores[..., None]).sum(axis=-2)
     return y
@@ -211,10 +272,7 @@ def _qwen3_next_counting_call(self, x: mx.array) -> mx.array:
 
     y = self.switch_mlp(x, inds)
 
-    mx.eval(inds, scores)
-    np_inds = _to_numpy(inds).reshape(-1, inds.shape[-1])
-    np_scores = _to_numpy(scores).reshape(-1, scores.shape[-1])
-    self._reap_accumulator.update(self._reap_layer_idx, np_inds, np_scores)
+    self._reap_accumulator.queue_lazy(self._reap_layer_idx, inds, scores)
 
     y = (y * scores[..., None]).sum(axis=-2)
 
@@ -244,11 +302,7 @@ def _minimax_full_counting_call(self, x: mx.array) -> mx.array:
     y = self.switch_mlp(x, inds)
     activation_norms = mx.linalg.norm(y, axis=-1)
 
-    mx.eval(inds, scores, activation_norms)
-    np_inds = _to_numpy(inds).reshape(-1, inds.shape[-1])
-    np_scores = _to_numpy(scores).reshape(-1, scores.shape[-1])
-    np_norms = _to_numpy(activation_norms).reshape(-1, activation_norms.shape[-1])
-    self._reap_accumulator.update(self._reap_layer_idx, np_inds, np_scores, np_norms)
+    self._reap_accumulator.queue_lazy(self._reap_layer_idx, inds, scores, activation_norms)
 
     y = (y * scores[..., None]).sum(axis=-2)
     return y
@@ -267,11 +321,7 @@ def _glm4_full_counting_call(self, x: mx.array) -> mx.array:
     y = self.switch_mlp(x_experts, inds)
     activation_norms = mx.linalg.norm(y, axis=-1)
 
-    mx.eval(inds, scores, activation_norms)
-    np_inds = _to_numpy(inds).reshape(-1, inds.shape[-1])
-    np_scores = _to_numpy(scores).reshape(-1, scores.shape[-1])
-    np_norms = _to_numpy(activation_norms).reshape(-1, activation_norms.shape[-1])
-    self._reap_accumulator.update(self._reap_layer_idx, np_inds, np_scores, np_norms)
+    self._reap_accumulator.queue_lazy(self._reap_layer_idx, inds, scores, activation_norms)
 
     y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
     if hasattr(self, "fc2_latent_proj"):
@@ -295,11 +345,7 @@ def _qwen3_moe_full_counting_call(self, x: mx.array) -> mx.array:
     y = self.switch_mlp(x, inds)
     activation_norms = mx.linalg.norm(y, axis=-1)
 
-    mx.eval(inds, scores, activation_norms)
-    np_inds = _to_numpy(inds).reshape(-1, inds.shape[-1])
-    np_scores = _to_numpy(scores).reshape(-1, scores.shape[-1])
-    np_norms = _to_numpy(activation_norms).reshape(-1, activation_norms.shape[-1])
-    self._reap_accumulator.update(self._reap_layer_idx, np_inds, np_scores, np_norms)
+    self._reap_accumulator.queue_lazy(self._reap_layer_idx, inds, scores, activation_norms)
 
     y = (y * scores[..., None]).sum(axis=-2)
     return y
@@ -318,11 +364,7 @@ def _qwen3_next_full_counting_call(self, x: mx.array) -> mx.array:
     y = self.switch_mlp(x, inds)
     activation_norms = mx.linalg.norm(y, axis=-1)
 
-    mx.eval(inds, scores, activation_norms)
-    np_inds = _to_numpy(inds).reshape(-1, inds.shape[-1])
-    np_scores = _to_numpy(scores).reshape(-1, scores.shape[-1])
-    np_norms = _to_numpy(activation_norms).reshape(-1, activation_norms.shape[-1])
-    self._reap_accumulator.update(self._reap_layer_idx, np_inds, np_scores, np_norms)
+    self._reap_accumulator.queue_lazy(self._reap_layer_idx, inds, scores, activation_norms)
 
     y = (y * scores[..., None]).sum(axis=-2)
 
@@ -337,10 +379,7 @@ def _gemma4_counting_call(self, h: mx.array) -> mx.array:
     h2 = self.pre_feedforward_layernorm_2(h)
     result = self.experts(h2, top_k_indices, top_k_weights)
 
-    mx.eval(top_k_indices, top_k_weights)
-    np_inds = _to_numpy(top_k_indices).reshape(-1, top_k_indices.shape[-1])
-    np_scores = _to_numpy(top_k_weights).reshape(-1, top_k_weights.shape[-1])
-    self._reap_accumulator.update(self._reap_layer_idx, np_inds, np_scores)
+    self._reap_accumulator.queue_lazy(self._reap_layer_idx, top_k_indices, top_k_weights)
 
     return result
 
@@ -376,11 +415,7 @@ def _gemma4_full_counting_call(self, h: mx.array) -> mx.array:
     expert_out = self.switch_glu(x_flat, indices_flat)
     activation_norms = mx.linalg.norm(expert_out, axis=-1)
 
-    mx.eval(inds, scores, activation_norms)
-    np_inds = _to_numpy(inds).reshape(-1, inds.shape[-1])
-    np_scores = _to_numpy(scores).reshape(-1, scores.shape[-1])
-    np_norms = _to_numpy(activation_norms).reshape(-1, activation_norms.shape[-1])
-    self._reap_accumulator.update(self._reap_layer_idx, np_inds, np_scores, np_norms)
+    self._reap_accumulator.queue_lazy(self._reap_layer_idx, inds, scores, activation_norms)
 
     weights = scores.reshape(B * S, k)[..., None]
     return (expert_out * weights).sum(axis=-2).reshape(B, S, H)
@@ -420,10 +455,7 @@ def _minimax_counting_steering_call(self, x: mx.array) -> mx.array:
 
     y = self.switch_mlp(x, inds)
 
-    mx.eval(inds, scores)
-    np_inds = _to_numpy(inds).reshape(-1, inds.shape[-1])
-    np_scores = _to_numpy(scores).reshape(-1, scores.shape[-1])
-    self._reap_accumulator.update(self._reap_layer_idx, np_inds, np_scores)
+    self._reap_accumulator.queue_lazy(self._reap_layer_idx, inds, scores)
 
     y = (y * scores[..., None]).sum(axis=-2)
     return y
@@ -435,18 +467,26 @@ def _glm4_counting_steering_call(self, x: mx.array) -> mx.array:
             "Sharded models not supported. Load without sharding."
         )
 
-    # Inline the gate forward to inject steering bias before routing
-    raw_gates = x @ self.gate.weight.T
-    if self._steering_bias is not None:
+    # When no steering bias is configured, delegate to the model's own gate
+    # forward. The upstream gate uses grouped top-k (group_expert_select)
+    # with n_group / topk_group / routed_scaling_factor — reimplementing
+    # those inline is fragile, and a flat top-k reimplementation routes
+    # tokens to the wrong experts and destroys output quality.
+    if self._steering_bias is None:
+        inds, scores = self.gate(x)
+    else:
+        # Steering path: inject bias into raw gate logits before grouped top-k.
+        # NOTE: this still reimplements the gate as flat top-k — fix when we
+        # actually wire steering up against this architecture.
+        raw_gates = x @ self.gate.weight.T
         raw_gates = raw_gates + self._steering_bias
-
-    scores = mx.sigmoid(raw_gates.astype(mx.float32))
-    orig_scores = scores
-    scores = scores + self.gate.e_score_correction_bias
-    k = self.gate.top_k
-    inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
-    scores = mx.take_along_axis(orig_scores, inds, axis=-1)
-    scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
+        scores = mx.sigmoid(raw_gates.astype(mx.float32))
+        orig_scores = scores
+        scores = scores + self.gate.e_score_correction_bias
+        k = self.gate.top_k
+        inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+        scores = mx.take_along_axis(orig_scores, inds, axis=-1)
+        scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
 
     # Latent projection (Nemotron-H): 4096 → moe_latent_size before experts
     x_experts = x
@@ -454,10 +494,7 @@ def _glm4_counting_steering_call(self, x: mx.array) -> mx.array:
         x_experts = self.fc1_latent_proj(x)
     y = self.switch_mlp(x_experts, inds)
 
-    mx.eval(inds, scores)
-    np_inds = _to_numpy(inds).reshape(-1, inds.shape[-1])
-    np_scores = _to_numpy(scores).reshape(-1, scores.shape[-1])
-    self._reap_accumulator.update(self._reap_layer_idx, np_inds, np_scores)
+    self._reap_accumulator.queue_lazy(self._reap_layer_idx, inds, scores)
 
     y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
     # Latent back-projection: moe_latent_size → 4096
@@ -483,10 +520,7 @@ def _qwen3_moe_counting_steering_call(self, x: mx.array) -> mx.array:
 
     y = self.switch_mlp(x, inds)
 
-    mx.eval(inds, scores)
-    np_inds = _to_numpy(inds).reshape(-1, inds.shape[-1])
-    np_scores = _to_numpy(scores).reshape(-1, scores.shape[-1])
-    self._reap_accumulator.update(self._reap_layer_idx, np_inds, np_scores)
+    self._reap_accumulator.queue_lazy(self._reap_layer_idx, inds, scores)
 
     y = (y * scores[..., None]).sum(axis=-2)
     return y
@@ -506,10 +540,7 @@ def _qwen3_next_counting_steering_call(self, x: mx.array) -> mx.array:
 
     y = self.switch_mlp(x, inds)
 
-    mx.eval(inds, scores)
-    np_inds = _to_numpy(inds).reshape(-1, inds.shape[-1])
-    np_scores = _to_numpy(scores).reshape(-1, scores.shape[-1])
-    self._reap_accumulator.update(self._reap_layer_idx, np_inds, np_scores)
+    self._reap_accumulator.queue_lazy(self._reap_layer_idx, inds, scores)
 
     y = (y * scores[..., None]).sum(axis=-2)
 
@@ -537,10 +568,7 @@ def _gemma4_counting_steering_call(self, h: mx.array) -> mx.array:
     h2 = self.pre_feedforward_layernorm_2(h)
     result = self.experts(h2, inds, scores)
 
-    mx.eval(inds, scores)
-    np_inds = _to_numpy(inds).reshape(-1, inds.shape[-1])
-    np_scores = _to_numpy(scores).reshape(-1, scores.shape[-1])
-    self._reap_accumulator.update(self._reap_layer_idx, np_inds, np_scores)
+    self._reap_accumulator.queue_lazy(self._reap_layer_idx, inds, scores)
 
     return result
 
@@ -724,6 +752,13 @@ class ModelManager:
         dflash_block_size: Optional[int] = None,
         dflash_num_layers: int = 5,
         dflash_num_heads: int = 8,
+        default_temperature: Optional[float] = None,
+        default_top_p: Optional[float] = None,
+        default_top_k: Optional[int] = None,
+        default_min_p: Optional[float] = None,
+        default_repetition_penalty: Optional[float] = None,
+        default_repetition_context_size: Optional[int] = None,
+        enable_counting: bool = False,
     ):
         # Config (immutable for server lifetime)
         self._mode = mode
@@ -739,6 +774,15 @@ class ModelManager:
         self._dflash_block_size = dflash_block_size
         self._dflash_num_layers = dflash_num_layers
         self._dflash_num_heads = dflash_num_heads
+        self._sampling_defaults = {
+            "temperature": default_temperature,
+            "top_p": default_top_p,
+            "top_k": default_top_k,
+            "min_p": default_min_p,
+            "repetition_penalty": default_repetition_penalty,
+            "repetition_context_size": default_repetition_context_size,
+        }
+        self._enable_counting = enable_counting
 
         # Mutable state (protected by _lock)
         self._lock = threading.RLock()
@@ -802,6 +846,18 @@ class ModelManager:
     def steering_config(self, value):
         self._steering_config = value
 
+    def apply_sampling_defaults(self, body: dict) -> None:
+        """Inject server-wide sampling defaults into a request body in-place.
+
+        Only sets keys the client did not already supply, so per-request
+        overrides still win.
+        """
+        for key, value in self._sampling_defaults.items():
+            if value is None:
+                continue
+            if key not in body:
+                body[key] = value
+
     # --- Core lifecycle ---
 
     def ensure_loaded(self, model_id: str):
@@ -844,20 +900,41 @@ class ModelManager:
         """Load model, install hooks, create ResponseGenerator."""
         from mlx_lm import load as mlx_load
         from mlx_lm.server import LRUPromptCache, ResponseGenerator
+        from mlx_lm.utils import load_config
 
         logging.info(f"Loading model: {resolved_path}")
-        model, tokenizer, config = mlx_load(resolved_path, return_config=True)
+
+        # Resolve chat template BEFORE loading the tokenizer so it overrides the
+        # bundled template AND so _infer_tool_parser sees our template (the
+        # bundled one for some GLM-5.1 quants does not contain <arg_key>, which
+        # would leave the tokenizer with no tool parser).
+        pre_config = load_config(Path(resolved_path))
+        pre_model_type = pre_config.get("model_type", "")
+        chat_template_content = _resolve_chat_template(
+            self._chat_template, pre_model_type
+        )
+
+        tokenizer_config = {}
+        if chat_template_content:
+            tokenizer_config["chat_template"] = chat_template_content
+
+        model, tokenizer, config = mlx_load(
+            resolved_path,
+            tokenizer_config=tokenizer_config or None,
+            return_config=True,
+        )
 
         model_type = config.get("model_type", "")
 
-        # Set up MoE adapter + hooks
-        adapter, moe_blocks, accumulator, n_experts = self._setup_hooks(model, config)
+        # Set up MoE adapter + hooks. Off by default — pass --enable-counting
+        # if you want /v1/reap/save and /v1/reap/stats to return routing data.
+        if self._enable_counting:
+            adapter, moe_blocks, accumulator, n_experts = self._setup_hooks(model, config)
+        else:
+            adapter, moe_blocks, accumulator, n_experts = None, [], None, 0
 
         # Apply KV compression
         kv_compress_info = self._setup_kv_compression(model, model_type)
-
-        # Resolve chat template
-        chat_template_content = _resolve_chat_template(self._chat_template, model_type)
 
         # Build cli_args and provider
         cli_kwargs = dict(
@@ -1118,7 +1195,7 @@ _MODEL_TYPE_TEMPLATES = {
     "gemma4": "gemma.jinja",
     "glm4_moe": "glm.jinja",
     "glm4_moe_lite": "glm_flash.jinja",
-    "glm_moe_dsa": "glm.jinja",
+    "glm_moe_dsa": "glm51.jinja",
     "deepseek_v32": "glm.jinja",
     "minimax": "minimax.jinja",
     "minimax_m2": "minimax_25.jinja",
@@ -1256,6 +1333,15 @@ class ReapModelProvider:
 
         self.draft_model = draft_model
         self.model_key = ("reap_preloaded", None, draft_model_path)
+
+    def load_default(self):
+        """No-op: the model is already pre-loaded in __init__.
+
+        mlx-lm's server calls this at the start of ``_generate`` to ensure the
+        default model is ready. For our pre-loaded provider there is nothing
+        to do.
+        """
+        return
 
     def load(self, model_path=None, adapter_path=None, draft_model_path=None):
         """Return the pre-loaded model — no actual loading occurs.
@@ -1413,8 +1499,14 @@ class ReapAPIHandler:
                             self._json_response(503, {"error": f"Model load failed: {e}"})
                             return
 
-                        # Re-stuff body for parent do_POST
+                        # Inject server-wide sampling defaults the client did not set
+                        model_manager.apply_sampling_defaults(body)
+                        raw = json.dumps(body).encode()
+
+                        # Re-stuff body for parent do_POST and update Content-Length
                         self.rfile = io.BytesIO(raw)
+                        del self.headers["Content-Length"]
+                        self.headers["Content-Length"] = str(len(raw))
                         super().do_POST()
                     else:
                         super().do_POST()
@@ -1827,11 +1919,17 @@ class ReapAPIHandler:
                     })
                     return
 
+                # Inject server-wide sampling defaults the client did not set
+                model_manager.apply_sampling_defaults(body)
+
                 stream = body.get("stream", False)
                 max_tokens = body.get("max_tokens", 1024)
                 temperature = body.get("temperature", self.response_generator.cli_args.temp)
                 top_p = body.get("top_p", self.response_generator.cli_args.top_p)
                 top_k = body.get("top_k", self.response_generator.cli_args.top_k)
+                min_p = body.get("min_p", self.response_generator.cli_args.min_p)
+                repetition_penalty = body.get("repetition_penalty", 0.0)
+                repetition_context_size = body.get("repetition_context_size", 20)
 
                 # Build generation arguments
                 request = CompletionRequest("chat", "", messages, tools, None)
@@ -1841,14 +1939,14 @@ class ReapAPIHandler:
                         temperature=temperature,
                         top_p=top_p,
                         top_k=top_k,
-                        min_p=0.0,
+                        min_p=min_p,
                         xtc_probability=0.0,
                         xtc_threshold=0.0,
                     ),
                     logits=LogitsProcessorArguments(
                         logit_bias=None,
-                        repetition_penalty=0.0,
-                        repetition_context_size=20,
+                        repetition_penalty=repetition_penalty,
+                        repetition_context_size=repetition_context_size,
                         presence_penalty=0.0,
                         presence_context_size=20,
                         frequency_penalty=0.0,
@@ -2119,6 +2217,14 @@ def run_reap_server(
     dflash_block_size: Optional[int] = None,
     dflash_num_layers: int = 5,
     dflash_num_heads: int = 8,
+    log_level: str = "INFO",
+    default_temperature: Optional[float] = None,
+    default_top_p: Optional[float] = None,
+    default_top_k: Optional[int] = None,
+    default_min_p: Optional[float] = None,
+    default_repetition_penalty: Optional[float] = None,
+    default_repetition_context_size: Optional[int] = None,
+    enable_counting: bool = False,
 ):
     """Start the server with on-demand model loading.
 
@@ -2166,10 +2272,16 @@ def run_reap_server(
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
         mx.set_wired_limit(wired_limit)
 
+    level = getattr(logging, log_level.upper(), logging.INFO)
     logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
+        level=level,
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        force=True,
     )
+    if level <= logging.DEBUG:
+        # Quiet very chatty libraries unless explicitly bumped
+        for noisy in ("urllib3", "asyncio", "httpcore"):
+            logging.getLogger(noisy).setLevel(logging.INFO)
 
     # Create model manager
     model_manager = ModelManager(
@@ -2186,7 +2298,20 @@ def run_reap_server(
         dflash_block_size=dflash_block_size,
         dflash_num_layers=dflash_num_layers,
         dflash_num_heads=dflash_num_heads,
+        default_temperature=default_temperature,
+        default_top_p=default_top_p,
+        default_top_k=default_top_k,
+        default_min_p=default_min_p,
+        default_repetition_penalty=default_repetition_penalty,
+        default_repetition_context_size=default_repetition_context_size,
+        enable_counting=enable_counting,
     )
+
+    set_defaults = {
+        k: v for k, v in model_manager._sampling_defaults.items() if v is not None
+    }
+    if set_defaults:
+        logging.info(f"Server-wide sampling defaults: {set_defaults}")
 
     # Apply initial steering if configured
     if safety_map and steering_mode:

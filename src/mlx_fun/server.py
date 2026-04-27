@@ -39,23 +39,20 @@ from .saliency import SaliencyAccumulator
 class OnlineAccumulator:
     """Thread-safe wrapper around SaliencyAccumulator.
 
-    Routing data is collected via ``queue_lazy`` which stores **lazy MLX
-    array refs only** — no ``mx.eval`` and no numpy conversion happens
-    inline with the model forward pass. This is critical for inference
-    quality: forcing eager evaluation per-layer per-token fragments
-    MLX's lazy compute graph and changes intermediate-precision rounding
-    enough to push the model into a different greedy trajectory (e.g.
-    GLM-5.1 fails to emit clean ``<tool_call>`` blocks).
+    Routing data is materialized **eagerly on the generation thread**
+    via ``queue_lazy``: it does ``mx.eval`` + numpy conversion inline
+    and forwards to the numpy accumulator immediately. This keeps
+    every ``mx.eval`` call on the same thread (the one driving model
+    forward passes), which is required because Metal command encoders
+    are not safe to interleave from different host threads — concurrent
+    ``mx.eval`` from a HTTP handler thread (e.g. /v1/reap/save) and
+    the generation thread triggers
+    ``A command encoder is already encoding to this command buffer``.
 
-    Pending entries drain into the underlying numpy accumulator either
-    automatically (``_auto_flush_size`` cap) or on demand via
-    ``flush()`` — called by ``save``, ``get_stats`` and ``reset``.
+    The original GLM-5 tool-call regression was caused by a faulty gate
+    reimplementation in the steering hook, not by eager evaluation; so
+    we keep the eager path here and rely on the gate fix instead.
     """
-
-    # Auto-flush threshold tuned for typical 60–80 MoE-layer models:
-    # ~4 tokens' worth of routing data, bounded so the lazy graph
-    # never grows unbounded across long generations.
-    _AUTO_FLUSH_SIZE = 256
 
     def __init__(self, num_layers: int, num_experts: int):
         self._lock = threading.Lock()
@@ -64,8 +61,6 @@ class OnlineAccumulator:
         self._token_count = 0
         self.num_layers = num_layers
         self.num_experts = num_experts
-        # Pending lazy entries: list of (layer_idx, inds_mx, scores_mx, norms_mx_or_None)
-        self._pending: List[Tuple[int, mx.array, mx.array, Optional[mx.array]]] = []
 
     def queue_lazy(
         self,
@@ -74,48 +69,32 @@ class OnlineAccumulator:
         router_weights: mx.array,
         activation_norms: Optional[mx.array] = None,
     ):
-        """Queue routing data lazily — no MLX eval forced here.
+        """Materialize routing tensors and update the numpy accumulator.
 
-        Holds references to the lazy ``mx.array`` nodes; they are
-        materialized in batch by ``flush()``.
+        Must be called from the generation thread (the MoE forward pass).
+        Despite the legacy name, evaluation is **eager** — see class
+        docstring for why.
         """
+        if activation_norms is None:
+            mx.eval(expert_indices, router_weights)
+        else:
+            mx.eval(expert_indices, router_weights, activation_norms)
+        np_inds = _to_numpy(expert_indices).reshape(-1, expert_indices.shape[-1])
+        np_scores = _to_numpy(router_weights).reshape(-1, router_weights.shape[-1])
+        np_norms = (
+            _to_numpy(activation_norms).reshape(-1, activation_norms.shape[-1])
+            if activation_norms is not None
+            else np.zeros_like(np_scores)
+        )
         with self._lock:
-            self._pending.append(
-                (layer_idx, expert_indices, router_weights, activation_norms)
-            )
-            if len(self._pending) >= self._AUTO_FLUSH_SIZE:
-                self._flush_locked()
-
-    def _flush_locked(self):
-        """Materialize and consume pending lazy entries. Caller holds the lock."""
-        if not self._pending:
-            return
-        # Single mx.eval over every queued tensor: MLX picks an efficient
-        # batched evaluation pass instead of the per-block eager flush
-        # that was breaking inference quality.
-        arrays: List[mx.array] = []
-        for _, inds, scores, norms in self._pending:
-            arrays.append(inds)
-            arrays.append(scores)
-            if norms is not None:
-                arrays.append(norms)
-        mx.eval(*arrays)
-
-        for layer_idx, inds, scores, norms in self._pending:
-            np_inds = _to_numpy(inds).reshape(-1, inds.shape[-1])
-            np_scores = _to_numpy(scores).reshape(-1, scores.shape[-1])
-            np_norms = (
-                _to_numpy(norms).reshape(-1, norms.shape[-1])
-                if norms is not None
-                else np.zeros_like(np_scores)
-            )
             self._acc.update(layer_idx, np_inds, np_scores, np_norms)
-        self._pending.clear()
 
     def flush(self):
-        """Drain the lazy queue. Call before reading stats or saving."""
-        with self._lock:
-            self._flush_locked()
+        """No-op: eager path keeps the numpy accumulator always up-to-date.
+        Kept as a stable API surface so callers (save/stats/reset) work
+        regardless of whether a future change reintroduces lazy queueing.
+        """
+        return
 
     def update(
         self,
@@ -146,7 +125,6 @@ class OnlineAccumulator:
         comparison with stats-diff, stats-merge, and stats-purge operations.
         """
         with self._lock:
-            self._flush_locked()
             # Compute scores for all metrics
             reap_scores = self._acc.compute_scores("reap").tolist()
             ean_scores = self._acc.compute_scores("ean").tolist()
@@ -178,7 +156,6 @@ class OnlineAccumulator:
     def save(self, path: str):
         """Save accumulator state to .npz (compatible with SaliencyAccumulator.load)."""
         with self._lock:
-            self._flush_locked()
             self._acc.save(path)
 
     def reset(self):
@@ -189,7 +166,6 @@ class OnlineAccumulator:
             self._acc = SaliencyAccumulator(n_layers, n_experts)
             self._request_count = 0
             self._token_count = 0
-            self._pending.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -759,6 +735,7 @@ class ModelManager:
         default_repetition_penalty: Optional[float] = None,
         default_repetition_context_size: Optional[int] = None,
         enable_counting: bool = False,
+        prompt_cache_size: int = 10,
     ):
         # Config (immutable for server lifetime)
         self._mode = mode
@@ -783,6 +760,7 @@ class ModelManager:
             "repetition_context_size": default_repetition_context_size,
         }
         self._enable_counting = enable_counting
+        self._prompt_cache_size = prompt_cache_size
 
         # Mutable state (protected by _lock)
         self._lock = threading.RLock()
@@ -999,7 +977,7 @@ class ModelManager:
                 f"target_layers={dflash_model.target_layer_ids}"
             )
 
-        prompt_cache = LRUPromptCache()
+        prompt_cache = LRUPromptCache(self._prompt_cache_size)
         response_generator = ResponseGenerator(provider, prompt_cache)
 
         # Swap state under lock
@@ -1430,6 +1408,8 @@ class ReapAPIHandler:
                         self._handle_reap_info()
                     elif self.path == "/v1/reap/steer":
                         self._handle_steer_get()
+                    elif self.path == "/v1/reap/gpu_limit":
+                        self._handle_gpu_limit_get()
                     else:
                         super().do_GET()
                 except BrokenPipeError:
@@ -1466,6 +1446,8 @@ class ReapAPIHandler:
                         self._handle_reap_reset()
                     elif self.path == "/v1/reap/steer":
                         self._handle_steer_post()
+                    elif self.path == "/v1/reap/gpu_limit":
+                        self._handle_gpu_limit_post()
                     elif self.path == "/v1/messages":
                         self._handle_anthropic_messages()
                     elif self.path in ("/v1/chat/completions", "/v1/completions",
@@ -1779,6 +1761,67 @@ class ReapAPIHandler:
                     return
                 acc.reset()
                 self._json_response(200, {"status": "reset"})
+
+            def _handle_gpu_limit_get(self):
+                """GET /v1/reap/gpu_limit — report current MLX wired-memory limit
+                and the OS-level recommended/working-set sizes."""
+                try:
+                    info = mx.device_info()
+                    self._json_response(200, {
+                        "max_recommended_working_set_size_bytes":
+                            info.get("max_recommended_working_set_size"),
+                        "max_recommended_working_set_size_gib":
+                            info.get("max_recommended_working_set_size") / (1024 ** 3),
+                        "memory_size_bytes": info.get("memory_size"),
+                        "memory_size_gib": (info.get("memory_size") or 0) / (1024 ** 3),
+                    })
+                except Exception as e:
+                    self._json_response(500, {"error": str(e)})
+
+            def _handle_gpu_limit_post(self):
+                """POST /v1/reap/gpu_limit — set MLX wired-memory limit at
+                runtime without reloading the model.
+
+                Body accepts ONE of:
+                  {"gib": <float>}    — limit in GiB
+                  {"bytes": <int>}    — limit in bytes
+                """
+                try:
+                    content_length = int(self.headers.get("Content-Length", 0))
+                    if content_length <= 0:
+                        self._json_response(400, {"error": "request body required"})
+                        return
+                    raw = self.rfile.read(content_length)
+                    data = json.loads(raw.decode())
+                    if "gib" in data:
+                        new_limit = int(float(data["gib"]) * (1024 ** 3))
+                    elif "bytes" in data:
+                        new_limit = int(data["bytes"])
+                    else:
+                        self._json_response(400, {"error": "specify 'gib' or 'bytes'"})
+                        return
+
+                    info = mx.device_info()
+                    cap = info.get("max_recommended_working_set_size")
+                    # MLX rejects values above what the OS allows; warn the
+                    # caller but still attempt — they may have raised the
+                    # iogpu.wired_limit_mb sysctl.
+                    prev_limit = mx.set_wired_limit(new_limit)
+                    self._json_response(200, {
+                        "status": "set",
+                        "previous_limit_bytes": prev_limit,
+                        "previous_limit_gib": prev_limit / (1024 ** 3),
+                        "new_limit_bytes": new_limit,
+                        "new_limit_gib": new_limit / (1024 ** 3),
+                        "os_max_recommended_bytes": cap,
+                        "os_max_recommended_gib": (cap or 0) / (1024 ** 3),
+                    })
+                    logging.info(
+                        f"GPU wired limit changed: {prev_limit / 1024**3:.2f} GiB "
+                        f"→ {new_limit / 1024**3:.2f} GiB"
+                    )
+                except Exception as e:
+                    self._json_response(500, {"error": str(e)})
 
             def _handle_steer_get(self):
                 """GET /v1/reap/steer — return current steering config."""
@@ -2225,6 +2268,7 @@ def run_reap_server(
     default_repetition_penalty: Optional[float] = None,
     default_repetition_context_size: Optional[int] = None,
     enable_counting: bool = False,
+    prompt_cache_size: int = 10,
 ):
     """Start the server with on-demand model loading.
 
@@ -2305,6 +2349,7 @@ def run_reap_server(
         default_repetition_penalty=default_repetition_penalty,
         default_repetition_context_size=default_repetition_context_size,
         enable_counting=enable_counting,
+        prompt_cache_size=prompt_cache_size,
     )
 
     set_defaults = {
@@ -2374,8 +2419,8 @@ def run_reap_server(
         "API: POST /v1/chat/completions (OpenAI), /v1/messages (Anthropic)"
     )
     logging.info(
-        "REAP: GET /v1/reap/stats, /v1/reap/info, /v1/reap/steer | "
-        "POST /v1/reap/save, /v1/reap/reset, /v1/reap/steer | "
+        "REAP: GET /v1/reap/stats, /v1/reap/info, /v1/reap/steer, /v1/reap/gpu_limit | "
+        "POST /v1/reap/save, /v1/reap/reset, /v1/reap/steer, /v1/reap/gpu_limit | "
         "DELETE /v1/reap/steer"
     )
     try:

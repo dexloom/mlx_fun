@@ -121,8 +121,13 @@ def collect(model, dataset, output, max_samples, max_tokens, text_key, seed):
 @click.option("--ignore-experts", default=None,
               help="Comma-separated expert indices to protect from model-wide pruning. "
                    "Format: 1,2,250..255 (ranges inclusive). Only valid with --model-wide.")
+@click.option("--stream", is_flag=True, default=False,
+              help="Stream-prune by slicing safetensors shards directly. Bypasses mlx_lm.load. "
+                   "Use for models too large to fit in unified memory. Per-tensor peak RAM (~few GB) "
+                   "instead of full-model peak. Currently supports per-layer 'bottom' strategy with "
+                   "saliency input; --strided / --model-wide / --expert-list not supported in stream mode.")
 def prune(model, saliency, expert_list, output, n_prune, metric, strategy, model_wide, min_experts_per_layer,
-          safety_map, safety_mode, domain_map, domain_mode, ignore_experts):
+          safety_map, safety_mode, domain_map, domain_mode, ignore_experts, stream):
     """Prune experts from model based on saliency statistics or expert list.
     
     Two modes of operation:
@@ -176,6 +181,57 @@ def prune(model, saliency, expert_list, output, n_prune, metric, strategy, model
         click.echo(f"Loading model from local path: {model}")
     else:
         click.echo(f"Loading model: {model}")
+
+    # Stream-prune path: skip mlx_lm.load entirely; slice safetensors directly.
+    if stream:
+        if expert_list is not None or model_wide or strategy == "strided":
+            raise click.UsageError(
+                "--stream currently supports only saliency-based per-layer 'bottom' pruning. "
+                "Drop --expert-list / --model-wide / --strategy strided."
+            )
+        import json as _json
+        from .stream_pruner import stream_prune, _moe_layer_indices, _expert_count_key, EXPERT_TENSOR_PATTERNS
+        with open(os.path.join(model, "config.json")) as _f:
+            cfg = _json.load(_f)
+        mt = cfg.get("model_type", "")
+        if mt not in EXPERT_TENSOR_PATTERNS:
+            raise click.UsageError(
+                f"--stream: model_type '{mt}' has no tensor pattern registered. "
+                f"Add an entry in src/mlx_fun/stream_pruner.py:EXPERT_TENSOR_PATTERNS."
+            )
+        click.echo(f"[stream] model_type={mt}")
+        click.echo(f"[stream] loading saliency: {saliency}")
+        acc = SaliencyAccumulator.load(saliency)
+        scores = acc.compute_scores(metric)
+        click.echo(f"[stream] scores shape={scores.shape} metric={metric}")
+
+        protected_experts, targeted_experts = None, None
+        if safety_map and safety_mode:
+            click.echo(f"[stream] safety map: {safety_map} (mode={safety_mode})")
+            protected_experts, targeted_experts = load_safety_constraints(safety_map, safety_mode)
+        if domain_map and domain_mode:
+            click.echo(f"[stream] domain map: {domain_map} (mode={domain_mode})")
+            domain_protected, _ = load_domain_constraints(domain_map, domain_mode)
+            if domain_protected:
+                if protected_experts is None:
+                    protected_experts = {}
+                for li, ex in domain_protected.items():
+                    protected_experts[li] = (
+                        np.union1d(protected_experts[li], ex) if li in protected_experts else ex
+                    )
+
+        keep_map = select_experts_to_keep(
+            scores, n_prune,
+            protected_experts=protected_experts,
+            targeted_experts=targeted_experts,
+        )
+        moe_indices = _moe_layer_indices(cfg)
+        keep_map_model = {moe_indices[i]: k for i, k in keep_map.items()}
+        click.echo(f"[stream] per-layer kept={len(next(iter(keep_map_model.values())))} / {acc.num_experts}")
+        click.echo(f"[stream] writing pruned shards to: {expanded_output}")
+        new_cfg = stream_prune(model, expanded_output, keep_map_model, log_progress=True)
+        click.echo(f"[stream] done — new {_expert_count_key(mt)}={new_cfg[_expert_count_key(mt)]}")
+        return
 
     try:
         mlx_model, tokenizer, config = mlx_load(model, return_config=True)
@@ -643,6 +699,11 @@ def smoke_test(model, prompt, max_tokens, kv_compress, kv_compress_bits):
                    "/v1/reap/stats return routing data. Off by default — "
                    "plain inference is the common case and the hooks add a "
                    "small per-token overhead.")
+@click.option("--prompt-cache-size", default=10, type=int,
+              help="Number of prompt-cache entries kept by the LRUPromptCache. "
+                   "Default 10. Lower (e.g. 1) when each conversation is large "
+                   "and you only need same-thread cache reuse, freeing GPU "
+                   "memory that would otherwise be held by stale prefixes.")
 def serve(model, host, port, mode, auto_save, max_tokens, max_kv_size,
           chat_template, safety_map, steering_mode, domain_map,
           domain_steering_mode, kv_compress, kv_compress_bits, idle_timeout,
@@ -650,7 +711,7 @@ def serve(model, host, port, mode, auto_save, max_tokens, max_kv_size,
           dflash_block_size, dflash_num_layers, dflash_num_heads, log_level,
           default_temperature, default_top_p, default_top_k, default_min_p,
           default_repetition_penalty, default_repetition_context_size,
-          enable_counting):
+          enable_counting, prompt_cache_size):
     """Serve model with on-demand loading and online expert counting.
 
     Starts an OpenAI and Anthropic compatible server. Models are loaded on
@@ -706,6 +767,7 @@ def serve(model, host, port, mode, auto_save, max_tokens, max_kv_size,
         default_repetition_penalty=default_repetition_penalty,
         default_repetition_context_size=default_repetition_context_size,
         enable_counting=enable_counting,
+        prompt_cache_size=prompt_cache_size,
     )
 
 

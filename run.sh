@@ -5,4 +5,5 @@ mlx-fun serve \
     --default-top-k 100 \
     --default-repetition-penalty 1.1 \
     --enable-counting \
+    --prompt-cache-size 1 \
     --log-level INFO 2>&1 | tee /tmp/mlx_fun_server.log

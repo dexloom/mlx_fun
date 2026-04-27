@@ -825,17 +825,19 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
         # Merge Mode Comparison tab
         # -------------------------------------------------------------------
         with gr.Tab("Merge Mode Comparison"):
-            gr.Markdown("### Compare Different Merge Modes")
+            gr.Markdown("### Rank Experts for Pruning")
             gr.Markdown(
-                "Merge the same input files using different strategies (sum, normalized, max) "
-                "and compare the results. Use filters to identify experts for pruning."
+                "Load **one or more** `.npz` saliency files. With multiple files, ranks are "
+                "summed across files (rank-based aggregation). With a single file, the per-layer "
+                "rank of that file's metric is shown directly. Use the filters below to "
+                "identify experts for pruning, merging, or analysis."
             )
             
             # Inject localStorage persistence script
             gr.HTML(get_local_storage_script())
 
             with gr.Row():
-                gr.Markdown("#### Input Files (select .npz files from your computer)")
+                gr.Markdown("#### Input Files (select 1–4 .npz files from your computer)")
             
             # Display area for previously selected files (populated by JavaScript)
             saved_files_display = gr.HTML("", elem_id="saved_files_display")
@@ -849,7 +851,7 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                     elem_id="merge_file1",
                 )
                 merge_file2 = gr.File(
-                    label="File 2 (.npz) - Required",
+                    label="File 2 (.npz) - Optional",
                     file_types=[".npz"],
                     type="filepath",
                     elem_id="merge_file2",
@@ -877,7 +879,7 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 )
 
             with gr.Row():
-                merge_btn = gr.Button("Merge Files", variant="primary")
+                merge_btn = gr.Button("Load / Merge Files", variant="primary")
             
             # Store merged data for filtering
             merge_state = gr.State(None)
@@ -1013,9 +1015,9 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 # Collect non-empty file paths (gr.File returns None when no file selected)
                 files = [f for f in [f1, f2, f3, f4] if f is not None]
 
-                if len(files) < 2:
+                if len(files) < 1:
                     return (
-                        "**Error:** At least 2 files are required.",
+                        "**Error:** Select at least one .npz file.",
                         None,
                         None,
                         None,
@@ -1078,7 +1080,8 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 
                 ax.set_xlabel("Expert Index")
                 ax.set_ylabel("MoE Layer Index")
-                ax.set_title(f"Summed Ranks - {metric} (Lower = More Important)")
+                title_prefix = "Per-Layer Rank" if len(files) == 1 else "Summed Ranks"
+                ax.set_title(f"{title_prefix} - {metric} (Lower = More Important)")
                 
                 # Show every10th tick label on X-axis
                 ax.set_xticks(range(0, num_experts, 10))
@@ -1124,14 +1127,20 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                     })
 
                 # Format info text
+                file_word = "file" if len(files) == 1 else "files"
+                head_label = (
+                    "Loaded 1 file (per-layer rank shown directly)"
+                    if len(files) == 1
+                    else f"Merged {len(files)} files using rank-based aggregation"
+                )
                 info = (
-                    f"**Merged {len(files)} files using rank-based aggregation**\n\n"
+                    f"**{head_label}**\n\n"
                     f"**Metric for ranking:** {metric}\n"
                     f"**Dimensions:** {merged.num_layers} layers × {merged.num_experts} experts\n\n"
                     f"**How it works:**\n"
                     f"- Each file ranks experts per-layer (rank 1 = highest score)\n"
-                    f"- Ranks are summed across all files\n"
-                    f"- **Lower summed rank = more important** (consistently high ranking)\n\n"
+                    f"- Ranks are summed across {len(files)} {file_word}\n"
+                    f"- **Lower rank = more important** (consistently high ranking)\n\n"
                     f"**Statistics:**\n"
                     f"- Rank sum range: [{summed_ranks.min():.0f}, {summed_ranks.max():.0f}]\n"
                     f"- Mean rank sum: {summed_ranks.mean():.1f}\n"
@@ -1828,7 +1837,8 @@ def create_app(base_url: str = "http://127.0.0.1:8080") -> gr.Blocks:
                 
                 ax.set_xlabel("Expert Index")
                 ax.set_ylabel("MoE Layer Index")
-                ax.set_title(f"Summed Ranks - {metric} (Lower = More Important)")
+                title_prefix = "Per-Layer Rank" if len(files) == 1 else "Summed Ranks"
+                ax.set_title(f"{title_prefix} - {metric} (Lower = More Important)")
                 
                 # Show every10th tick label on X-axis
                 ax.set_xticks(range(0, num_experts, 10))

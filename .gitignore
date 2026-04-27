@@ -9,5 +9,7 @@ build/
 data/
 pruned_*/
 .claude/
+skills/
+local/
 uv.lock
 

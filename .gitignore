@@ -7,9 +7,11 @@ build/
 *.npz
 *.safetensors
 data/
+datasets/
 pruned_*/
 .claude/
 skills/
 local/
+bench/
 uv.lock
 

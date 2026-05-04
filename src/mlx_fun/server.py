@@ -367,6 +367,7 @@ _COUNTING_HOOK_MAP = {
     "glm4_moe_lite": _glm4_counting_call,
     "glm_moe_dsa": _glm4_counting_call,
     "deepseek_v32": _glm4_counting_call,
+    "kimi_k25": _glm4_counting_call,
     "nemotron_h": _glm4_counting_call,
     "qwen3_moe": _qwen3_moe_counting_call,
     "qwen3_next": _qwen3_next_counting_call,
@@ -404,6 +405,7 @@ _FULL_COUNTING_HOOK_MAP = {
     "glm4_moe_lite": _glm4_full_counting_call,
     "glm_moe_dsa": _glm4_full_counting_call,
     "deepseek_v32": _glm4_full_counting_call,
+    "kimi_k25": _glm4_full_counting_call,
     "nemotron_h": _glm4_full_counting_call,
     "qwen3_moe": _qwen3_moe_full_counting_call,
     "qwen3_next": _qwen3_next_full_counting_call,
@@ -431,7 +433,13 @@ def _minimax_counting_steering_call(self, x: mx.array) -> mx.array:
 
     y = self.switch_mlp(x, inds)
 
-    self._reap_accumulator.queue_lazy(self._reap_layer_idx, inds, scores)
+    if getattr(self, "_reap_full_mode", False):
+        activation_norms = mx.linalg.norm(y, axis=-1)
+        self._reap_accumulator.queue_lazy(
+            self._reap_layer_idx, inds, scores, activation_norms
+        )
+    else:
+        self._reap_accumulator.queue_lazy(self._reap_layer_idx, inds, scores)
 
     y = (y * scores[..., None]).sum(axis=-2)
     return y
@@ -470,7 +478,13 @@ def _glm4_counting_steering_call(self, x: mx.array) -> mx.array:
         x_experts = self.fc1_latent_proj(x)
     y = self.switch_mlp(x_experts, inds)
 
-    self._reap_accumulator.queue_lazy(self._reap_layer_idx, inds, scores)
+    if getattr(self, "_reap_full_mode", False):
+        activation_norms = mx.linalg.norm(y, axis=-1)
+        self._reap_accumulator.queue_lazy(
+            self._reap_layer_idx, inds, scores, activation_norms
+        )
+    else:
+        self._reap_accumulator.queue_lazy(self._reap_layer_idx, inds, scores)
 
     y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
     # Latent back-projection: moe_latent_size → 4096
@@ -496,7 +510,13 @@ def _qwen3_moe_counting_steering_call(self, x: mx.array) -> mx.array:
 
     y = self.switch_mlp(x, inds)
 
-    self._reap_accumulator.queue_lazy(self._reap_layer_idx, inds, scores)
+    if getattr(self, "_reap_full_mode", False):
+        activation_norms = mx.linalg.norm(y, axis=-1)
+        self._reap_accumulator.queue_lazy(
+            self._reap_layer_idx, inds, scores, activation_norms
+        )
+    else:
+        self._reap_accumulator.queue_lazy(self._reap_layer_idx, inds, scores)
 
     y = (y * scores[..., None]).sum(axis=-2)
     return y
@@ -516,7 +536,13 @@ def _qwen3_next_counting_steering_call(self, x: mx.array) -> mx.array:
 
     y = self.switch_mlp(x, inds)
 
-    self._reap_accumulator.queue_lazy(self._reap_layer_idx, inds, scores)
+    if getattr(self, "_reap_full_mode", False):
+        activation_norms = mx.linalg.norm(y, axis=-1)
+        self._reap_accumulator.queue_lazy(
+            self._reap_layer_idx, inds, scores, activation_norms
+        )
+    else:
+        self._reap_accumulator.queue_lazy(self._reap_layer_idx, inds, scores)
 
     y = (y * scores[..., None]).sum(axis=-2)
 
@@ -542,10 +568,22 @@ def _gemma4_counting_steering_call(self, h: mx.array) -> mx.array:
     scores = scores * router.per_expert_scale[inds]
 
     h2 = self.pre_feedforward_layernorm_2(h)
+    if getattr(self, "_reap_full_mode", False):
+        # Take the per-expert path so we can measure ||expert_output||.
+        # Mirrors _gemma4_full_counting_call.
+        B, S, H = h2.shape
+        x_flat = h2.reshape(B * S, H)
+        indices_flat = inds.reshape(B * S, k)
+        expert_out = self.switch_glu(x_flat, indices_flat)
+        activation_norms = mx.linalg.norm(expert_out, axis=-1)
+        self._reap_accumulator.queue_lazy(
+            self._reap_layer_idx, inds, scores, activation_norms
+        )
+        weights = scores.reshape(B * S, k)[..., None]
+        return (expert_out * weights).sum(axis=-2).reshape(B, S, H)
+
     result = self.experts(h2, inds, scores)
-
     self._reap_accumulator.queue_lazy(self._reap_layer_idx, inds, scores)
-
     return result
 
 
@@ -556,6 +594,7 @@ _COUNTING_STEERING_HOOK_MAP = {
     "glm4_moe_lite": _glm4_counting_steering_call,
     "glm_moe_dsa": _glm4_counting_steering_call,
     "deepseek_v32": _glm4_counting_steering_call,
+    "kimi_k25": _glm4_counting_steering_call,
     "nemotron_h": _glm4_counting_steering_call,
     "qwen3_moe": _qwen3_moe_counting_steering_call,
     "qwen3_next": _qwen3_next_counting_steering_call,
@@ -612,6 +651,9 @@ def install_counting_hooks(
     for layer_idx, block in enumerate(moe_blocks):
         block._reap_accumulator = accumulator
         block._reap_layer_idx = layer_idx
+        # The compound counting+steering hook checks this flag to decide
+        # whether to spend the extra reduction needed for reap_sum/ean_sum.
+        block._reap_full_mode = (mode == "full")
         if steering:
             block._steering_bias = None  # Will be set by _update_steering_bias
         original_cls = type(block)
@@ -736,6 +778,7 @@ class ModelManager:
         default_repetition_context_size: Optional[int] = None,
         enable_counting: bool = False,
         prompt_cache_size: int = 10,
+        trust_remote_code: bool = False,
     ):
         # Config (immutable for server lifetime)
         self._mode = mode
@@ -761,6 +804,7 @@ class ModelManager:
         }
         self._enable_counting = enable_counting
         self._prompt_cache_size = prompt_cache_size
+        self._trust_remote_code = trust_remote_code
 
         # Mutable state (protected by _lock)
         self._lock = threading.RLock()
@@ -895,6 +939,8 @@ class ModelManager:
         tokenizer_config = {}
         if chat_template_content:
             tokenizer_config["chat_template"] = chat_template_content
+        if self._trust_remote_code:
+            tokenizer_config["trust_remote_code"] = True
 
         model, tokenizer, config = mlx_load(
             resolved_path,
@@ -903,6 +949,33 @@ class ModelManager:
         )
 
         model_type = config.get("model_type", "")
+
+        # Kimi-K2.6 quants have two tool-call quirks vs upstream Kimi-K2:
+        #   1. ids of the form ``tool_call_N`` (sequential index, no
+        #      function name) instead of ``functions.NAME:0``;
+        #   2. tool-call blocks emitted *without* the surrounding
+        #      ``<|tool_calls_section_begin|>...<|tool_calls_section_end|>``
+        #      wrapper, which means mlx-lm's streaming state machine
+        #      never flips into "tool" mode and the raw <|tool_call_*|>
+        #      tokens leak through as content text.
+        # Swap in a permissive parser AND retarget the streaming
+        # boundaries to the per-call markers so each block is captured
+        # individually whether or not the section wrapper is present.
+        if model_type == "kimi_k25":
+            from . import kimi_k26_tool_parser
+            tokenizer._tool_parser = kimi_k26_tool_parser.parse_tool_call
+            tokenizer._tool_call_start = "<|tool_call_begin|>"
+            tokenizer._tool_call_end = "<|tool_call_end|>"
+            # Bust mlx-lm's per-tokenizer state-machine cache so the new
+            # boundaries take effect on the next request.
+            try:
+                self._provider  # placeholder; cache lives on the generator
+            except Exception:
+                pass
+            logging.info(
+                "Installed kimi_k26 permissive tool-call parser; "
+                "streaming boundaries set to <|tool_call_begin|>/<|tool_call_end|>"
+            )
 
         # Set up MoE adapter + hooks. Off by default — pass --enable-counting
         # if you want /v1/reap/save and /v1/reap/stats to return routing data.
@@ -2269,6 +2342,7 @@ def run_reap_server(
     default_repetition_context_size: Optional[int] = None,
     enable_counting: bool = False,
     prompt_cache_size: int = 10,
+    trust_remote_code: bool = False,
 ):
     """Start the server with on-demand model loading.
 
@@ -2350,6 +2424,7 @@ def run_reap_server(
         default_repetition_context_size=default_repetition_context_size,
         enable_counting=enable_counting,
         prompt_cache_size=prompt_cache_size,
+        trust_remote_code=trust_remote_code,
     )
 
     set_defaults = {

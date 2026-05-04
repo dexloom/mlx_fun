@@ -230,7 +230,12 @@ def prune(model, saliency, expert_list, output, n_prune, metric, strategy, model
         click.echo(f"[stream] per-layer kept={len(next(iter(keep_map_model.values())))} / {acc.num_experts}")
         click.echo(f"[stream] writing pruned shards to: {expanded_output}")
         new_cfg = stream_prune(model, expanded_output, keep_map_model, log_progress=True)
-        click.echo(f"[stream] done — new {_expert_count_key(mt)}={new_cfg[_expert_count_key(mt)]}")
+        # The expert-count key may live in nested text_config (Kimi/multimodal).
+        ek = _expert_count_key(mt)
+        new_n = new_cfg.get(ek)
+        if new_n is None and "text_config" in new_cfg:
+            new_n = new_cfg["text_config"].get(ek)
+        click.echo(f"[stream] done — new {ek}={new_n}")
         return
 
     try:
@@ -704,6 +709,12 @@ def smoke_test(model, prompt, max_tokens, kv_compress, kv_compress_bits):
                    "Default 10. Lower (e.g. 1) when each conversation is large "
                    "and you only need same-thread cache reuse, freeing GPU "
                    "memory that would otherwise be held by stale prefixes.")
+@click.option("--trust-remote-code", is_flag=True, default=False,
+              help="Allow custom tokenizer/model code from the model repo to be "
+                   "executed (passes trust_remote_code=True to the HuggingFace "
+                   "AutoTokenizer). Required for models like Kimi-K2 / "
+                   "MiniMax-M2 that ship a Python tokenizer alongside the "
+                   "weights. Off by default for safety.")
 def serve(model, host, port, mode, auto_save, max_tokens, max_kv_size,
           chat_template, safety_map, steering_mode, domain_map,
           domain_steering_mode, kv_compress, kv_compress_bits, idle_timeout,
@@ -711,7 +722,7 @@ def serve(model, host, port, mode, auto_save, max_tokens, max_kv_size,
           dflash_block_size, dflash_num_layers, dflash_num_heads, log_level,
           default_temperature, default_top_p, default_top_k, default_min_p,
           default_repetition_penalty, default_repetition_context_size,
-          enable_counting, prompt_cache_size):
+          enable_counting, prompt_cache_size, trust_remote_code):
     """Serve model with on-demand loading and online expert counting.
 
     Starts an OpenAI and Anthropic compatible server. Models are loaded on
@@ -768,6 +779,7 @@ def serve(model, host, port, mode, auto_save, max_tokens, max_kv_size,
         default_repetition_context_size=default_repetition_context_size,
         enable_counting=enable_counting,
         prompt_cache_size=prompt_cache_size,
+        trust_remote_code=trust_remote_code,
     )
 
 

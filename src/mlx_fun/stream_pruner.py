@@ -56,6 +56,12 @@ EXPERT_TENSOR_PATTERNS: Dict[str, List[re.Pattern]] = {
         re.compile(r"^model\.layers\.(?P<L>\d+)\.mlp\.gate\.weight$"),
         re.compile(r"^model\.layers\.(?P<L>\d+)\.mlp\.switch_mlp\.(?:gate|up|down)_proj\.(?:weight|scales|biases)$"),
     ],
+    # Kimi K2.5 / K2.6 — wrapped in language_model.* by Moonshot's multimodal config
+    "kimi_k25": [
+        re.compile(r"^language_model\.model\.layers\.(?P<L>\d+)\.mlp\.gate\.weight$"),
+        re.compile(r"^language_model\.model\.layers\.(?P<L>\d+)\.mlp\.gate\.e_score_correction_bias$"),
+        re.compile(r"^language_model\.model\.layers\.(?P<L>\d+)\.mlp\.switch_mlp\.(?:gate|up|down)_proj\.(?:weight|scales|biases)$"),
+    ],
     # MiniMax / MiniMax-M2
     "minimax": [
         re.compile(r"^model\.layers\.(?P<L>\d+)\.block_sparse_moe\.gate\.weight$"),
@@ -71,7 +77,12 @@ EXPERT_TENSOR_PATTERNS: Dict[str, List[re.Pattern]] = {
 def _moe_layer_indices(config: dict) -> List[int]:
     """Return absolute model layer indices that contain routed experts."""
     mt = config.get("model_type", "")
-    n_layers = config["num_hidden_layers"]
+    # Kimi-K2.5/2.6 wraps the language config in text_config (multimodal stub).
+    sub = config.get("text_config") if "text_config" in config else config
+    n_layers = sub.get("num_hidden_layers") or config.get("num_hidden_layers")
+    if mt == "kimi_k25":
+        first_k = sub.get("first_k_dense_replace", 0)
+        return list(range(first_k, n_layers))
     if mt in {"glm_moe_dsa", "deepseek_v32", "glm4_moe"}:
         first_k = config.get("first_k_dense_replace", 0)
         return list(range(first_k, n_layers))
@@ -88,7 +99,7 @@ def _moe_layer_indices(config: dict) -> List[int]:
 
 
 def _expert_count_key(model_type: str) -> str:
-    if model_type in {"glm_moe_dsa", "deepseek_v32", "glm4_moe", "glm4_moe_lite"}:
+    if model_type in {"glm_moe_dsa", "deepseek_v32", "glm4_moe", "glm4_moe_lite", "kimi_k25"}:
         return "n_routed_experts"
     if model_type in {"qwen3_moe", "qwen3_next"}:
         return "num_experts"
@@ -225,7 +236,10 @@ def stream_prune(
                 copied_count += 1
 
         out_shard = dst / shard
-        mx.save_safetensors(str(out_shard), out_buf)
+        # The {'format': 'mlx'} metadata is what mlx_lm.load and LM Studio
+        # use to identify MLX-native shards; without it loaders error out
+        # with "Unsupported safetensors format: null".
+        mx.save_safetensors(str(out_shard), out_buf, metadata={"format": "mlx"})
         new_weight_map.update({k: shard for k in out_buf})
         # Free shard memory before next iteration
         del loaded, out_buf
@@ -240,14 +254,23 @@ def stream_prune(
                 f, indent=2,
             )
 
-    # Update + write config.json
+    # Update + write config.json. Only update where the key actually lives in
+    # the source — adding it at top-level when the source had it only in
+    # text_config (Kimi/multimodal) confuses downstream loaders like LM Studio.
     new_config = dict(config)
     key = _expert_count_key(model_type)
-    new_config[key] = int(new_n_experts)
-    if "text_config" in new_config and key in new_config["text_config"]:
-        nested = dict(new_config["text_config"])
+    in_top = key in config
+    in_nested = "text_config" in config and key in config.get("text_config", {})
+    if in_top:
+        new_config[key] = int(new_n_experts)
+    if in_nested:
+        nested = dict(config["text_config"])
         nested[key] = int(new_n_experts)
         new_config["text_config"] = nested
+    if not (in_top or in_nested):
+        # Source didn't carry the key at either location — write at top-level
+        # as the safest default.
+        new_config[key] = int(new_n_experts)
     with open(dst / "config.json", "w") as f:
         json.dump(new_config, f, indent=2)
 
@@ -258,8 +281,12 @@ def stream_prune(
         }:
             shutil.copy2(aux, dst / aux.name)
 
+    # Source key may live in nested text_config (Kimi/multimodal wrappers).
+    src_n = config.get(key)
+    if src_n is None and "text_config" in config:
+        src_n = config["text_config"].get(key)
     logger.info(
         f"stream_prune: done — sliced={sliced_count}, copied={copied_count}, "
-        f"experts {config[key]}->{new_n_experts}"
+        f"experts {src_n}->{new_n_experts}"
     )
     return new_config

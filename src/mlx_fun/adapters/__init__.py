@@ -8,6 +8,7 @@ from .glm4_moe import GLM4MoEAdapter
 from .glm4_moe_lite import GLM4MoELiteAdapter
 from .qwen3_moe import Qwen3MoEAdapter
 from .glm_moe_dsa import GLMMoeDsaAdapter
+from .kimi_k25 import KimiK25Adapter
 from .nemotron_h import NemotronHAdapter
 from .gemma4 import Gemma4Adapter
 
@@ -20,6 +21,7 @@ _ADAPTER_MAP = {
     "qwen3_next": Qwen3MoEAdapter,
     "glm_moe_dsa": GLMMoeDsaAdapter,
     "deepseek_v32": GLMMoeDsaAdapter,
+    "kimi_k25": KimiK25Adapter,
     "nemotron_h": NemotronHAdapter,
     "gemma4": Gemma4Adapter,
 }

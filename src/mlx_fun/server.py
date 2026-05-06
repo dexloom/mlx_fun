@@ -821,6 +821,10 @@ class ModelManager:
         self._n_experts: int = 0
         self._kv_compress_info: Optional[dict] = None
         self._steering_config = None  # Persists across model swaps
+        # Survives _unload_model so "default" requests can wake the model
+        # back up after idle eviction. Set by the eager-load path at startup
+        # and refreshed on every successful load.
+        self._default_model_path: Optional[str] = None
 
         # Loading state
         self._loading = False
@@ -839,6 +843,14 @@ class ModelManager:
     @property
     def loaded_model_path(self) -> Optional[str]:
         return self._model_path
+
+    @property
+    def default_model_path(self) -> Optional[str]:
+        return self._default_model_path
+
+    @default_model_path.setter
+    def default_model_path(self, value: Optional[str]) -> None:
+        self._default_model_path = value
 
     @property
     def accumulator(self) -> Optional[OnlineAccumulator]:
@@ -882,13 +894,41 @@ class ModelManager:
 
     # --- Core lifecycle ---
 
-    def ensure_loaded(self, model_id: str):
+    # Sentinel model IDs that mean "use whatever model the operator picked".
+    # Lets clients (Claude Code, generic SDKs) not have to know the exact path.
+    _DEFAULT_SENTINELS = frozenset({
+        "", "default", "default_model", "auto", "current",
+    })
+
+    def ensure_loaded(self, model_id):
         """Ensure model_id is loaded. Returns the ResponseGenerator.
 
         If a different model is loaded, unloads it first.
         If the same model is loaded, resets the idle timer.
         Blocks concurrent callers while loading is in progress.
+
+        Sentinel IDs ("", "default", "default_model", "auto", "current",
+        None) route to whatever model is currently loaded; if nothing is
+        loaded, falls back to the operator-configured default path.
         """
+        # Resolve "default" sentinel before path lookup so callers don't need
+        # to know the actual filesystem path.
+        if model_id is None or (
+            isinstance(model_id, str) and model_id.lower() in self._DEFAULT_SENTINELS
+        ):
+            with self._lock:
+                if self._model_path is not None and self._response_generator is not None:
+                    self._reset_idle_timer()
+                    return self._response_generator
+            if self._default_model_path:
+                model_id = self._default_model_path
+            else:
+                raise ValueError(
+                    "No model is loaded and no default model is configured. "
+                    "Start the server with a model path, or send an explicit "
+                    "model ID in the request."
+                )
+
         resolved = _resolve_model_path(model_id)
 
         with self._lock:
@@ -915,6 +955,10 @@ class ModelManager:
             with self._lock:
                 self._loading = False
                 self._load_condition.notify_all()
+
+        # Remember the most recently loaded model as the default so
+        # post-idle-unload "default" requests can wake it back up.
+        self._default_model_path = resolved
 
         return self._response_generator
 
@@ -2450,6 +2494,7 @@ def run_reap_server(
 
     # Eagerly load default model if specified
     if model_path:
+        model_manager.default_model_path = model_path
         model_manager.ensure_loaded(model_path)
 
     # Create handler class

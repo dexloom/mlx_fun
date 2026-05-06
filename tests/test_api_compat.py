@@ -111,7 +111,11 @@ class TestAnthropicToOpenAIMessages:
         tc = msg["tool_calls"][0]
         assert tc["id"] == "toolu_abc123"
         assert tc["function"]["name"] == "get_weather"
-        assert tc["function"]["arguments"] == {"location": "NYC"}
+        # OpenAI spec: arguments is a JSON-encoded string (mlx_lm's server
+        # does json.loads on it downstream).
+        assert isinstance(tc["function"]["arguments"], str)
+        import json as _json
+        assert _json.loads(tc["function"]["arguments"]) == {"location": "NYC"}
 
     def test_tool_result_message(self):
         body = {

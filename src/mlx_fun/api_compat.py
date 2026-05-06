@@ -4,6 +4,7 @@ Pure conversion functions with no server dependencies. Both APIs share the
 same generation pipeline — jinja templates always receive OpenAI-style messages.
 """
 
+import json
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -133,12 +134,22 @@ def _convert_assistant_message(content) -> dict:
         if block_type == "text":
             text_parts.append(block["text"])
         elif block_type == "tool_use":
+            # Anthropic spec: tool_use.input is a dict.
+            # OpenAI spec: tool_calls[].function.arguments is a JSON-encoded
+            # string. mlx_lm's server does json.loads(arguments) downstream,
+            # so we must serialize here — passing the dict through crashes
+            # the chat-template path on tool roundtrips.
+            raw_input = block.get("input", {})
+            if isinstance(raw_input, str):
+                args_str = raw_input
+            else:
+                args_str = json.dumps(raw_input, ensure_ascii=False)
             tool_calls.append({
                 "id": block.get("id", f"call_{uuid.uuid4().hex[:8]}"),
                 "type": "function",
                 "function": {
                     "name": block["name"],
-                    "arguments": block.get("input", {}),
+                    "arguments": args_str,
                 },
             })
 

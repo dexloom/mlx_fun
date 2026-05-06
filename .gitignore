@@ -15,3 +15,6 @@ local/
 bench/
 uv.lock
 
+# User-specific scripts (not committed)
+scripts/
+

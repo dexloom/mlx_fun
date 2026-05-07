@@ -25,6 +25,13 @@ convert = ["safetensors>=0.4", "huggingface-hub>=0.20"]
 [project.scripts]
 mlx-fun = "mlx_fun.cli:main"
 
+[tool.uv.sources]
+# Use the local fork of mlx-lm (branch: gemma4-assistant) so the
+# `gemma4_assistant` model_type is available for MTP speculative decoding.
+# Falls back gracefully on machines without the local checkout — uv will
+# still install from git@main per the [project.dependencies] declaration.
+mlx-lm = { path = "../mlx-lm", editable = true }
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

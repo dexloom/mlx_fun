@@ -42,6 +42,7 @@ checkpoints that load with stock `mlx_lm.load()`.
 | **TurboQuant** | KV cache compression via PolarQuant rotation (4–6× memory) | [kv-cache](docs/kv-cache.md#turboquant-polarquant) |
 | **RotorQuant** | KV cache compression via Cl(3,0) Clifford rotors (44× fewer rotation params) | [kv-cache](docs/kv-cache.md#rotorquant-clifford-rotors) |
 | **Sliding window** | Cap KV cache to N tokens per layer for bounded memory | `--max-kv-size` |
+| **Gemma 4 MTP drafter** | Greedy speculative decoding with the `gemma4_assistant` drafter — 1.4–1.9× over backbone, up to 4.9× over bf16 | [mtp-speculative-decoding](docs/mtp-speculative-decoding.md) |
 
 ### Tools & dashboard
 

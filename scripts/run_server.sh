@@ -8,20 +8,28 @@
 # suffix). The MTP-aware path is auto-installed by mlx-fun when it sees a
 # gemma4_assistant drafter.
 #
+# Pass ``--no-thinking`` to disable Gemma 4's <|channel>thought reasoning
+# preamble server-wide. Without this, Gemma 4 IT models burn 1500–3500
+# tokens on internal reasoning before producing any visible content, so
+# requests with low max_tokens look like "reasoning-only / empty content".
+# Per-request override: include
+#   "chat_template_kwargs": {"enable_thinking": false}
+# in the JSON body.
+#
 # Usage:
 #   ./scripts/run_server.sh <model-name>                    # serve, idle-timeout 0
 #   ./scripts/run_server.sh <model-name> --port 8080        # custom port
 #   ./scripts/run_server.sh <model-name> --mtp              # + MTP drafter
-#   ./scripts/run_server.sh <model-name> --enable-counting  # extra flags
+#   ./scripts/run_server.sh <model-name> --no-thinking      # skip Gemma reasoning
 #
 # Examples:
-#   ./scripts/run_server.sh Gemma-4-26B-A4B-it-NVFP4 --mtp
+#   ./scripts/run_server.sh Gemma-4-26B-A4B-it-NVFP4 --mtp --no-thinking
 #   ./scripts/run_server.sh Gemma-4-31B-it-NVFP4 --mtp -k 4
 #   ./scripts/run_server.sh GLM-5.1-NVFP4-mixed
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-    echo "Usage: $0 <model-name> [--mtp] [extra mlx-fun serve flags]" >&2
+    echo "Usage: $0 <model-name> [--mtp] [--no-thinking] [extra mlx-fun serve flags]" >&2
     exit 1
 fi
 
@@ -62,12 +70,23 @@ for a in "$@"; do [[ "$a" == "--port" ]] && PORT_FLAG=""; done
 
 # Optional --mtp: auto-derive the matching Gemma 4 assistant drafter and
 # pass it via --draft-model. Strip --mtp from the args we forward.
+# Optional --no-thinking: pass --chat-template-args '{"enable_thinking":false}'.
 EXTRA=()
 WANT_MTP=0
+WANT_NOTHINK=0
 for a in "$@"; do
-    if [[ "$a" == "--mtp" ]]; then WANT_MTP=1; else EXTRA+=("$a"); fi
+    case "$a" in
+        --mtp)         WANT_MTP=1 ;;
+        --no-thinking) WANT_NOTHINK=1 ;;
+        *)             EXTRA+=("$a") ;;
+    esac
 done
 set -- "${EXTRA[@]}"
+
+if [[ $WANT_NOTHINK -eq 1 ]]; then
+    set -- --chat-template-args '{"enable_thinking":false}' "$@"
+    echo "[run_server] thinking disabled (--no-thinking)" >&2
+fi
 
 if [[ $WANT_MTP -eq 1 ]]; then
     bb=$(basename "$MODEL")

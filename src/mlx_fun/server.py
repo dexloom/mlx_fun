@@ -760,6 +760,7 @@ class ModelManager:
         mode: str = "lightweight",
         max_tokens: int = 512,
         chat_template: Optional[str] = None,
+        chat_template_args: Optional[Dict[str, Any]] = None,
         idle_timeout: float = 1800.0,
         max_kv_size: Optional[int] = None,
         kv_compress: Optional[str] = None,
@@ -784,6 +785,7 @@ class ModelManager:
         self._mode = mode
         self._max_tokens = max_tokens
         self._chat_template = chat_template
+        self._chat_template_args = chat_template_args or {}
         self._idle_timeout = idle_timeout
         self._max_kv_size = max_kv_size
         self._kv_compress = kv_compress
@@ -1039,6 +1041,11 @@ class ModelManager:
         )
         if chat_template_content:
             cli_kwargs["chat_template"] = chat_template_content
+        if self._chat_template_args:
+            cli_kwargs["chat_template_args"] = self._chat_template_args
+            logging.info(
+                f"Default chat-template args: {self._chat_template_args}"
+            )
         if self._draft_model_path:
             cli_kwargs["draft_model"] = self._draft_model_path
         cli_args = _make_cli_args(**cli_kwargs)
@@ -2458,6 +2465,7 @@ def run_reap_server(
     auto_save: Optional[str] = None,
     max_tokens: int = 512,
     chat_template: Optional[str] = None,
+    chat_template_args: Optional[Dict[str, Any]] = None,
     safety_map: Optional[str] = None,
     steering_mode: Optional[str] = None,
     max_kv_size: Optional[int] = None,
@@ -2545,6 +2553,7 @@ def run_reap_server(
         mode=mode,
         max_tokens=max_tokens,
         chat_template=chat_template,
+        chat_template_args=chat_template_args,
         idle_timeout=idle_timeout,
         max_kv_size=max_kv_size,
         kv_compress=kv_compress,

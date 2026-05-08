@@ -654,6 +654,10 @@ def smoke_test(model, prompt, max_tokens, kv_compress, kv_compress_bits):
               help="Max KV cache size per layer (tokens). Uses RotatingKVCache sliding window "
                    "to cap memory usage for long conversations.")
 @click.option("--chat-template", default=None, help="Chat template override.")
+@click.option("--chat-template-args", default=None,
+              help="JSON string of extra apply_chat_template kwargs applied "
+                   "server-wide. Use to disable Gemma 4 thinking by default: "
+                   "--chat-template-args '{\"enable_thinking\":false}'.")
 @click.option("--safety-map", default=None, help="Path to safety_report.json for steering.")
 @click.option("--steering-mode", default=None, type=click.Choice(["safe", "unsafe"]),
               help="Steering mode: 'safe' boosts safety experts, 'unsafe' masks them.")
@@ -716,9 +720,9 @@ def smoke_test(model, prompt, max_tokens, kv_compress, kv_compress_bits):
                    "MiniMax-M2 that ship a Python tokenizer alongside the "
                    "weights. Off by default for safety.")
 def serve(model, host, port, mode, auto_save, max_tokens, max_kv_size,
-          chat_template, safety_map, steering_mode, domain_map,
-          domain_steering_mode, kv_compress, kv_compress_bits, idle_timeout,
-          draft_model, num_draft_tokens, capture_layers,
+          chat_template, chat_template_args, safety_map, steering_mode,
+          domain_map, domain_steering_mode, kv_compress, kv_compress_bits,
+          idle_timeout, draft_model, num_draft_tokens, capture_layers,
           dflash_block_size, dflash_num_layers, dflash_num_heads, log_level,
           default_temperature, default_top_p, default_top_k, default_min_p,
           default_repetition_penalty, default_repetition_context_size,
@@ -748,6 +752,18 @@ def serve(model, host, port, mode, auto_save, max_tokens, max_kv_size,
         from .dflash_draft import parse_block_size
         parsed_dflash_block_size = parse_block_size(dflash_block_size)
 
+    parsed_chat_template_args = {}
+    if chat_template_args:
+        import json as _json
+        try:
+            parsed_chat_template_args = _json.loads(chat_template_args)
+            if not isinstance(parsed_chat_template_args, dict):
+                raise ValueError("expected a JSON object")
+        except Exception as e:
+            raise click.BadParameter(
+                f"--chat-template-args must be a JSON object: {e}"
+            )
+
     run_reap_server(
         host=host,
         port=port,
@@ -757,6 +773,7 @@ def serve(model, host, port, mode, auto_save, max_tokens, max_kv_size,
         max_tokens=max_tokens,
         max_kv_size=max_kv_size,
         chat_template=chat_template,
+        chat_template_args=parsed_chat_template_args,
         safety_map=safety_map,
         steering_mode=steering_mode,
         domain_map=domain_map,

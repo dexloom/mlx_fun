@@ -1050,6 +1050,30 @@ class ModelManager:
                 f"num_draft_tokens={self._num_draft_tokens}"
             )
 
+            # If the drafter is a Gemma 4 MTP assistant, the upstream
+            # speculative path can't drive it (it has KV-shared layers and
+            # needs backbone hidden state + anchor KV). Route stream_generate
+            # to our MTP-aware version, which falls through to upstream for
+            # any other drafter.
+            try:
+                from .mtp_speculative import is_mtp_drafter, mtp_stream_generate
+                if is_mtp_drafter(provider.draft_model):
+                    import mlx_lm.generate as _gen_mod
+                    import mlx_lm.server as _srv_mod
+                    if not getattr(_gen_mod, "_mlx_fun_mtp_patched", False):
+                        _gen_mod.stream_generate = mtp_stream_generate
+                        _srv_mod.stream_generate = mtp_stream_generate
+                        _gen_mod._mlx_fun_mtp_patched = True
+                        logging.info(
+                            "Detected gemma4_assistant drafter — installed "
+                            "MTP-aware stream_generate (greedy speculative "
+                            "decoding via mtp_speculative_generate_step)."
+                        )
+            except Exception as e:
+                logging.warning(
+                    f"Could not install MTP speculative patch: {e}"
+                )
+
         # Install hidden state capture hooks if requested (Phase 2)
         # When DFlash is enabled, auto-configure capture layers if not set
         capture_layers = self._capture_layers

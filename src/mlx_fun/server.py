@@ -1044,11 +1044,52 @@ class ModelManager:
         cli_args = _make_cli_args(**cli_kwargs)
 
         provider = ReapModelProvider(model, tokenizer, cli_args)
+
+        # Pre-warm the model inside mlx_lm's generation_stream so that any
+        # @mx.compile decorated paths (e.g. gemma4_text.logit_softcap, geglu)
+        # capture *that* stream as their compiled-output affinity at first
+        # invocation. Without this, the first compile invocation happens in
+        # whatever stream a per-request worker thread is using, producing
+        # arrays that subsequent worker threads can't evaluate ("RuntimeError:
+        # There is no Stream(gpu, N) in current thread"). Doing the warm-up
+        # on the main thread under generation_stream is the cheapest fix — a
+        # single 1-token forward pass, weights already loaded.
+        try:
+            import mlx.core as mx
+            from mlx_lm.generate import generation_stream
+            with mx.stream(generation_stream):
+                warm_ids = mx.array([[tokenizer.bos_token_id or 0]])
+                warm_cache = model.make_cache() if hasattr(model, "make_cache") else None
+                _ = model(warm_ids, cache=warm_cache)
+                mx.eval(_)
+            logging.info("Pre-warmed model under generation_stream.")
+        except Exception as e:
+            logging.warning(f"Model pre-warm failed (continuing): {e}")
+
         if provider.draft_model is not None:
             logging.info(
                 f"Speculative decoding enabled: draft_model={self._draft_model_path}, "
                 f"num_draft_tokens={self._num_draft_tokens}"
             )
+
+            # Same warm-up for the drafter, so it captures generation_stream
+            # at first compile.
+            try:
+                import mlx.core as mx
+                from mlx_lm.generate import generation_stream
+                from .mtp_speculative import is_mtp_drafter
+                if not is_mtp_drafter(provider.draft_model):
+                    with mx.stream(generation_stream):
+                        warm_ids = mx.array([[tokenizer.bos_token_id or 0]])
+                        warm_cache = (
+                            provider.draft_model.make_cache()
+                            if hasattr(provider.draft_model, "make_cache") else None
+                        )
+                        _ = provider.draft_model(warm_ids, cache=warm_cache)
+                        mx.eval(_)
+                    logging.info("Pre-warmed draft model under generation_stream.")
+            except Exception as e:
+                logging.warning(f"Drafter pre-warm failed (continuing): {e}")
 
             # If the drafter is a Gemma 4 MTP assistant, the upstream
             # speculative path can't drive it (it has KV-shared layers and
@@ -1056,7 +1097,10 @@ class ModelManager:
             # to our MTP-aware version, which falls through to upstream for
             # any other drafter.
             try:
-                from .mtp_speculative import is_mtp_drafter, mtp_stream_generate
+                from .mtp_speculative import (
+                    is_mtp_drafter, mtp_stream_generate,
+                    mtp_speculative_generate_step,
+                )
                 if is_mtp_drafter(provider.draft_model):
                     import mlx_lm.generate as _gen_mod
                     import mlx_lm.server as _srv_mod
@@ -1069,6 +1113,33 @@ class ModelManager:
                             "MTP-aware stream_generate (greedy speculative "
                             "decoding via mtp_speculative_generate_step)."
                         )
+
+                    # Warm the MTP pipeline (pre_projection, drafter layers,
+                    # post_projection) under generation_stream by running a
+                    # tiny generation. Same rationale as the backbone warm-up
+                    # above — first compile invocation needs to capture
+                    # generation_stream as its stream affinity.
+                    try:
+                        import mlx.core as mx
+                        from mlx_lm.generate import generation_stream
+                        warm_prompt = mx.array(
+                            [tokenizer.bos_token_id or 0,
+                             tokenizer.bos_token_id or 0]
+                        )
+                        with mx.stream(generation_stream):
+                            for _tok in mtp_speculative_generate_step(
+                                warm_prompt,
+                                model,
+                                provider.draft_model,
+                                num_draft_tokens=2,
+                                max_tokens=2,
+                                prompt_cache=None,
+                                prefill_step_size=2048,
+                            ):
+                                pass
+                        logging.info("Pre-warmed MTP pipeline.")
+                    except Exception as e:
+                        logging.warning(f"MTP warm-up failed (continuing): {e}")
             except Exception as e:
                 logging.warning(
                     f"Could not install MTP speculative patch: {e}"

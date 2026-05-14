@@ -777,6 +777,7 @@ class ModelManager:
         default_min_p: Optional[float] = None,
         default_repetition_penalty: Optional[float] = None,
         default_repetition_context_size: Optional[int] = None,
+        default_seed: Optional[int] = None,
         enable_counting: bool = False,
         prompt_cache_size: int = 10,
         trust_remote_code: bool = False,
@@ -803,6 +804,7 @@ class ModelManager:
             "min_p": default_min_p,
             "repetition_penalty": default_repetition_penalty,
             "repetition_context_size": default_repetition_context_size,
+            "seed": default_seed,
         }
         self._enable_counting = enable_counting
         self._prompt_cache_size = prompt_cache_size
@@ -972,14 +974,17 @@ class ModelManager:
 
         logging.info(f"Loading model: {resolved_path}")
 
-        # Resolve chat template BEFORE loading the tokenizer so it overrides the
-        # bundled template AND so _infer_tool_parser sees our template (the
-        # bundled one for some GLM-5.1 quants does not contain <arg_key>, which
-        # would leave the tokenizer with no tool parser).
+        # Resolve chat template BEFORE loading the tokenizer. Priority is now:
+        #   1. explicit --chat-template (path or inline)
+        #   2. the model directory's own chat_template.jinja (matches upstream
+        #      HF and is per-version-accurate, e.g. MiniMax-2.5 vs M2.7 differ
+        #      only in the identity string)
+        #   3. bundled template by model_type (legacy fallback for quants that
+        #      shipped without a chat_template.jinja or with a broken one)
         pre_config = load_config(Path(resolved_path))
         pre_model_type = pre_config.get("model_type", "")
         chat_template_content = _resolve_chat_template(
-            self._chat_template, pre_model_type
+            self._chat_template, pre_model_type, Path(resolved_path)
         )
 
         tokenizer_config = {}
@@ -996,32 +1001,104 @@ class ModelManager:
 
         model_type = config.get("model_type", "")
 
-        # Kimi-K2.6 quants have two tool-call quirks vs upstream Kimi-K2:
-        #   1. ids of the form ``tool_call_N`` (sequential index, no
-        #      function name) instead of ``functions.NAME:0``;
-        #   2. tool-call blocks emitted *without* the surrounding
-        #      ``<|tool_calls_section_begin|>...<|tool_calls_section_end|>``
-        #      wrapper, which means mlx-lm's streaming state machine
-        #      never flips into "tool" mode and the raw <|tool_call_*|>
-        #      tokens leak through as content text.
-        # Swap in a permissive parser AND retarget the streaming
-        # boundaries to the per-call markers so each block is captured
-        # individually whether or not the section wrapper is present.
-        if model_type == "kimi_k25":
-            from . import kimi_k26_tool_parser
-            tokenizer._tool_parser = kimi_k26_tool_parser.parse_tool_call
+        # Disable mlx-lm's <think>/</think> channel separation on the
+        # OpenAI Chat-Completions and Anthropic Messages endpoints we
+        # expose. mlx-lm ships a `SequenceStateMachine` that tags each
+        # generated token as `normal | reasoning | tool` and the server
+        # routes `reasoning`-tagged tokens into a non-standard
+        # `reasoning_content` field instead of `content`. This is fine
+        # for clients that look at that field (some OpenAI-compat tools
+        # do), but it breaks any client that follows the canonical
+        # `/v1/chat/completions` schema, which has no such field and
+        # expects everything in `content`.
+        #
+        # The pain shows up on models whose chat templates pre-open a
+        # `<think>` block in the prompt suffix (MiniMax-M2.7's
+        # chat_template.jinja appends `]~b]ai\n<think>\n` unconditionally
+        # at `add_generation_prompt`). mlx-lm's `_tokenize` sees the
+        # open `<think>` and starts the state machine in `reasoning`
+        # mode; every token until `</think>` lands in `reasoning_text`
+        # and `content` stays empty. If the model takes its full
+        # max_tokens budget to close the thinking block (which it does
+        # on hard prompts), the client receives a response with empty
+        # content and several thousand tokens of reasoning_content,
+        # which the canonical-API agent loop can't act on.
+        #
+        # LM Studio + its `mlx-engine` don't do this routing — they
+        # yield raw text segments and let the client split `<think>`
+        # tags itself. We mimic that by flipping `has_thinking` off:
+        # `_make_state_machine` will not add the reasoning transitions
+        # and `_tokenize` will not force `initial_state="reasoning"`.
+        # Tool-call detection is unaffected (the `tool` state lives on
+        # `has_tool_calling`, a separate flag) and EOS still terminates.
+        # Result: the stream contains the raw model output including
+        # literal `<think>...</think>` tags inline in `content`, which
+        # SAC's openai client and any canonical-OpenAI agent already
+        # know how to handle.
+        # NOTE: ``has_thinking`` is a read-only property on mlx-lm's
+        # ``TokenizerWrapper``; assigning ``False`` to it is silently
+        # ignored.  We must clear the underlying ``_think_start`` state
+        # so that the property returns ``False`` and mlx-lm's state
+        # machine skips reasoning transitions entirely.
+        #
+        # IMPORTANT: only apply this when the chat template's
+        # `add_generation_prompt` actually pre-opens a literal `<think>`
+        # tag in the prompt suffix (MiniMax-M2.7 case). Models like Gemma 4
+        # that use channel-paired reasoning (`<|channel>thought ...
+        # <|channel>final`) ALSO have `has_thinking=True`, but their state
+        # machine correctly routes thought-channel tokens into
+        # `reasoning_content` and final-channel tokens into `content`.
+        # Clearing _think_start for them just disables proper routing and
+        # the model emits raw channel markup as `content`, which SAC
+        # sees as 0 chars / 0 tool calls (validation failure).
+        forced_think = False
+        try:
+            suffix = tokenizer.apply_chat_template(
+                [{"role": "user", "content": ""}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            forced_think = suffix.rstrip().endswith("<think>")
+        except Exception as e:
+            logging.warning(f"Could not probe chat template for prompt-forced think: {e}")
+
+        if forced_think and getattr(tokenizer, "has_thinking", False):
+            tokenizer._think_start = None
+            tokenizer._think_end = None
+            tokenizer._think_start_tokens = None
+            tokenizer._think_end_tokens = None
+            logging.info(
+                "Disabled mlx-lm thinking channel separation "
+                "(cleared _think_start / _think_start_tokens) — chat template "
+                "pre-opens <think>. Model output, including <think>...</think> "
+                "tags, will stream as `content` per canonical OpenAI/Anthropic "
+                "semantics."
+            )
+        elif getattr(tokenizer, "has_thinking", False):
+            logging.info(
+                "Left mlx-lm thinking state machine ACTIVE "
+                "(channel-paired reasoning model, no prompt-forced <think>). "
+                "Thought-channel tokens will route into `reasoning_content` "
+                "and final-channel tokens into `content`."
+            )
+
+        # Per-model template dialect: reshapes incoming JSON to what the
+        # Jinja template expects, and supplies the tool-call output parser
+        # mlx-lm's ToolCallFormatter uses. See ``mlx_fun.dialect``.
+        from .dialect import resolve_dialect
+        dialect = resolve_dialect(model_type, chat_template_content)
+        tokenizer._tool_parser = dialect.parse_output
+        if dialect.name == "kimi":
+            # Kimi-K2.6 quants emit tool-call blocks without the surrounding
+            # <|tool_calls_section_begin|>...<|tool_calls_section_end|>
+            # wrapper, so retarget the streaming state machine to per-call
+            # markers.
             tokenizer._tool_call_start = "<|tool_call_begin|>"
             tokenizer._tool_call_end = "<|tool_call_end|>"
-            # Bust mlx-lm's per-tokenizer state-machine cache so the new
-            # boundaries take effect on the next request.
-            try:
-                self._provider  # placeholder; cache lives on the generator
-            except Exception:
-                pass
-            logging.info(
-                "Installed kimi_k26 permissive tool-call parser; "
-                "streaming boundaries set to <|tool_call_begin|>/<|tool_call_end|>"
-            )
+        logging.info(
+            f"Resolved template dialect: {dialect.name} "
+            f"(model_type={model_type or '?'})"
+        )
 
         # Set up MoE adapter + hooks. Off by default — pass --enable-counting
         # if you want /v1/reap/save and /v1/reap/stats to return routing data.
@@ -1107,8 +1184,16 @@ class ModelManager:
                 from .mtp_speculative import (
                     is_mtp_drafter, mtp_stream_generate,
                     mtp_speculative_generate_step,
+                    install_lru_compatible_drafter_cache,
                 )
                 if is_mtp_drafter(provider.draft_model):
+                    # Rebind drafter's make_cache so the per-layer slots are
+                    # LRU-friendly zero-byte stubs instead of ``None``. Without
+                    # this, mlx-lm's LRUPromptCache.insert_cache crashes on
+                    # ``None.nbytes`` after every generation, the exception is
+                    # silently dropped (post-stream), and no request ever
+                    # populates the cache — every probe is a cold miss.
+                    install_lru_compatible_drafter_cache(provider.draft_model)
                     import mlx_lm.generate as _gen_mod
                     import mlx_lm.server as _srv_mod
                     if not getattr(_gen_mod, "_mlx_fun_mtp_patched", False):
@@ -1118,17 +1203,29 @@ class ModelManager:
                         logging.info(
                             "Detected gemma4_assistant drafter — installed "
                             "MTP-aware stream_generate (greedy speculative "
-                            "decoding via mtp_speculative_generate_step)."
+                            "decoding via mtp_speculative_generate_step) and "
+                            "LRU-compatible drafter cache stubs."
                         )
 
                     # Warm the MTP pipeline (pre_projection, drafter layers,
-                    # post_projection) under generation_stream by running a
-                    # tiny generation. Same rationale as the backbone warm-up
-                    # above — first compile invocation needs to capture
-                    # generation_stream as its stream affinity.
+                    # post_projection, cache trim, second-iter resume) under
+                    # generation_stream by running a small but multi-iteration
+                    # generation. The trim block and the second outer iter of
+                    # ``mtp_speculative_generate_step`` only fire when the loop
+                    # yields more than (1 + num_draft_tokens + 1) tokens —
+                    # otherwise the function exits before those kernels are
+                    # ever traced, so the FIRST real request that needs more
+                    # than ~5 tokens pays a ~9 s JIT-compile cost mid-stream
+                    # and looks indistinguishable from a hang to the client.
+                    # With K = self._num_draft_tokens, picking
+                    # max_tokens = 3*(K+1) + 1 guarantees at least three outer
+                    # iterations execute end-to-end, which is enough to JIT
+                    # every shape the steady-state loop reuses.
                     try:
                         import mlx.core as mx
                         from mlx_lm.generate import generation_stream
+                        warm_K = max(1, self._num_draft_tokens)
+                        warm_max = 3 * (warm_K + 1) + 1
                         warm_prompt = mx.array(
                             [tokenizer.bos_token_id or 0,
                              tokenizer.bos_token_id or 0]
@@ -1138,13 +1235,16 @@ class ModelManager:
                                 warm_prompt,
                                 model,
                                 provider.draft_model,
-                                num_draft_tokens=2,
-                                max_tokens=2,
+                                num_draft_tokens=warm_K,
+                                max_tokens=warm_max,
                                 prompt_cache=None,
                                 prefill_step_size=2048,
                             ):
                                 pass
-                        logging.info("Pre-warmed MTP pipeline.")
+                        logging.info(
+                            f"Pre-warmed MTP pipeline "
+                            f"(K={warm_K}, max_tokens={warm_max})."
+                        )
                     except Exception as e:
                         logging.warning(f"MTP warm-up failed (continuing): {e}")
             except Exception as e:
@@ -1198,6 +1298,9 @@ class ModelManager:
 
         prompt_cache = LRUPromptCache(self._prompt_cache_size)
         response_generator = ResponseGenerator(provider, prompt_cache)
+        # Stash the resolved dialect so request handlers can call
+        # ``response_generator.dialect.shape_request(...)`` before generation.
+        response_generator.dialect = dialect
 
         # Swap state under lock
         with self._lock:
@@ -1402,14 +1505,19 @@ _MODEL_TYPE_TEMPLATES = {
 
 
 def _resolve_chat_template(
-    chat_template: Optional[str], model_type: str
+    chat_template: Optional[str],
+    model_type: str,
+    model_dir: Optional[Path] = None,
 ) -> Optional[str]:
     """Resolve chat template to a Jinja string.
 
     Priority:
       1. Explicit value — if it's a file path, read it; otherwise use as-is.
-      2. Auto-detect from model_type using bundled templates.
-      3. None — let the tokenizer's built-in template (if any) handle it.
+      2. The model directory's own ``chat_template.jinja`` (per-version-accurate
+         and tracks upstream HF). Falls through if the file is missing.
+      3. Bundled template by model_type — legacy fallback for quants that
+         shipped without a chat_template.jinja or with a broken one.
+      4. None — let the tokenizer's built-in template (if any) handle it.
     """
     if chat_template:
         p = Path(chat_template)
@@ -1419,14 +1527,24 @@ def _resolve_chat_template(
         # Assume it's an inline Jinja string
         return chat_template
 
-    # Auto-detect from model_type
+    if model_dir is not None:
+        standalone = Path(model_dir) / "chat_template.jinja"
+        if standalone.is_file():
+            logging.info(
+                f"Using model's own chat template: {standalone.name} "
+                f"(model_type={model_type})"
+            )
+            return standalone.read_text()
+
+    # Bundled fallback
     template_name = _MODEL_TYPE_TEMPLATES.get(model_type)
     if template_name:
         template_dir = Path(__file__).parent / "templates"
         template_path = template_dir / template_name
         if template_path.is_file():
             logging.info(
-                f"Auto-selected chat template for {model_type}: {template_name}"
+                f"Falling back to bundled chat template for {model_type}: "
+                f"{template_name}"
             )
             return template_path.read_text()
         else:
@@ -1692,6 +1810,25 @@ class ReapAPIHandler:
                             )
                             return
 
+                        # DEBUG: dump the incoming OpenAI-shape JSON body
+                        # (env-gated on MLX_FUN_DUMP_PROMPTS=1). Pairs by
+                        # timestamp with the after-template prompt dump
+                        # written later in handle_completion. Together they
+                        # give a per-turn (request, rendered-prompt) record.
+                        if os.environ.get("MLX_FUN_DUMP_PROMPTS"):
+                            try:
+                                ts = time.strftime("%Y%m%d_%H%M%S")
+                                dump_path = f"/tmp/mlx_fun_request_{ts}_{id(body) & 0xffff:04x}.json"
+                                with open(dump_path, "w") as f:
+                                    json.dump(body, f, indent=2, default=str)
+                                logging.info(
+                                    f"REQUEST DUMP → {dump_path} "
+                                    f"({len(raw)} bytes, {len(body.get('messages', []))} messages, "
+                                    f"{len(body.get('tools', []) or [])} tools)"
+                                )
+                            except Exception as e:
+                                logging.warning(f"Request dump failed: {e}")
+
                         model_id = body.get("model", "default")
                         try:
                             self._ensure_model(model_id)
@@ -1743,6 +1880,24 @@ class ReapAPIHandler:
                     ToolCallFormatter,
                 )
 
+                # Reshape messages/tools through the model's dialect (e.g.
+                # Qwen3.5 needs tool_call.arguments as dict for the Jinja
+                # `|items` filter). No-op for the OpenAI passthrough dialect,
+                # and skipped entirely for raw /v1/completions text mode.
+                dialect = getattr(self.response_generator, "dialect", None)
+                if dialect is not None and request.request_type == "chat":
+                    try:
+                        new_messages, new_tools = dialect.shape_request(
+                            request.messages, request.tools, None,
+                        )
+                        request.messages = new_messages
+                        request.tools = new_tools
+                    except Exception as e:
+                        logging.warning(
+                            f"dialect.shape_request failed ({dialect.name}): {e}; "
+                            f"falling back to raw messages"
+                        )
+
                 args = GenerationArguments(
                     model=ModelDescription(
                         model=self.requested_model,
@@ -1792,6 +1947,58 @@ class ReapAPIHandler:
                     self.wfile.write(json.dumps({"error": str(e)}).encode())
                     return
 
+                # DEBUG: dump the exact prompt the model saw (env-gated).
+                # Set MLX_FUN_DUMP_PROMPTS=1 to capture every request's
+                # tokenized-then-decoded prompt into /tmp/mlx_fun_prompt_*.txt
+                # so we can diff turn 1 vs turn 2 of a tool-using session and
+                # compare to what LM Studio renders. Pairs with a sidecar
+                # /tmp/mlx_fun_kwargs_<ts>_<hex>.json containing the
+                # GenerationArguments (sampling / logits / seed / etc.) so we
+                # can spot LM-Studio-injected defaults like top_k=100 or
+                # repetition_penalty=1.1 that mlx_fun isn't applying.
+                if os.environ.get("MLX_FUN_DUMP_PROMPTS"):
+                    try:
+                        tok = self.response_generator.model_provider.tokenizer
+                        decoder = getattr(tok, "decode", None) or tok._tokenizer.decode
+                        prompt_text = decoder(ctx.prompt)
+                        ts = time.strftime("%Y%m%d_%H%M%S")
+                        suffix = f"{ts}_{id(ctx) & 0xffff:04x}"
+                        dump_dir = os.environ.get("MLX_FUN_DUMP_DIR", "/tmp")
+                        os.makedirs(dump_dir, exist_ok=True)
+                        dump_path = f"{dump_dir}/mlx_fun_prompt_{suffix}.txt"
+                        with open(dump_path, "w") as f:
+                            f.write(prompt_text)
+                        logging.info(
+                            f"PROMPT DUMP → {dump_path} "
+                            f"({len(prompt_text)} chars, {len(ctx.prompt)} tokens)"
+                        )
+
+                        try:
+                            import dataclasses as _dc
+                            args_dict = _dc.asdict(args) if _dc.is_dataclass(args) else None
+                        except Exception:
+                            args_dict = None
+                        if args_dict is None:
+                            args_dict = {
+                                k: getattr(args, k, None)
+                                for k in (
+                                    "sampling", "logits", "stop_words",
+                                    "max_tokens", "num_draft_tokens",
+                                    "logprobs", "top_logprobs", "seed",
+                                    "chat_template_kwargs",
+                                )
+                            }
+                        kwargs_path = f"{dump_dir}/mlx_fun_kwargs_{suffix}.json"
+                        payload = {
+                            "prompt_token_count": len(ctx.prompt),
+                            "kwargs": args_dict,
+                        }
+                        with open(kwargs_path, "w") as f:
+                            json.dump(payload, f, indent=2, default=repr, sort_keys=True)
+                        logging.info(f"KWARGS DUMP → {kwargs_path}")
+                    except Exception as e:
+                        logging.warning(f"Prompt/kwargs dump failed: {e}")
+
                 if self.stream:
                     self._set_stream_headers(200)
                     self.end_headers()
@@ -1803,7 +2010,16 @@ class ReapAPIHandler:
                 def tool_formatter(tc):
                     """Safe wrapper: log raw input and fall back to empty on parse errors."""
                     try:
-                        return _raw_formatter(tc)
+                        result = _raw_formatter(tc)
+                        if tc and not result and os.environ.get("MLX_FUN_LOG_TOOL_TEXT"):
+                            # Parser returned empty for a non-empty tool buffer —
+                            # dialect regex didn't match the model's output shape.
+                            logging.warning(
+                                "Tool call parse returned EMPTY (dialect=%s) "
+                                "for non-empty tool_text: %r",
+                                getattr(dialect, "name", "?"), tc,
+                            )
+                        return result
                     except (ValueError, SyntaxError, KeyError) as e:
                         logging.warning(
                             "Tool call parse FAILED: %s\n"
@@ -1827,6 +2043,36 @@ class ReapAPIHandler:
                 token_logprobs = []
                 top_tokens = []
 
+                # Detect "prompt-forced <think> open" mode.
+                #
+                # Chat templates like MiniMax-2.7 unconditionally append
+                # `<think>\n` at `add_generation_prompt`, so the model starts
+                # generating already inside a thinking block. Its output is
+                # `reasoning</think>\n\n<tool_call>` — i.e. only the CLOSING
+                # tag appears in the model's tokens; the opener lives in the
+                # prompt prefix.
+                #
+                # With our `has_thinking=False` patch, mlx-lm's state machine
+                # has no reasoning channel and dumps everything into `normal`.
+                # That gives an OpenAI response with a malformed `content`
+                # (orphan `</think>`, no opener) — not the canonical shape.
+                #
+                # Fix: do the channel split ourselves on the assembled output.
+                # Buffer `normal`-state text in `forced_think_buffer`; when we
+                # see `</think>`, route the pre-part into `reasoning_text`,
+                # the post-part into `text`, drop the tag, exit forced mode.
+                # If generation ends without seeing the close tag, flush the
+                # entire buffer into `reasoning_text`.
+                forced_think_open = False
+                forced_think_buffer = ""
+                try:
+                    _tok = self.response_generator.model_provider.tokenizer
+                    _decoder = getattr(_tok, "decode", None) or _tok._tokenizer.decode
+                    _tail = _decoder(ctx.prompt[-32:])
+                    forced_think_open = _tail.rstrip().endswith("<think>")
+                except Exception:
+                    pass
+
                 # Timing
                 t_generate_start = time.perf_counter()
                 t_first_token = None
@@ -1836,16 +2082,58 @@ class ReapAPIHandler:
                         if t_first_token is None:
                             t_first_token = time.perf_counter()
 
+                        # State-transition log (MLX_FUN_LOG_TOOL_TEXT=1).
+                        if (
+                            os.environ.get("MLX_FUN_LOG_TOOL_TEXT")
+                            and gen.state != prev_state
+                        ):
+                            logging.info(
+                                "STATE %s -> %s (token=%r finish=%s)",
+                                prev_state, gen.state, gen.text,
+                                gen.finish_reason,
+                            )
+
+                        # If we just left the tool state (either back to
+                        # normal *or* re-entered <think>), flush the buffered
+                        # tool_call body. mlx_lm now allows tool calls inside
+                        # a <think> block, so tool->reasoning is a real edge.
+                        if prev_state == "tool" and gen.state != "tool":
+                            if tool_text:
+                                if os.environ.get("MLX_FUN_LOG_TOOL_TEXT"):
+                                    logging.info(
+                                        "TOOL_TEXT flush mid-stream "
+                                        "(dialect=%s, len=%d): %r",
+                                        getattr(dialect, "name", "?"),
+                                        len(tool_text), tool_text[:2000],
+                                    )
+                                tool_calls.append(tool_text)
+                                tool_text = ""
+                                made_tool_call = True
+
                         if gen.state == "reasoning":
                             reasoning_text += gen.text
                         elif gen.state == "tool":
                             tool_text += gen.text
                         elif gen.state == "normal":
-                            if prev_state == "tool":
-                                tool_calls.append(tool_text)
-                                tool_text = ""
-                                made_tool_call = True
-                            text += gen.text
+                            if forced_think_open:
+                                forced_think_buffer += gen.text
+                                if "</think>" in forced_think_buffer:
+                                    pre, post = forced_think_buffer.split("</think>", 1)
+                                    # Drop leading newlines that templates put
+                                    # between </think> and the visible reply.
+                                    post = post.lstrip("\n")
+                                    reasoning_text += pre
+                                    text += post
+                                    forced_think_open = False
+                                    forced_think_buffer = ""
+                                elif len(forced_think_buffer) > 16:
+                                    # Safe flush: keep last 16 chars (longer
+                                    # than "</think>") in case the close tag
+                                    # straddles a token boundary.
+                                    reasoning_text += forced_think_buffer[:-16]
+                                    forced_think_buffer = forced_think_buffer[-16:]
+                            else:
+                                text += gen.text
 
                         tokens.append(gen.token)
                         if args.logprobs:
@@ -1874,8 +2162,20 @@ class ReapAPIHandler:
                         prev_state = gen.state
 
                     if prev_state == "tool" and tool_text:
+                        if os.environ.get("MLX_FUN_LOG_TOOL_TEXT"):
+                            logging.info(
+                                "TOOL_TEXT flush at EOS "
+                                "(dialect=%s, len=%d): %r",
+                                getattr(dialect, "name", "?"),
+                                len(tool_text), tool_text[:2000],
+                            )
                         tool_calls.append(tool_text)
                         made_tool_call = True
+                    # EOS-mid-think: flush remaining buffer into reasoning so
+                    # we don't drop content and don't leak an orphan tag.
+                    if forced_think_buffer:
+                        reasoning_text += forced_think_buffer
+                        forced_think_buffer = ""
                     if finish_reason == "stop" and made_tool_call:
                         finish_reason = "tool_calls"
 
@@ -2181,6 +2481,18 @@ class ReapAPIHandler:
                     })
                     return
 
+                # Reshape messages for the model's chat template (e.g. Qwen3.5
+                # needs tool_call.arguments as dict, not JSON string).
+                dialect = getattr(self.response_generator, "dialect", None)
+                if dialect is not None:
+                    try:
+                        messages, tools = dialect.shape_request(messages, tools, None)
+                    except Exception as e:
+                        logging.warning(
+                            f"dialect.shape_request failed ({dialect.name}): {e}; "
+                            f"falling back to raw messages"
+                        )
+
                 # Inject server-wide sampling defaults the client did not set
                 model_manager.apply_sampling_defaults(body)
 
@@ -2192,6 +2504,19 @@ class ReapAPIHandler:
                 min_p = body.get("min_p", self.response_generator.cli_args.min_p)
                 repetition_penalty = body.get("repetition_penalty", 0.0)
                 repetition_context_size = body.get("repetition_context_size", 20)
+                seed = body.get("seed", None)
+
+                # Anthropic's `thinking: {"type": "enabled"|"disabled", ...}`
+                # → forward to the chat template as `enable_thinking`.
+                # budget_tokens has no mlx-lm equivalent and is ignored.
+                chat_template_kwargs = None
+                thinking_param = body.get("thinking")
+                if isinstance(thinking_param, dict):
+                    t = thinking_param.get("type")
+                    if t == "enabled":
+                        chat_template_kwargs = {"enable_thinking": True}
+                    elif t == "disabled":
+                        chat_template_kwargs = {"enable_thinking": False}
 
                 # Build generation arguments
                 request = CompletionRequest("chat", "", messages, tools, None)
@@ -2219,8 +2544,8 @@ class ReapAPIHandler:
                     num_draft_tokens=self.response_generator.cli_args.num_draft_tokens,
                     logprobs=False,
                     top_logprobs=-1,
-                    seed=None,
-                    chat_template_kwargs=None,
+                    seed=seed,
+                    chat_template_kwargs=chat_template_kwargs,
                 )
 
                 # Generate
@@ -2232,6 +2557,50 @@ class ReapAPIHandler:
                         "error": {"type": "api_error", "message": str(e)},
                     })
                     return
+
+                # DEBUG: dump the exact prompt the model saw (env-gated, anthropic path)
+                if os.environ.get("MLX_FUN_DUMP_PROMPTS"):
+                    try:
+                        tok = self.response_generator.model_provider.tokenizer
+                        decoder = getattr(tok, "decode", None) or tok._tokenizer.decode
+                        prompt_text = decoder(ctx.prompt)
+                        ts = time.strftime("%Y%m%d_%H%M%S")
+                        suffix = f"{ts}_{id(ctx) & 0xffff:04x}_anth"
+                        dump_dir = os.environ.get("MLX_FUN_DUMP_DIR", "/tmp")
+                        os.makedirs(dump_dir, exist_ok=True)
+                        dump_path = f"{dump_dir}/mlx_fun_prompt_{suffix}.txt"
+                        with open(dump_path, "w") as f:
+                            f.write(prompt_text)
+                        logging.info(
+                            f"PROMPT DUMP → {dump_path} "
+                            f"({len(prompt_text)} chars, {len(ctx.prompt)} tokens)"
+                        )
+
+                        try:
+                            import dataclasses as _dc
+                            args_dict = _dc.asdict(args) if _dc.is_dataclass(args) else None
+                        except Exception:
+                            args_dict = None
+                        if args_dict is None:
+                            args_dict = {
+                                k: getattr(args, k, None)
+                                for k in (
+                                    "sampling", "logits", "stop_words",
+                                    "max_tokens", "num_draft_tokens",
+                                    "logprobs", "top_logprobs", "seed",
+                                    "chat_template_kwargs",
+                                )
+                            }
+                        kwargs_path = f"{dump_dir}/mlx_fun_kwargs_{suffix}.json"
+                        payload = {
+                            "prompt_token_count": len(ctx.prompt),
+                            "kwargs": args_dict,
+                        }
+                        with open(kwargs_path, "w") as f:
+                            json.dump(payload, f, indent=2, default=repr, sort_keys=True)
+                        logging.info(f"KWARGS DUMP → {kwargs_path}")
+                    except Exception as e:
+                        logging.warning(f"Prompt/kwargs dump failed: {e}")
 
                 if stream:
                     self._anthropic_stream_response(
@@ -2257,6 +2626,7 @@ class ReapAPIHandler:
                 from mlx_lm.server import ToolCallFormatter
 
                 text = ""
+                reasoning_text = ""
                 tokens = []
                 finish_reason = "stop"
                 tool_text = ""
@@ -2271,15 +2641,21 @@ class ReapAPIHandler:
                         if t_first_token is None:
                             t_first_token = time.perf_counter()
 
-                        if gen.state == "tool":
-                            tool_text += gen.text
-                        elif gen.state == "normal":
-                            if prev_state == "tool":
+                        # Flush a completed tool body on any tool→non-tool
+                        # transition. With reasoning↔tool now legal (see
+                        # _make_state_machine), tool→reasoning is also valid.
+                        if prev_state == "tool" and gen.state != "tool":
+                            if tool_text:
                                 tool_calls.append(tool_text)
                                 tool_text = ""
                                 made_tool_call = True
+
+                        if gen.state == "tool":
+                            tool_text += gen.text
+                        elif gen.state == "normal":
                             text += gen.text
-                        # reasoning state: tokens skipped in Anthropic output
+                        elif gen.state == "reasoning":
+                            reasoning_text += gen.text
 
                         tokens.append(gen.token)
                         if gen.finish_reason is not None:
@@ -2315,6 +2691,7 @@ class ReapAPIHandler:
                     completion_tokens=len(tokens),
                     model=model_name,
                     tool_calls=parsed_tool_calls or None,
+                    reasoning_text=reasoning_text or None,
                 )
                 resp["perf"] = _build_perf_block(
                     len(ctx.prompt), len(tokens),
@@ -2335,8 +2712,16 @@ class ReapAPIHandler:
                                            cb_delta, cb_stop, msg_delta,
                                            msg_stop, map_stop_reason_fn,
                                            request_tools=None):
-                """Stream generation as Anthropic SSE events."""
+                """Stream generation as Anthropic SSE events.
+
+                Block layout is allocated lazily based on what the model
+                actually emits: a thinking block opens on the first
+                `reasoning` token, a text block on the first `normal` token,
+                then tool_use blocks for each parsed tool call. Anthropic
+                requires content_block_stop before opening the next index.
+                """
                 from mlx_lm.server import ToolCallFormatter
+                from .api_compat import anthropic_stream_content_block_delta_thinking
 
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -2344,39 +2729,101 @@ class ReapAPIHandler:
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
 
-                # 1. message_start
+                # 1. message_start (always first)
                 self.wfile.write(fmt_sse("message_start", msg_start(model_name, len(ctx.prompt))))
                 self.wfile.flush()
 
-                # 2. content_block_start (text block at index 0)
-                self.wfile.write(fmt_sse("content_block_start", cb_start(0, "text")))
-                self.wfile.flush()
-
-                # 3. Stream content_block_delta for each token
+                # 2. Stream content blocks. Indices are allocated as blocks
+                #    open; no block is opened before its first token arrives.
                 tokens = []
                 finish_reason = "stop"
                 tool_text = ""
                 tool_calls = []
                 prev_state = None
-                text_block_open = True
+                next_index = 0
+                thinking_index = None
+                text_index = None
                 t_generate_start = time.perf_counter()
                 t_first_token = None
+
+                def open_thinking():
+                    nonlocal next_index, thinking_index
+                    thinking_index = next_index
+                    next_index += 1
+                    self.wfile.write(fmt_sse(
+                        "content_block_start",
+                        cb_start(thinking_index, "thinking"),
+                    ))
+                    self.wfile.flush()
+
+                def close_thinking():
+                    nonlocal thinking_index
+                    if thinking_index is not None:
+                        self.wfile.write(fmt_sse(
+                            "content_block_stop", cb_stop(thinking_index),
+                        ))
+                        self.wfile.flush()
+                        thinking_index = None
+
+                def open_text():
+                    nonlocal next_index, text_index
+                    text_index = next_index
+                    next_index += 1
+                    self.wfile.write(fmt_sse(
+                        "content_block_start", cb_start(text_index, "text"),
+                    ))
+                    self.wfile.flush()
+
+                def close_text():
+                    nonlocal text_index
+                    if text_index is not None:
+                        self.wfile.write(fmt_sse(
+                            "content_block_stop", cb_stop(text_index),
+                        ))
+                        self.wfile.flush()
+                        text_index = None
+
                 try:
                     for gen in response:
                         if t_first_token is None:
                             t_first_token = time.perf_counter()
                         tokens.append(gen.token)
 
-                        if gen.state == "tool":
-                            tool_text += gen.text
-                        elif gen.state == "normal":
-                            if prev_state == "tool" and tool_text:
+                        # Flush a completed tool body on any tool→non-tool
+                        # transition (tool→normal *or* tool→reasoning).
+                        if prev_state == "tool" and gen.state != "tool":
+                            if tool_text:
                                 tool_calls.append(tool_text)
                                 tool_text = ""
+
+                        if gen.state == "tool":
+                            tool_text += gen.text
+                        elif gen.state == "reasoning":
+                            # Close text block if we were emitting text and
+                            # the model re-enters <think> (rare but legal
+                            # with the cross-state edges we added).
+                            if text_index is not None:
+                                close_text()
+                            if thinking_index is None:
+                                open_thinking()
                             if gen.text:
-                                self.wfile.write(
-                                    fmt_sse("content_block_delta", cb_delta(0, gen.text))
-                                )
+                                self.wfile.write(fmt_sse(
+                                    "content_block_delta",
+                                    anthropic_stream_content_block_delta_thinking(
+                                        thinking_index, gen.text,
+                                    ),
+                                ))
+                                self.wfile.flush()
+                        elif gen.state == "normal":
+                            if thinking_index is not None:
+                                close_thinking()
+                            if text_index is None:
+                                open_text()
+                            if gen.text:
+                                self.wfile.write(fmt_sse(
+                                    "content_block_delta",
+                                    cb_delta(text_index, gen.text),
+                                ))
                                 self.wfile.flush()
 
                         if gen.finish_reason is not None:
@@ -2390,11 +2837,11 @@ class ReapAPIHandler:
 
                 t_end = time.perf_counter()
 
-                # 4. close text block
-                self.wfile.write(fmt_sse("content_block_stop", cb_stop(0)))
-                self.wfile.flush()
+                # 3. Close any still-open content block before tool_use.
+                close_text()
+                close_thinking()
 
-                # 5. emit tool_use blocks if any
+                # 4. Emit tool_use blocks if any
                 parsed_tool_calls = []
                 if tool_calls:
                     raw_formatter = ToolCallFormatter(
@@ -2408,7 +2855,7 @@ class ReapAPIHandler:
                             e, tool_calls,
                         )
 
-                for idx, tc in enumerate(parsed_tool_calls, start=1):
+                for tc in parsed_tool_calls:
                     fn = tc.get("function", tc)
                     args = fn.get("arguments", {})
                     if isinstance(args, str):
@@ -2416,6 +2863,8 @@ class ReapAPIHandler:
                             args = json.loads(args)
                         except (json.JSONDecodeError, ValueError):
                             args = {"_raw": args}
+                    idx = next_index
+                    next_index += 1
                     tu_block = {
                         "type": "tool_use",
                         "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:12]}"),
@@ -2487,6 +2936,7 @@ def run_reap_server(
     default_min_p: Optional[float] = None,
     default_repetition_penalty: Optional[float] = None,
     default_repetition_context_size: Optional[int] = None,
+    default_seed: Optional[int] = None,
     enable_counting: bool = False,
     prompt_cache_size: int = 10,
     trust_remote_code: bool = False,
@@ -2570,6 +3020,7 @@ def run_reap_server(
         default_min_p=default_min_p,
         default_repetition_penalty=default_repetition_penalty,
         default_repetition_context_size=default_repetition_context_size,
+        default_seed=default_seed,
         enable_counting=enable_counting,
         prompt_cache_size=prompt_cache_size,
         trust_remote_code=trust_remote_code,

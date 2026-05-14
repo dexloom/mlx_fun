@@ -121,18 +121,26 @@ def _convert_tool_result(block: dict) -> dict:
 def _convert_assistant_message(content) -> dict:
     """Convert Anthropic assistant message to OpenAI format.
 
-    Handles text blocks and tool_use blocks.
+    Handles text, tool_use, and thinking blocks. thinking blocks map to a
+    `reasoning_content` field on the converted message so the chat templates
+    (which read `reasoning_content`) can re-inject prior thought on follow-up
+    turns. `redacted_thinking` carries no plaintext and is dropped.
     """
     if isinstance(content, str):
         return {"role": "assistant", "content": content}
 
     text_parts = []
     tool_calls = []
+    thinking_parts = []
 
     for block in content:
         block_type = block.get("type", "")
         if block_type == "text":
             text_parts.append(block["text"])
+        elif block_type == "thinking":
+            t = block.get("thinking", "")
+            if t:
+                thinking_parts.append(t)
         elif block_type == "tool_use":
             # Anthropic spec: tool_use.input is a dict.
             # OpenAI spec: tool_calls[].function.arguments is a JSON-encoded
@@ -157,6 +165,8 @@ def _convert_assistant_message(content) -> dict:
         "role": "assistant",
         "content": "\n".join(text_parts) if text_parts else None,
     }
+    if thinking_parts:
+        result["reasoning_content"] = "\n".join(thinking_parts)
     if tool_calls:
         result["tool_calls"] = tool_calls
     return result
@@ -202,9 +212,19 @@ def build_anthropic_response(
     completion_tokens: int,
     model: str,
     tool_calls: Optional[List[dict]] = None,
+    reasoning_text: Optional[str] = None,
 ) -> dict:
-    """Build a complete Anthropic Messages API response."""
+    """Build a complete Anthropic Messages API response.
+
+    Block ordering follows the Anthropic spec: thinking first, then text,
+    then tool_use. Thinking blocks emitted here have no `signature` field —
+    they're informational only; strict Anthropic clients that re-submit
+    signed thinking will reject them. SAC-style local clients that just
+    read `block["thinking"]` work fine.
+    """
     content: List[dict] = []
+    if reasoning_text:
+        content.append({"type": "thinking", "thinking": reasoning_text})
     if text:
         content.append({"type": "text", "text": text})
 
@@ -278,6 +298,8 @@ def anthropic_stream_content_block_start(index: int, block_type: str = "text") -
     block: dict = {"type": block_type}
     if block_type == "text":
         block["text"] = ""
+    elif block_type == "thinking":
+        block["thinking"] = ""
     return {
         "type": "content_block_start",
         "index": index,
@@ -293,6 +315,18 @@ def anthropic_stream_content_block_delta(index: int, text: str) -> dict:
         "delta": {
             "type": "text_delta",
             "text": text,
+        },
+    }
+
+
+def anthropic_stream_content_block_delta_thinking(index: int, text: str) -> dict:
+    """Build a thinking content_block_delta SSE event data."""
+    return {
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {
+            "type": "thinking_delta",
+            "thinking": text,
         },
     }
 

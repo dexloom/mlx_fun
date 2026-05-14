@@ -703,6 +703,10 @@ def smoke_test(model, prompt, max_tokens, kv_compress, kv_compress_bits):
                    "GLM-5.1 Q3 works well at 1.1.")
 @click.option("--default-repetition-context-size", default=None, type=int,
               help="Token window for the repetition penalty (default upstream: 20).")
+@click.option("--default-seed", default=None, type=int,
+              help="Server-wide default sampling seed applied when the request "
+                   "omits it. Useful for reproducing stalls/loops bit-for-bit. "
+                   "Per-request `seed` in the body still wins.")
 @click.option("--enable-counting", is_flag=True, default=False,
               help="Install MoE expert-counting hooks so /v1/reap/save and "
                    "/v1/reap/stats return routing data. Off by default — "
@@ -726,6 +730,7 @@ def serve(model, host, port, mode, auto_save, max_tokens, max_kv_size,
           dflash_block_size, dflash_num_layers, dflash_num_heads, log_level,
           default_temperature, default_top_p, default_top_k, default_min_p,
           default_repetition_penalty, default_repetition_context_size,
+          default_seed,
           enable_counting, prompt_cache_size, trust_remote_code):
     """Serve model with on-demand loading and online expert counting.
 
@@ -794,6 +799,7 @@ def serve(model, host, port, mode, auto_save, max_tokens, max_kv_size,
         default_min_p=default_min_p,
         default_repetition_penalty=default_repetition_penalty,
         default_repetition_context_size=default_repetition_context_size,
+        default_seed=default_seed,
         enable_counting=enable_counting,
         prompt_cache_size=prompt_cache_size,
         trust_remote_code=trust_remote_code,

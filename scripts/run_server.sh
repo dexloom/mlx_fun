@@ -88,6 +88,21 @@ if [[ $WANT_NOTHINK -eq 1 ]]; then
     echo "[run_server] thinking disabled (--no-thinking)" >&2
 fi
 
+# MiniMax-2.x defaults: the model's repetition-loop failure mode on long
+# tool-use sessions doesn't escape with mlx-lm's upstream 20-token window,
+# so default the penalty's lookback to 125. Skip when the caller has
+# already supplied --default-repetition-context-size explicitly.
+case "${MODEL:l}" in
+    *minimax*)
+        HAS_REPCTX=0
+        for a in "$@"; do [[ "$a" == "--default-repetition-context-size" ]] && HAS_REPCTX=1; done
+        if [[ $HAS_REPCTX -eq 0 ]]; then
+            set -- --default-repetition-context-size 125 "$@"
+            echo "[run_server] MiniMax: default-repetition-context-size=125 (auto)" >&2
+        fi
+        ;;
+esac
+
 if [[ $WANT_MTP -eq 1 ]]; then
     bb=$(basename "$MODEL")
     drafter_name=""

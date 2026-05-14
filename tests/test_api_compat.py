@@ -10,6 +10,7 @@ from mlx_fun.api_compat import (
     anthropic_stream_message_start,
     anthropic_stream_content_block_start,
     anthropic_stream_content_block_delta,
+    anthropic_stream_content_block_delta_thinking,
     anthropic_stream_content_block_stop,
     anthropic_stream_message_delta,
     anthropic_stream_message_stop,
@@ -461,3 +462,146 @@ class TestEdgeCases:
         }
         messages, _, _ = anthropic_to_openai_messages(body)
         assert messages[0]["content"] == "You are a helpful assistant."
+
+
+# ---------------------------------------------------------------------------
+# Thinking-block round trip (Anthropic <-> OpenAI reasoning_content)
+# ---------------------------------------------------------------------------
+
+
+class TestThinkingBlockConversion:
+    """Anthropic-style thinking blocks must round-trip through the shim."""
+
+    def test_assistant_thinking_block_maps_to_reasoning_content(self):
+        body = {
+            "messages": [
+                {"role": "user", "content": "Pick a number."},
+                {"role": "assistant", "content": [
+                    {"type": "thinking",
+                     "thinking": "Considered 17, 23, 42 — 42 wins.",
+                     "signature": "sig_abc"},
+                    {"type": "text", "text": "I picked 42."},
+                ]},
+                {"role": "user", "content": "Why?"},
+            ],
+            "max_tokens": 100,
+        }
+        messages, _, _ = anthropic_to_openai_messages(body)
+        assert messages[1]["role"] == "assistant"
+        assert messages[1]["content"] == "I picked 42."
+        assert messages[1]["reasoning_content"] == "Considered 17, 23, 42 — 42 wins."
+
+    def test_assistant_thinking_then_tool_use(self):
+        """Tool sub-turn: thinking + tool_use, no text. The MiniMax template
+        actually preserves reasoning for this shape (current user turn)."""
+        body = {
+            "messages": [
+                {"role": "user", "content": "Search news."},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "Tavily for fresh news."},
+                    {"type": "tool_use", "id": "tu_1", "name": "search",
+                     "input": {"q": "MLX"}},
+                ]},
+            ],
+            "max_tokens": 100,
+        }
+        messages, _, _ = anthropic_to_openai_messages(body)
+        asst = messages[1]
+        assert asst["role"] == "assistant"
+        assert asst["content"] is None
+        assert asst["reasoning_content"] == "Tavily for fresh news."
+        assert asst["tool_calls"][0]["function"]["name"] == "search"
+
+    def test_assistant_multiple_thinking_blocks_concatenate(self):
+        body = {
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "Step 1."},
+                    {"type": "thinking", "thinking": "Step 2."},
+                    {"type": "text", "text": "OK."},
+                ]},
+            ],
+            "max_tokens": 100,
+        }
+        messages, _, _ = anthropic_to_openai_messages(body)
+        assert messages[1]["reasoning_content"] == "Step 1.\nStep 2."
+
+    def test_redacted_thinking_dropped(self):
+        body = {
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": [
+                    {"type": "redacted_thinking", "data": "encrypted"},
+                    {"type": "text", "text": "OK."},
+                ]},
+            ],
+            "max_tokens": 100,
+        }
+        messages, _, _ = anthropic_to_openai_messages(body)
+        assert messages[1]["content"] == "OK."
+        assert "reasoning_content" not in messages[1]
+
+    def test_empty_thinking_block_ignored(self):
+        body = {
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": ""},
+                    {"type": "text", "text": "OK."},
+                ]},
+            ],
+            "max_tokens": 100,
+        }
+        messages, _, _ = anthropic_to_openai_messages(body)
+        assert "reasoning_content" not in messages[1]
+
+    def test_response_emits_thinking_first(self):
+        """Anthropic content-block ordering: thinking, then text, then tool_use."""
+        resp = build_anthropic_response(
+            text="The answer is 42.",
+            finish_reason="stop",
+            prompt_tokens=10,
+            completion_tokens=20,
+            model="m",
+            reasoning_text="I reasoned about it.",
+        )
+        types = [b["type"] for b in resp["content"]]
+        assert types == ["thinking", "text"]
+        assert resp["content"][0]["thinking"] == "I reasoned about it."
+        assert resp["content"][1]["text"] == "The answer is 42."
+
+    def test_response_thinking_then_text_then_tool_use(self):
+        resp = build_anthropic_response(
+            text="Let me check.",
+            finish_reason="tool_calls",
+            prompt_tokens=10,
+            completion_tokens=20,
+            model="m",
+            reasoning_text="Need to call search.",
+            tool_calls=[{"id": "tu_1", "function": {
+                "name": "search", "arguments": '{"q": "x"}'}}],
+        )
+        types = [b["type"] for b in resp["content"]]
+        assert types == ["thinking", "text", "tool_use"]
+        assert resp["stop_reason"] == "tool_use"
+
+    def test_response_no_reasoning_unchanged(self):
+        """When reasoning_text is None/empty, no thinking block is emitted."""
+        resp = build_anthropic_response(
+            text="hi", finish_reason="stop",
+            prompt_tokens=1, completion_tokens=1, model="m",
+        )
+        types = [b["type"] for b in resp["content"]]
+        assert types == ["text"]
+
+    def test_thinking_block_start_helper(self):
+        data = anthropic_stream_content_block_start(0, "thinking")
+        assert data["content_block"]["type"] == "thinking"
+        assert data["content_block"]["thinking"] == ""
+
+    def test_thinking_delta_helper(self):
+        data = anthropic_stream_content_block_delta_thinking(0, "step one")
+        assert data["type"] == "content_block_delta"
+        assert data["index"] == 0
+        assert data["delta"] == {"type": "thinking_delta", "thinking": "step one"}

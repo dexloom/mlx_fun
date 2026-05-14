@@ -60,6 +60,90 @@ def is_mtp_drafter(model: nn.Module) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# LRU-compatible null cache for MTP drafter slots
+# ---------------------------------------------------------------------------
+
+
+class _MTPNullCache:
+    """Zero-byte trimmable stub for MTP drafter cache slots.
+
+    The Gemma 4 MTP drafter reuses backbone KV via anchors, so its own
+    per-layer cache slots hold no state. Upstream ``gemma4_assistant.make_cache``
+    returns ``[None] * num_layers`` for that reason.
+
+    The trouble is that mlx-lm's prompt cache LRU treats every entry as a
+    cache-protocol object: ``LRUPromptCache.insert_cache`` calls
+    ``sum(c.nbytes for c in prompt_cache)`` (``models/cache.py:1706``) on
+    the concatenated ``backbone + drafter`` cache list. ``None.nbytes``
+    raises ``AttributeError`` — and crucially this happens *after*
+    ``rqueue.put(None)`` has already closed the response stream, so the
+    exception lands in ``except Exception as e: rqueue.put(e)`` at
+    ``server.py:1023`` where nobody is reading the queue anymore. The
+    error is swallowed silently and the LRU never gets populated — every
+    request is a cold miss even when 90 % of the prompt matches a prior
+    one.
+
+    Replacing the ``None`` slots with this stub satisfies the surface of
+    the cache protocol (``nbytes``, ``is_trimmable``, ``trim``, ``state``,
+    ``meta_state``, ``offset``) without holding any real KV. Storage cost
+    is zero (the stub reports ``nbytes = 0``), so the LRU's byte-budget
+    accounting stays accurate.
+    """
+
+    nbytes = 0
+    offset = 0
+
+    def is_trimmable(self) -> bool:
+        return True
+
+    def trim(self, n: int) -> int:
+        return n
+
+    @property
+    def state(self):
+        return ()
+
+    @state.setter
+    def state(self, value):
+        # Accept but ignore — there is nothing to restore.
+        pass
+
+    @property
+    def meta_state(self):
+        return ()
+
+    @meta_state.setter
+    def meta_state(self, value):
+        pass
+
+
+def install_lru_compatible_drafter_cache(draft_model: nn.Module) -> None:
+    """Rebind ``draft_model.make_cache`` so it returns LRU-friendly stubs
+    instead of ``[None, ...]``. Idempotent.
+
+    Only does anything when ``draft_model`` is a Gemma 4 MTP drafter — for
+    any other drafter type the upstream ``make_cache`` is left alone.
+    """
+    if not is_mtp_drafter(draft_model):
+        return
+    if getattr(draft_model, "_mlx_fun_mtp_cache_patched", False):
+        return
+    try:
+        num_layers = draft_model.text_args.num_hidden_layers
+    except AttributeError:
+        # Defensive: if the model exposes ``model.layers`` instead, use that.
+        num_layers = len(getattr(getattr(draft_model, "model", None), "layers", []))
+        if num_layers == 0:
+            return
+
+    def _make_cache_stubs():
+        return [_MTPNullCache() for _ in range(num_layers)]
+
+    draft_model.make_cache = _make_cache_stubs
+    draft_model._mlx_fun_mtp_cache_patched = True
+
+
+# ---------------------------------------------------------------------------
 # Anchor selection
 # ---------------------------------------------------------------------------
 
@@ -166,6 +250,7 @@ def mtp_speculative_generate_step(
     ] = None,
     prompt_cache: Optional[List[Any]] = None,
     prefill_step_size: int = 2048,
+    prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     **_unused,
 ) -> Generator[Tuple[int, mx.array, bool], None, None]:
     """MTP speculative decoding generator.
@@ -221,6 +306,16 @@ def mtp_speculative_generate_step(
     committed: List[int] = list(prompt.tolist())  # for logits_processors context
 
     # ---- prefill (chunked) ----
+    total_prompt = int(prompt.size)
+    processed = 0
+    if prompt_progress_callback is not None:
+        # Initial tick so the server can emit ``Prompt processing progress:
+        # 0/N`` and the SSE keepalive before any GPU work starts. Mirrors
+        # the upstream mlx-lm prefill behavior.
+        try:
+            prompt_progress_callback(processed, total_prompt)
+        except Exception:
+            pass
     with mx.stream(_gs):
         y = prompt.astype(mx.uint32)
         while y.size > prefill_step_size:
@@ -228,6 +323,12 @@ def mtp_speculative_generate_step(
             mx.eval([c.state for c in cache if c is not None])
             y = y[prefill_step_size:]
             mx.clear_cache()
+            processed += prefill_step_size
+            if prompt_progress_callback is not None:
+                try:
+                    prompt_progress_callback(processed, total_prompt)
+                except Exception:
+                    pass
 
         last_hidden = inner(y[None], cache=cache)
         last_h = last_hidden[:, -1:, :]
@@ -473,11 +574,14 @@ def mtp_stream_generate(
 
     detok = tokenizer.detokenizer
     kwargs.pop("max_kv_size", None)
-    kwargs.pop("prompt_progress_callback", None)
     # mlx_lm passes these for the upstream loop; we don't use them.
     kwargs.pop("kv_bits", None)
     kwargs.pop("kv_group_size", None)
     kwargs.pop("quantized_kv_start", None)
+    # Forward prompt_progress_callback into the MTP prefill so the server
+    # can keep emitting "Prompt processing progress: N/M" log lines and
+    # SSE ": keepalive N/M" comments during chunked prefill, exactly like
+    # the upstream stream_generate path.
 
     gen = mtp_speculative_generate_step(
         prompt, model, draft_model,

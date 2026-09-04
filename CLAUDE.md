@@ -27,6 +27,7 @@ mlx-fun steer --help
 mlx-fun abliterate --help
 mlx-fun domain-scan --help
 mlx-fun domain-probe --help
+mlx-fun refusal-probe --help
 mlx-fun amplify --help
 mlx-fun convert-nvfp4 --help
 mlx-fun ui --help
@@ -59,10 +60,11 @@ src/mlx_fun/
 ├── convert_nvfp4.py       # NVIDIA NVFP4 (modelopt) -> MLX NVFP4 checkpoint converter
 ├── domain.py              # Domain expert identification, amplification bias computation, gate modification
 ├── probe.py               # Q&A expert relevance: routing trace over answers + knockout verification
+├── refusal.py             # Guardrail experts: refused-vs-answered routing + regenerate-and-classify knockout
 ├── frontend.py            # Gradio web dashboard: chat, heatmaps, steering controls, server management
 ├── data.py                # JSONL + directory dataset loading with random subsampling
 ├── save.py                # mlx_lm.utils.save_model + reap/ream/abliteration/amplification metadata
-└── cli.py                 # Click CLI: collect, prune, merge, smoke-test, serve, ui, safety-scan, steer, abliterate, domain-scan, domain-probe, amplify
+└── cli.py                 # Click CLI: collect, prune, merge, smoke-test, serve, ui, safety-scan, steer, abliterate, domain-scan, domain-probe, refusal-probe, amplify
 ```
 
 ## Key Design Decisions
@@ -131,6 +133,23 @@ src/mlx_fun/
   knowledge, since both sides are Solidity. Every Solidity sample in
   `data/corpora/evm_security.jsonl` compiles under solc 0.8.28 Cancun and the
   Yul object under `--strict-assembly`; keep it that way when adding samples.
+
+- **Refusal probing is a separate objective** (`refusal.py`, `refusal-probe`).
+  It generates an answer per question, classifies it answered/refused/partial
+  with a precise, normalized phrase-list heuristic (`classify_response` — folds
+  curly apostrophes, decline-specific markers, so "I'm sorry, but I can
+  explain…" is answered; lexical similarity was tested and rejected for
+  blurring can/can't), and contrasts refused vs answered routing — reusing
+  `ProbeStats` with refused as the positive bucket. Verification regenerates
+  each refused question under the mask and re-classifies; only a fully clean
+  answer counts as a flip (`partial` never does), because a likelihood delta
+  cannot tell a reworded refusal from real compliance. `--stratify-tags`
+  (default on) contrasts within each tag to curb topic confounding. The report
+  keeps `candidate_refusal_experts` and `verified_refusal_experts` distinct and
+  defaults `domain_experts` to the *verified* set, so downstream never acts on a
+  merely-correlated expert. No disallowed-intent dataset is authored. Generation
+  runs on VLMs via a logits shim (`_LogitsModel`) over the unwrapped language
+  stack. `RefusalReport` is a `ProbeReport`/`DomainReport` superset.
 
 - **Knockout deltas are paired per question** with a bootstrap CI
   (`paired_delta_stats`). A masked run that goes non-finite counts as a collapse
@@ -218,13 +237,14 @@ Reference source files (mlx-lm 0.32.0 upstream, mlx-vlm 0.6.17):
 Tests use tiny MoE fixtures (4 experts, hidden=32) defined in `tests/conftest.py`. No real models are needed for unit tests.
 
 ```bash
-pytest tests/ -v                    # All 705 tests
+pytest tests/ -v                    # All 752 tests
 pytest tests/test_pruner.py -v      # Just pruner tests
 pytest tests/test_safety.py -v      # Safety analysis tests
 pytest tests/test_steering.py -v    # Steering hook tests
 pytest tests/test_abliterate.py -v  # Abliteration tests
 pytest tests/test_domain.py -v      # Domain identification + amplification tests
 pytest tests/test_probe.py -v       # Q&A probe: scoring, knockout mask, trace pass
+pytest tests/test_refusal.py -v     # Refusal probe: classifier, regenerate knockout, VLM shim
 pytest tests/test_frontend.py -v   # Frontend API + visualization tests
 pytest tests/test_convert_nvfp4.py -v  # NVFP4 converter tests
 pytest tests/test_loader.py -v      # Backend routing (mlx-lm vs mlx-vlm)

@@ -74,3 +74,18 @@ def test_domain_probe_requires_args():
     runner = CliRunner()
     result = runner.invoke(main, ["domain-probe"])
     assert result.exit_code != 0
+
+
+def test_refusal_probe_command_registered():
+    runner = CliRunner()
+    result = runner.invoke(main, ["refusal-probe", "--help"])
+    assert result.exit_code == 0
+    for flag in ("--model", "--questions", "--output", "--verify-top",
+                 "--min-flip-rate", "--refusal-markers"):
+        assert flag in result.output
+
+
+def test_refusal_probe_requires_args():
+    runner = CliRunner()
+    result = runner.invoke(main, ["refusal-probe"])
+    assert result.exit_code != 0

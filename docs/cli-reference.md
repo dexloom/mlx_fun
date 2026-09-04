@@ -206,6 +206,26 @@ The report is a `domain_report.json` superset, so it feeds `prune --domain-map`,
 `amplify` and `serve --domain-map` unchanged. See
 [safety-and-domain](safety-and-domain.md#domain-probe--ask-the-model-questions).
 
+## `refusal-probe` — find the guardrail experts
+
+Generates an answer to each question, classifies it answered/refused/partial,
+and contrasts refused vs answered routing to find the refusal experts. Verifies
+by masking each and regenerating the refused questions (the flip rate).
+
+```bash
+mlx-fun refusal-probe --model ./model \
+    --questions ./data/probes/security.jsonl \
+    --output refusal_report.json --verify-top 16 --seed 42
+```
+
+Key options: `--refusal-markers` (extra phrases), `--max-answer-tokens`,
+`--min-coverage`, `--verify-top`, `--verify-questions`, `--min-flip-rate`,
+`--bootstrap`, `--stratify-tags/--no-stratify-tags` (control topic confounding),
+`--chat-template-args`, `--system`. Runs on vision models too. The report keeps
+`candidate_refusal_experts` and `verified_refusal_experts` distinct;
+`domain_experts` defaults to the verified set.
+See [safety-and-domain](safety-and-domain.md#refusal-probe--find-the-guardrail-experts).
+
 ## `amplify` — permanent domain-expert gate boost
 
 ```bash

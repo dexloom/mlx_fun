@@ -34,6 +34,7 @@ checkpoints that load with stock `mlx_lm.load()`.
 |---|---|---|
 | **Domain Scan** | Find domain-specialized experts via differential routing | [safety-and-domain](docs/safety-and-domain.md#domain-scan) |
 | **Domain Probe** | Score expert relevance by asking questions, verified by knockout | [safety-and-domain](docs/safety-and-domain.md#domain-probe--ask-the-model-questions) |
+| **Refusal Probe** | Find guardrail experts from refused vs answered routing, verified by regeneration | [safety-and-domain](docs/safety-and-domain.md#refusal-probe--find-the-guardrail-experts) |
 | **Amplify** | Permanently bias gate weights so domain experts are favored natively | [safety-and-domain](docs/safety-and-domain.md#amplify--permanent-domain-gate-boost) |
 
 ### Inference optimization

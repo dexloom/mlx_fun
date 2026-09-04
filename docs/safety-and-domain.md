@@ -306,6 +306,125 @@ Thinking-mode templates are best disabled for probing:
 
 Gemma 4 is not supported for knockout verification; the trace pass works.
 
+## Refusal probe — find the guardrail experts
+
+The domain probe finds experts used to *answer* a domain. `refusal-probe` finds
+the experts that implement the model's *refusals* — the guardrails — and is a
+distinct objective, so it is a separate command.
+
+It supplies no disallowed-intent dataset. The refusals are detected empirically:
+it generates an answer to each question, classifies the response as answered,
+refused or partial, and contrasts the routing on the questions the model
+**refused** against the ones it **answered**. Experts routed more heavily while
+refusing are the refusal machinery.
+
+```bash
+mlx-fun refusal-probe \
+    --model ./model \
+    --questions ./data/probes/security.jsonl \
+    --output refusal_report.json \
+    --answers-output refusal_answers.jsonl \
+    --verify-top 16 --seed 42
+```
+
+### Classification
+
+`classify_response` is a conservative heuristic (a phrase list, not a model, so
+it is auditable and dependency-free). Text is normalized first — lowercased,
+curly apostrophes folded to ASCII — so "I can’t help" is caught, and the
+markers are decline-specific ("I can’t", "I cannot", "I won’t"), so a
+helpful "I’m sorry, but I can explain…" is *not* a refusal. A marker
+near the start means the model declined; a marked response that then continues
+well past a length threshold is `partial` (a marker is present, so it is never
+treated as compliance). Only marker-free responses are `answered`. Widen
+detection with `--refusal-markers <file>` (one phrase per line).
+
+The list includes common paraphrased declines ("I'd rather not help…",
+"that's not something I'm going to write…"), kept long and specific so
+technical prose ("I'll pass the array by calldata", "I won't write more than
+24576 bytes") does not trigger them.
+
+Lexical **similarity** to refusal templates was evaluated on realistic
+responses and rejected: paraphrased refusals and technical answers overlap with
+no clean threshold (a real "I'd rather not help build something designed to
+steal funds" scores the same ~0.42 as an answer explaining a flash loan), and
+similarity blurs the decline/offer distinction the markers key on. The marker
+list has high precision but a recall ceiling on *novel* paraphrasing that no
+lexical method closes — the ceiling-breaker is a semantic classifier (an
+embedding judge or an LLM judge). `classify_response` is the single seam where
+one would slot in; `--refusal-markers` is the cheap lever until then.
+
+Only refused and answered responses define the signal; partials are recorded
+but excluded, and a `partial` never counts as a knockout flip.
+
+If the model refuses none of the questions there is no signal to isolate, and
+the command says so and stops — try a set it actually declines, a stricter
+`--system` prompt, or wider markers.
+
+### Verification is by regeneration, not likelihood
+
+A log-likelihood delta cannot tell a reworded refusal from real compliance. So
+knockout here **regenerates**: it masks a candidate expert out of the real
+router, re-runs each refused question, and re-classifies. The **flip rate** is
+the fraction that turned from a refusal into an answer. An expert is verified
+when the flip rate clears `--min-flip-rate` (default 0.5) and its bootstrap CI
+excludes zero. This measures the guardrail directly. Only a fully clean answer
+(no refusal marker at all) counts as a flip — a reworded or hedged refusal does
+not "verify" an expert the model still refuses with.
+
+The mask is the same real-router selection-score mask the domain knockout uses,
+so grouped selection and the correction bias are intact; Gemma 4 is unsupported.
+
+### Candidates vs verified experts
+
+The differential ranks *candidates* — experts correlated with refusing. Only
+`--verify-top` of them are knockout-tested, and only those that actually flip
+refusals become **verified**. The report keeps the two sets explicit
+(`candidate_refusal_experts`, `verified_refusal_experts`), and `domain_experts`
+— what the downstream tools read — defaults to the **verified** set when a
+knockout ran, so a safety action never disables a merely-correlated expert. With
+`--verify-top 0` no verification runs, `domain_experts` falls back to the
+candidates, and `refusal_experts_verified` is False (the command warns).
+
+### Controlling topic confounding
+
+Refused and answered questions differ in subject, so the raw contrast can rank a
+*topic* expert (security content) above a guardrail expert — and a true
+guardrail expert might not reach `--verify-top`. `--stratify-tags` (on by
+default) contrasts refused-vs-answered **within each tag** and averages across
+the tags that contain both outcomes, holding topic roughly constant. It falls
+back to the global contrast, with a warning, when no tag has both. The knockout
+is the backstop regardless: a topic expert does not flip refusals, so it never
+becomes verified. For sharper isolation, tag the questions finely, or supply
+matched allowed/disallowed prompts within each topic.
+
+### Vision models
+
+Unlike the domain probe's generate mode, `refusal-probe` runs on vision models:
+it generates on the unwrapped language stack (token ids only, no pixels) through
+a logits shim. (This path has unit coverage but has not been validated on real
+VLM weights in this repo — no small VLM is available here.)
+
+### Output
+
+The report is a `domain_report.json` superset with `objective: "refusal"`, the
+answered/refused/partial counts, the per-question outcomes (each with its
+question text, so a record is identifiable despite `--max-questions`
+subsampling), the candidate/verified expert sets, and the flip-rate knockout
+block. `domain_experts` holds the verified set, so the file loads with the
+existing tools — but note the useful guardrail operation is to **deactivate** or
+**prune** those experts, not to protect them, and you should act on the
+**verified** set:
+
+```bash
+# Deactivate the VERIFIED refusal experts at inference via the steering API
+curl -X POST http://localhost:8080/v1/reap/steer \
+    -d '{"deactivate": <verified_refusal_experts from the report>, "mask_value": -1e9}'
+```
+
+`--saliency-output` writes a `SaliencyAccumulator` `.npz` from the refused-answer
+routing for `prune --saliency`.
+
 ## Amplify — permanent domain gate boost
 
 `amplify` permanently modifies gate weights so domain-specialized experts

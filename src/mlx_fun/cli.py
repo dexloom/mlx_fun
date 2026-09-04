@@ -1521,6 +1521,283 @@ def domain_probe(model, domain_questions, general_questions, output, saliency_ou
         click.echo(f"Generated answers saved to: {answers_output}")
 
 
+@main.command("refusal-probe")
+@click.option("--model", required=True, help="Model path or HuggingFace repo ID.")
+@click.option("--questions", required=True,
+              help="JSONL of questions to probe for refusals (e.g. data/probes/security.jsonl).")
+@click.option("--output", required=True, help="Output path for refusal_report.json.")
+@click.option("--saliency-output", default=None,
+              help="Optional .npz of refused-answer routing, for prune --saliency.")
+@click.option("--answers-output", default=None,
+              help="Optional JSONL of generated answers with their outcome classification.")
+@click.option("--refusal-markers", default=None,
+              help="Optional file of extra refusal phrases, one per line.")
+@click.option("--domain-name", default="refusal",
+              help="Report label (this set becomes domain_experts for downstream tools).")
+@click.option("--max-questions", default=0, type=int,
+              help="Subsample this many questions (0 = all).")
+@click.option("--max-answer-tokens", default=256, type=int,
+              help="Max tokens to generate per question.")
+@click.option("--threshold-percentile", default=90.0, type=float,
+              help="Percentile threshold for classifying refusal experts.")
+@click.option("--min-coverage", default=0.0, type=float,
+              help="Drop refusal experts used in fewer than this fraction of refused questions.")
+@click.option("--verify-top", default=16, type=int,
+              help="Regeneration-verify this many top refusal experts (0 disables).")
+@click.option("--verify-questions", default=0, type=int,
+              help="Use this many refused questions for verification (0 = all).")
+@click.option("--min-flip-rate", default=0.5, type=float,
+              help="Minimum refused->answered flip rate to call a refusal expert verified.")
+@click.option("--bootstrap", default=1000, type=int,
+              help="Bootstrap resamples for the flip-rate confidence interval (0 disables).")
+@click.option("--stratify-tags/--no-stratify-tags", default=True,
+              help="Score refused-vs-answered within each tag to control topic "
+                   "confounding (falls back to global if no tag has both).")
+@click.option("--mask-value", default=-1e9, type=float,
+              help="Additive selection-score mask used for knockouts.")
+@click.option("--chat-template-args", default=None,
+              help="JSON object of extra chat-template kwargs, e.g. "
+                   "--chat-template-args '{\"enable_thinking\":false}'.")
+@click.option("--system", default=None, help="Default system prompt for every question.")
+@click.option("--seed", default=None, type=int, help="Random seed.")
+@click.option("--show-questions", is_flag=True, help="Echo each question and its outcome.")
+def refusal_probe(model, questions, output, saliency_output, answers_output,
+                  refusal_markers, domain_name, max_questions, max_answer_tokens,
+                  threshold_percentile, min_coverage, verify_top, verify_questions,
+                  min_flip_rate, bootstrap, stratify_tags, mask_value,
+                  chat_template_args, system, seed, show_questions):
+    """Find the experts that implement the model's refusal guardrails.
+
+    Generates an answer to each question, classifies it as answered / refused /
+    partial, and contrasts routing on refused questions against answered ones.
+    Candidates are verified by masking each expert and regenerating the refused
+    questions: a refusal expert is confirmed when removing it turns refusals
+    into answers. The report feeds prune / amplify / serve like a domain report.
+    """
+    import json as _json
+    import random
+    from pathlib import Path
+
+    import numpy as np
+    from tqdm import tqdm
+
+    from .adapters import get_adapter
+    from .domain import identify_domain_experts
+    from .loader import load_model, is_vision_model
+    from .observer import install_hooks, remove_hooks
+    from .probe import (
+        DOMAIN, GENERAL, ProbeStats,
+        apply_coverage_filter, compute_probe_scores, load_probe_set,
+        select_knockout_candidates,
+    )
+    from .refusal import (
+        ANSWERED, REFUSED, PARTIAL, RefusalReport,
+        run_refusal_knockout, stratified_probe_scores, trace_refusals,
+    )
+
+    if seed is not None:
+        random.seed(seed)
+
+    parsed_chat_template_args = {}
+    if chat_template_args:
+        try:
+            parsed_chat_template_args = _json.loads(chat_template_args)
+            if not isinstance(parsed_chat_template_args, dict):
+                raise ValueError("expected a JSON object")
+        except Exception as e:
+            raise click.BadParameter(f"--chat-template-args must be a JSON object: {e}")
+
+    extra_markers = None
+    if refusal_markers:
+        with open(refusal_markers) as f:
+            extra_markers = [line.strip() for line in f if line.strip()]
+
+    expanded_model = os.path.expanduser(model)
+    if os.path.exists(expanded_model):
+        model = expanded_model
+    click.echo(f"Loading model: {model}")
+    mlx_model, tokenizer, config = load_model(model)
+
+    adapter = get_adapter(mlx_model, config)
+    moe_indices = adapter.moe_layer_indices()
+    n_experts = adapter.num_routed_experts()
+    top_k = adapter.num_experts_per_tok()
+    model_type = config.get("model_type", "")
+    moe_blocks = [adapter.get_moe_block(i) for i in moe_indices]
+
+    click.echo(f"Model type: {model_type}, MoE layers: {len(moe_indices)}, "
+               f"Experts: {n_experts}, top_k: {top_k}"
+               + (" (VLM: generating on the language stack)" if is_vision_model(config) else ""))
+
+    qs = load_probe_set(questions, max_questions)
+    click.echo(f"Loaded {len(qs)} questions from {questions}")
+
+    stats = ProbeStats(num_layers=len(moe_indices), num_experts=n_experts)
+
+    def _echo(index, question, outcome, answer):
+        if show_questions:
+            click.echo(f"  [{outcome:8}] {question}")
+
+    bar = tqdm(total=len(qs), desc="Probing")
+    install_hooks(moe_blocks, model_type)
+    try:
+        examples, outcomes, skipped, records = trace_refusals(
+            mlx_model, tokenizer, config, qs, stats, moe_blocks,
+            num_experts=n_experts,
+            max_answer_tokens=max_answer_tokens,
+            chat_template_args=parsed_chat_template_args,
+            system=system,
+            extra_markers=extra_markers,
+            echo=_echo,
+            progress=lambda done, total: bar.update(1),
+        )
+    finally:
+        remove_hooks(moe_blocks)
+        bar.close()
+
+    n_answered = sum(1 for o in outcomes if o["outcome"] == ANSWERED)
+    n_refused = sum(1 for o in outcomes if o["outcome"] == REFUSED)
+    n_partial = sum(1 for o in outcomes if o["outcome"] == PARTIAL)
+    click.echo(f"Outcomes: {n_answered} answered, {n_refused} refused, "
+               f"{n_partial} partial ({len(skipped)} skipped)")
+
+    if n_refused == 0:
+        click.echo("The model refused none of these questions, so there is no "
+                   "refusal signal to isolate. Try a set it declines, a stricter "
+                   "system prompt, or --refusal-markers to widen detection.")
+    if n_refused == 0 or n_answered == 0:
+        raise click.ClickException(
+            "Need both refused and answered questions to contrast; got "
+            f"{n_refused} refused and {n_answered} answered."
+        )
+
+    scoring_method = "global"
+    stratified_tags = []
+    if stratify_tags:
+        strat = stratified_probe_scores(records, len(moe_indices), n_experts)
+        if strat is not None:
+            diff_freq, diff_weight, composite, stratified_tags = strat
+            scoring_method = "tag_stratified"
+            click.echo(f"Computing tag-stratified scores over {len(stratified_tags)} "
+                       f"tags with both outcomes (controls topic confounding)...")
+        else:
+            click.echo("No tag had both a refused and an answered question; "
+                       "falling back to a global contrast (topic-confounded).")
+    if scoring_method == "global":
+        click.echo("Computing global differential scores (refused vs answered)...")
+        diff_freq, diff_weight, composite = compute_probe_scores(stats)
+
+    base = identify_domain_experts(
+        diff_freq, diff_weight, composite, domain_name, threshold_percentile,
+    )
+    refused_coverage = stats.coverage_fraction(DOMAIN)
+    candidate_refusal_experts = apply_coverage_filter(
+        base.domain_experts, refused_coverage, min_coverage,
+    )
+
+    report = RefusalReport(
+        domain_name=domain_name,
+        num_layers=base.num_layers,
+        num_experts=base.num_experts,
+        threshold_percentile=threshold_percentile,
+        differential_freq=diff_freq,
+        differential_activation=diff_weight,
+        composite_score=composite,
+        # domain_experts defaults to the candidates; replaced by the verified
+        # set below when a knockout runs, so downstream never acts on unverified.
+        domain_experts=candidate_refusal_experts,
+        general_experts=base.general_experts,
+        answer_mode="generate",
+        min_coverage=min_coverage,
+        domain_coverage=refused_coverage,
+        general_coverage=stats.coverage_fraction(GENERAL),
+        objective="refusal",
+        scoring_method=scoring_method,
+        num_answered=n_answered,
+        num_refused=n_refused,
+        num_partial=n_partial,
+        candidate_refusal_experts=candidate_refusal_experts,
+        stratified_tags=stratified_tags,
+        per_question_outcome=outcomes,
+        skipped_questions={"probed": len(skipped)},
+    )
+
+    refused_examples = examples[DOMAIN]
+    if verify_questions > 0 and len(refused_examples) > verify_questions:
+        vrng = random.Random(seed if seed is not None else 0)
+        refused_examples = vrng.sample(refused_examples, verify_questions)
+
+    candidates = select_knockout_candidates(composite, candidate_refusal_experts, verify_top)
+    if candidates and refused_examples:
+        click.echo(f"Regeneration-verifying {len(candidates)} candidates over "
+                   f"{len(refused_examples)} refused questions...")
+        bar = tqdm(total=len(candidates), desc="Knockout")
+        try:
+            per_expert = run_refusal_knockout(
+                mlx_model, tokenizer, config, refused_examples, moe_blocks, model_type,
+                num_experts=n_experts, top_k=top_k, candidates=candidates,
+                max_answer_tokens=max_answer_tokens,
+                chat_template_args=parsed_chat_template_args, system=system,
+                extra_markers=extra_markers, mask_value=mask_value,
+                min_flip_rate=min_flip_rate, n_boot=bootstrap, seed=seed or 0,
+                composite=composite, coverage=refused_coverage,
+                progress=lambda done, total: bar.update(1),
+            )
+        finally:
+            bar.close()
+
+        delta = np.zeros_like(composite)
+        verified = {}
+        for entry in per_expert:
+            delta[entry["layer"], entry["expert"]] = entry["flip_rate"]
+            if entry["status"] == "verified":
+                verified.setdefault(entry["layer"], []).append(entry["expert"])
+        report.knockout = {
+            "backend": "regenerate_and_classify",
+            "mask_value": mask_value,
+            "num_refused_questions": len(refused_examples),
+            "min_flip_rate": min_flip_rate,
+            "bootstrap": bootstrap,
+            "per_expert": per_expert,
+        }
+        report.knockout_delta = delta
+        # Downstream reads domain_experts; default it to the VERIFIED set so a
+        # prune/steer/deactivate never acts on a merely-correlated expert.
+        report.verified_refusal_experts = verified
+        report.verified_domain_experts = verified
+        report.domain_experts = verified
+        report.refusal_experts_verified = True
+
+        for entry in sorted(per_expert, key=lambda e: -e["flip_rate"])[:5]:
+            click.echo(f"    L{entry['layer']} E{entry['expert']}: "
+                       f"flip_rate={entry['flip_rate']:.2f} "
+                       f"[{entry['ci_low']:.2f}, {entry['ci_high']:.2f}] {entry['status']}")
+        n_verified = sum(len(v) for v in verified.values())
+        click.echo(f"  Verified {n_verified} of {len(candidates)} candidates")
+    else:
+        click.echo("No knockout ran (--verify-top 0 or no refused questions); "
+                   "the report's domain_experts are UNVERIFIED candidates.")
+
+    report.save(output)
+    click.echo(f"Refusal report saved to: {output}")
+    n_candidates = sum(len(v) for v in candidate_refusal_experts.values())
+    n_verified_total = sum(len(v) for v in report.verified_refusal_experts.values())
+    click.echo(f"  Candidate refusal experts: {n_candidates}; "
+               f"verified: {n_verified_total}"
+               + ("" if report.refusal_experts_verified
+                  else " (unverified — run with --verify-top to confirm)"))
+
+    if saliency_output:
+        stats.saliency.save(saliency_output)
+        click.echo(f"Refused-answer saliency saved to: {saliency_output}")
+
+    if answers_output:
+        with open(answers_output, "w") as f:
+            for o in outcomes:
+                f.write(_json.dumps(o) + "\n")
+        click.echo(f"Answers and outcomes saved to: {answers_output}")
+
+
 @main.command()
 @click.option("--model", required=True, help="Model path or HuggingFace repo ID.")
 @click.option("--domain-map", required=True, help="Path to domain_report.json.")

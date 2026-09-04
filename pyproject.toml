@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "MLX-native toolkit for MoE model compression, analysis, and domain specialization on Apple Silicon"
 requires-python = ">=3.11"
 dependencies = [
-    "mlx>=0.30.0",
+    "mlx>=0.32.1",
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm.git@main",
     "click>=8.0",
     "tqdm>=4.60",
@@ -20,20 +20,11 @@ dev = ["pytest>=7.0"]
 dataset = ["datasets>=2.14", "huggingface-hub>=0.20"]
 ream = ["scipy>=1.10"]
 ui = ["gradio>=4.0", "matplotlib>=3.7", "requests>=2.28"]
+vlm = ["mlx-vlm>=0.6.17"]
 convert = ["safetensors>=0.4", "huggingface-hub>=0.20"]
 
 [project.scripts]
 mlx-fun = "mlx_fun.cli:main"
-
-[tool.uv.sources]
-# Use the local fork of mlx-lm (branch: gemma4-assistant) so the
-# `gemma4_assistant` model_type is available for MTP speculative decoding
-# (used by `src/mlx_fun/mtp_speculative.py` and `mtp_driver.py`) and so
-# DFlash drafter wiring can be exercised against the in-tree fork. The
-# fork rides on upstream main with one extra commit. Comment this out to
-# fall back to the pinned `mlx-lm @ git+...main` declared in
-# [project.dependencies] above.
-mlx-lm = { path = "../mlx-lm", editable = true }
 
 [tool.setuptools.packages.find]
 where = ["src"]

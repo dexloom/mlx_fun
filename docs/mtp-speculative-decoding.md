@@ -16,10 +16,12 @@ transformers repo.
 
 ## What's in the box
 
-- **`mlx_lm.models.gemma4_assistant`** (in the [dexloom/mlx-lm
-  fork](https://github.com/dexloom/mlx-lm/tree/gemma4-assistant)) — registers
-  the `gemma4_assistant` model_type so `mlx_lm.load()` and `mlx_lm.convert`
-  work directly on the raw HF checkpoint.
+- **`mlx_fun.models.gemma4_assistant`** (`src/mlx_fun/models/gemma4_assistant.py`)
+  — the drafter model class. mlx_fun publishes it under
+  `mlx_lm.models.gemma4_assistant` at import time (see
+  `mlx_fun.models.register_model_types`), so stock upstream `mlx_lm.load()` and
+  `mlx_lm.convert` work directly on the raw HF checkpoint. **No fork of mlx-lm
+  is needed.**
 - **`mlx_fun.mtp_driver`** (`src/mlx_fun/mtp_driver.py`) — the
   speculative-decoding loop: backbone prefill, K-step drafting against
   borrowed backbone KV, parallel verification, KV trim.
@@ -41,12 +43,16 @@ trimmed by `K - accepted` to roll back the rejected suffix.
 
 ## Quick start
 
-### 1. Install the fork of mlx-lm with the `gemma4_assistant` model type
+### 1. Install mlx_fun (registers the `gemma4_assistant` model type)
 
 ```bash
-git clone -b gemma4-assistant git@github.com:dexloom/mlx-lm.git
-uv pip install -e ./mlx-lm
+uv pip install -e ".[dev]"
 ```
+
+Importing anything from `mlx_fun` registers the drafter's model class into
+`mlx_lm.models`, so upstream mlx-lm resolves `model_type: gemma4_assistant`
+with no patching. If a future mlx-lm ships the type itself, upstream wins and
+the registration retires itself.
 
 ### 2. Convert the HF assistant checkpoints to MLX
 

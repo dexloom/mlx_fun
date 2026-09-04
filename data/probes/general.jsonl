@@ -1,0 +1,81 @@
+{"question": "What does the `len` function do in Python?", "answer": "It returns the number of items in a container such as a list, tuple, dict or string.", "tags": ["python"]}
+{"question": "What is the difference between a Python list and a tuple?", "answer": "A list is mutable and can grow or shrink; a tuple is immutable once created and can be used as a dict key.", "tags": ["python"]}
+{"question": "Write a Python function that returns the squares of a list.", "answer": "def squares(values):\n    return [v * v for v in values]", "tags": ["python"]}
+{"question": "What is a Python list comprehension?", "answer": "A compact expression that builds a list from an iterable, such as `[x * 2 for x in items if x > 0]`.", "tags": ["python"]}
+{"question": "What does the `with` statement do in Python?", "answer": "It runs a context manager, guaranteeing setup and cleanup, so a file opened with it is closed even if an exception is raised.", "tags": ["python"]}
+{"question": "What is a Python generator?", "answer": "A function that uses `yield` to produce values lazily, keeping only one item in memory at a time.", "tags": ["python"]}
+{"question": "What is the difference between `==` and `is` in Python?", "answer": "`==` compares values; `is` compares identity, testing whether two names point at the same object.", "tags": ["python"]}
+{"question": "What is a Python decorator?", "answer": "A callable that wraps another function to extend its behavior, applied with the `@name` syntax above the definition.", "tags": ["python"]}
+{"question": "Write a Python function that reads a file into a list of lines.", "answer": "def read_lines(path):\n    with open(path) as f:\n        return f.read().splitlines()", "tags": ["python"]}
+{"question": "What does `*args` mean in a Python function signature?", "answer": "It collects any extra positional arguments into a tuple, so the function accepts a variable number of them.", "tags": ["python"]}
+{"question": "What does `**kwargs` mean in a Python function signature?", "answer": "It collects any extra keyword arguments into a dictionary keyed by parameter name.", "tags": ["python"]}
+{"question": "What is the Python GIL?", "answer": "The global interpreter lock, which lets only one thread execute Python bytecode at a time, so CPU-bound work needs processes rather than threads.", "tags": ["python"]}
+{"question": "What is the difference between a shallow and a deep copy?", "answer": "A shallow copy duplicates the outer container but shares the nested objects; a deep copy recursively duplicates everything.", "tags": ["python"]}
+{"question": "How do you sort a list of dicts by a key in Python?", "answer": "sorted(rows, key=lambda r: r[\"name\"]) \u2014 pass a key function that extracts the field to compare.", "tags": ["python"]}
+{"question": "What does the `enumerate` builtin do?", "answer": "It yields index and value pairs while iterating, so `for i, item in enumerate(items)` gives positions without a counter.", "tags": ["python"]}
+{"question": "What is a Python dataclass?", "answer": "A class decorated with @dataclass, where declared fields generate the constructor, repr and equality methods automatically.", "tags": ["python"]}
+{"question": "What is the difference between `append` and `extend` on a list?", "answer": "`append` adds one item to the end; `extend` adds every item of an iterable individually.", "tags": ["python"]}
+{"question": "How do you handle an exception in Python?", "answer": "Wrap the risky code in `try:` and catch specific types with `except ValueError as e:`, optionally adding `else` and `finally` clauses.", "tags": ["python"]}
+{"question": "What does `if __name__ == \"__main__\":` do?", "answer": "It runs the block only when the file is executed directly, not when it is imported as a module.", "tags": ["python"]}
+{"question": "What is a virtual environment in Python?", "answer": "An isolated directory with its own interpreter and installed packages, so projects do not share or conflict over dependency versions.", "tags": ["python"]}
+{"question": "What does the `zip` builtin do?", "answer": "It pairs items from several iterables positionally, stopping at the shortest one.", "tags": ["python"]}
+{"question": "What is the difference between a set and a list in Python?", "answer": "A set holds unique unordered items with fast membership tests; a list keeps order and allows duplicates.", "tags": ["python"]}
+{"question": "How do you reverse a string in Python?", "answer": "Use an extended slice with a step of minus one: text[::-1].", "tags": ["python"]}
+{"question": "What is a lambda in Python?", "answer": "An anonymous single-expression function, written `lambda x: x + 1`, usually passed inline as a callback.", "tags": ["python"]}
+{"question": "What does `dict.get` do that indexing does not?", "answer": "It returns a default instead of raising KeyError when the key is absent.", "tags": ["python"]}
+{"question": "What is recursion in programming?", "answer": "A function calling itself on a smaller input, with a base case that stops the descent.", "tags": ["python", "cs"]}
+{"question": "What is the time complexity of binary search?", "answer": "O(log n), because each comparison halves the remaining search range.", "tags": ["cs"]}
+{"question": "What is the difference between a stack and a queue?", "answer": "A stack is last-in first-out; a queue is first-in first-out.", "tags": ["cs"]}
+{"question": "What is a hash table?", "answer": "A structure mapping keys to values through a hash function that gives an index into a bucket array, giving average constant-time lookup.", "tags": ["cs"]}
+{"question": "What does Big-O notation describe?", "answer": "How an algorithm's cost grows as the input size grows, ignoring constants and lower-order terms.", "tags": ["cs"]}
+{"question": "What is 17 multiplied by 23?", "answer": "Multiplying 17 by 23 gives 391.", "tags": ["math"]}
+{"question": "What is the square root of 144?", "answer": "The square root of 144 is 12, since 12 times 12 is 144.", "tags": ["math"]}
+{"question": "What is 15% of 240?", "answer": "Fifteen percent of 240 is 36, since 0.15 times 240 equals 36.", "tags": ["math"]}
+{"question": "Solve for x: 3x + 7 = 22.", "answer": "Subtracting 7 gives 3x = 15, so x = 5.", "tags": ["math"]}
+{"question": "What is the area of a circle with radius 5?", "answer": "The area is 25 pi, which is roughly 78.54 square units.", "tags": ["math"]}
+{"question": "What is the sum of the first 100 positive integers?", "answer": "The sum is 5050, from the formula n times n plus one over two.", "tags": ["math"]}
+{"question": "What is a prime number?", "answer": "A prime number is an integer greater than 1 whose only positive divisors are 1 and itself.", "tags": ["math"]}
+{"question": "What is the Pythagorean theorem?", "answer": "In a right triangle the square of the hypotenuse equals the sum of the squares of the other two sides: a squared plus b squared equals c squared.", "tags": ["math"]}
+{"question": "What is the derivative of x squared?", "answer": "The derivative of x squared with respect to x is 2x.", "tags": ["math"]}
+{"question": "What is the factorial of 6?", "answer": "Six factorial is 720, the product of 1 through 6.", "tags": ["math"]}
+{"question": "What is the median of 3, 7, 9, 12 and 20?", "answer": "The median is 9, the middle value once the numbers are ordered.", "tags": ["math"]}
+{"question": "What is the difference between mean and median?", "answer": "The mean is the arithmetic average; the median is the middle value, which resists outliers.", "tags": ["math"]}
+{"question": "Convert 0.75 to a fraction.", "answer": "0.75 is three quarters, or 3 over 4 in lowest terms.", "tags": ["math"]}
+{"question": "What is 2 to the power of 10?", "answer": "Two to the power of ten is 1024.", "tags": ["math"]}
+{"question": "What is the perimeter of a rectangle 8 by 3?", "answer": "The perimeter is 22, from twice the sum of the two side lengths.", "tags": ["math"]}
+{"question": "What is a logarithm?", "answer": "The exponent a base must be raised to in order to produce a number, so log base 10 of 1000 is 3.", "tags": ["math"]}
+{"question": "What is the greatest common divisor of 48 and 18?", "answer": "The greatest common divisor of 48 and 18 is 6.", "tags": ["math"]}
+{"question": "What is the probability of rolling a six on a fair die?", "answer": "The probability is one in six, about 16.7 percent.", "tags": ["math"]}
+{"question": "What is the slope of the line through (0,0) and (2,6)?", "answer": "The slope is 3, from the rise of 6 divided by the run of 2.", "tags": ["math"]}
+{"question": "What is standard deviation?", "answer": "A measure of spread: the square root of the average squared distance of the values from their mean.", "tags": ["math"]}
+{"question": "What is 144 divided by 12?", "answer": "Dividing 144 by 12 gives 12.", "tags": ["math"]}
+{"question": "What is the capital of France?", "answer": "The capital of France is Paris, on the river Seine.", "tags": ["trivia"]}
+{"question": "Who wrote the play Hamlet?", "answer": "Hamlet was written by William Shakespeare around 1600.", "tags": ["trivia"]}
+{"question": "What is the largest ocean on Earth?", "answer": "The Pacific Ocean is the largest, covering about a third of the surface.", "tags": ["trivia"]}
+{"question": "How many continents are there?", "answer": "There are seven continents by the most common convention.", "tags": ["trivia"]}
+{"question": "What planet is known as the red planet?", "answer": "Mars is called the red planet because of its iron oxide surface.", "tags": ["trivia"]}
+{"question": "Who painted the Mona Lisa?", "answer": "The Mona Lisa was painted by Leonardo da Vinci.", "tags": ["trivia"]}
+{"question": "What is the tallest mountain above sea level?", "answer": "Mount Everest is the tallest above sea level, at about 8849 metres.", "tags": ["trivia"]}
+{"question": "What language is spoken in Brazil?", "answer": "Portuguese is the official language of Brazil.", "tags": ["trivia"]}
+{"question": "How many days are in a leap year?", "answer": "A leap year has 366 days, one more than a common year.", "tags": ["trivia"]}
+{"question": "What is the chemical symbol for gold?", "answer": "The chemical symbol for gold is Au, from the Latin aurum.", "tags": ["trivia"]}
+{"question": "What is the longest river in the world?", "answer": "The Nile is traditionally cited, though the Amazon is longer by some measurements.", "tags": ["trivia"]}
+{"question": "Who developed the theory of general relativity?", "answer": "General relativity was developed by Albert Einstein and published in 1915.", "tags": ["trivia"]}
+{"question": "What is the boiling point of water at sea level in Celsius?", "answer": "Water boils at 100 degrees Celsius at sea level.", "tags": ["trivia"]}
+{"question": "How many strings does a standard guitar have?", "answer": "A standard guitar has six strings.", "tags": ["trivia"]}
+{"question": "What is the smallest country in the world by area?", "answer": "Vatican City is the smallest sovereign state by area.", "tags": ["trivia"]}
+{"question": "Which gas do plants absorb for photosynthesis?", "answer": "Plants absorb carbon dioxide and release oxygen during photosynthesis.", "tags": ["trivia"]}
+{"question": "What is the currency of Japan?", "answer": "The currency of Japan is the yen.", "tags": ["trivia"]}
+{"question": "Who wrote the novel Pride and Prejudice?", "answer": "Pride and Prejudice was written by Jane Austen.", "tags": ["trivia"]}
+{"question": "What is the hardest natural substance?", "answer": "Diamond is the hardest naturally occurring substance.", "tags": ["trivia"]}
+{"question": "How many players are on a football team on the field?", "answer": "Eleven per side in association football.", "tags": ["trivia"]}
+{"question": "What is the largest mammal?", "answer": "The blue whale is the largest mammal and the largest animal alive.", "tags": ["trivia"]}
+{"question": "In what year did the Second World War end?", "answer": "The Second World War ended in 1945.", "tags": ["trivia"]}
+{"question": "What is the freezing point of water in Fahrenheit?", "answer": "Water freezes at 32 degrees Fahrenheit.", "tags": ["trivia"]}
+{"question": "Which organ pumps blood around the body?", "answer": "The heart pumps blood around the body.", "tags": ["trivia"]}
+{"question": "What is the main ingredient in guacamole?", "answer": "The main ingredient in guacamole is mashed avocado.", "tags": ["trivia"]}
+{"question": "How many sides does a hexagon have?", "answer": "A hexagon has six sides and six angles.", "tags": ["trivia"]}
+{"question": "What is the closest star to Earth?", "answer": "The Sun is the closest star to Earth.", "tags": ["trivia"]}
+{"question": "Who was the first person to walk on the Moon?", "answer": "Neil Armstrong was the first person to walk on the Moon, in 1969.", "tags": ["trivia"]}
+{"question": "What is the largest desert in the world?", "answer": "Antarctica, which is a cold desert; the Sahara is the largest hot desert.", "tags": ["trivia"]}
+{"question": "How many bones are in the adult human body?", "answer": "The adult human body has 206 bones.", "tags": ["trivia"]}

@@ -136,6 +136,168 @@ Classifies experts into:
 The report feeds `prune --domain-map`, `amplify`, `serve --domain-map`, and
 the server's steering API.
 
+## Domain probe — ask the model questions
+
+`domain-scan` compares routing over raw corpora. `domain-probe` instead asks the
+model a curated set of questions and watches which experts it uses while it
+*answers* them, then verifies the top candidates causally:
+
+```bash
+mlx-fun domain-probe \
+    --model ./model \
+    --domain-questions ./data/probes/solidity.jsonl \
+    --general-questions ./data/probes/general.jsonl \
+    --output probe_report.json \
+    --saliency-output probe.npz \
+    --domain-name solidity \
+    --verify-top 32 --verify-prune 8 --seed 42
+```
+
+Four question sets ship with the repo — two domain sets and two contrast sets:
+
+| File | Role | Contents |
+|---|---|---|
+| `data/probes/solidity.jsonl` | domain | General smart-contract development |
+| `data/probes/security.jsonl` | domain | Vulnerability discovery, EVM internals, Yul |
+| `data/probes/solidity_benign.jsonl` | contrast | Ordinary Solidity, no security content |
+| `data/probes/general.jsonl` | contrast | Python, math, trivia |
+
+Pair them deliberately, because the contrast decides what the probe isolates.
+`security.jsonl` against `general.jsonl` finds broad smart-contract experts;
+`security.jsonl` against `solidity_benign.jsonl` holds Solidity knowledge
+constant on both sides, so what survives is the reasoning about what can go
+wrong:
+
+```bash
+mlx-fun domain-probe \
+    --model ./model \
+    --domain-questions ./data/probes/security.jsonl \
+    --general-questions ./data/probes/solidity_benign.jsonl \
+    --output security_report.json --saliency-output security.npz \
+    --domain-name security --verify-top 32 --verify-prune 8 --seed 42
+```
+
+See [datasets](datasets.md#choosing-a-pair) for the full pairing table and
+[Calibration corpora](datasets.md#calibration-corpora) for the matching raw
+corpus used by `collect` and `domain-scan`.
+
+### Question format
+
+```json
+{"question": "What does the `payable` modifier do?",
+ "answer": "It allows a function to receive Ether; calls with value to a non-payable function revert.",
+ "tags": ["functions", "ether"],
+ "system": null}
+```
+
+`question` is required. `answer` is required in teacher mode; `tags` and
+`system` are optional (a per-question `system` overrides `--system`).
+
+### Answer modes
+
+- `--answer-mode teacher` (default) — one forward pass over the chat-templated
+  question plus its reference answer. Deterministic, fast, and works for vision
+  checkpoints through their language stack.
+- `--answer-mode generate` — the model writes its own answer with the hooks
+  live during decoding. `--answers-output` dumps what it wrote in the probe
+  schema, so a generate run can be replayed in teacher mode. Not available for
+  vision models.
+
+### How relevance is scored
+
+Routing is attributed to the positions that *produce* the answer tokens —
+`[prompt_len-1 : prompt_len-1+n_answer]` — because logits at position `t`
+predict token `t+1`. The observational score and the knockout delta therefore
+describe exactly the same predictions, and the routing that picks the first
+answer token is included.
+
+Each question contributes one vector normalized by its own answer length, so a
+verbose answer cannot outvote a terse one. The composite is the same per-layer
+min-max blend `safety-scan` uses, over the differential selection frequency and
+the differential routed weight. `--min-coverage` drops domain experts that fired
+in too few questions, which is the usual source of a high score built on noise.
+
+### Knockout verification
+
+`--verify-top N` masks each of the top N experts out of the router, one at a
+time, and measures how much the answer log-likelihood degrades. The mask is
+added to the gate parameter that enters the *selection score* — the
+post-sigmoid correction bias for MiniMax and the GLM/DeepSeek family, a
+temporary pre-softmax `gate.bias` for the Qwen family — so the model's own
+routing runs untouched: grouped selection, `norm_topk_prob`,
+`routed_scaling_factor` and any latent projections all still apply. There is no
+surrogate router and no hook during scoring.
+
+Masking pre-sigmoid would not be enough: MiniMax and GLM select on
+`sigmoid(logits) + correction_bias`, so an expert with a large positive
+correction can survive a large negative pre-sigmoid bias.
+
+Deltas are paired per question. A masked run that goes non-finite is counted as
+a collapse rather than dropped, so a mask that destroys half the answers cannot
+average out to "harmless". Each candidate gets a status:
+
+| status | meaning |
+|---|---|
+| `verified` | mean delta ≥ `--min-delta` and the bootstrap CI excludes zero |
+| `not_verified` | no credible degradation |
+| `inconclusive` | usable pairs below `--min-valid-fraction` |
+| `catastrophic` | fewer than half the questions survived the mask |
+
+Only `verified` entries land in `verified_domain_experts`; `domain_experts` is
+never narrowed by the knockout, since only the top N are checked.
+
+The report records both `baseline_nll` (measured with a zero mask installed, so
+a never-routed expert gives a delta of exactly zero) and `plain_baseline_nll`
+(no mask at all). Small differences between them are numerical, not routing.
+
+### Prune-set verification
+
+`--verify-prune N` masks the exact set `prune` would remove — the same
+`build_keep_map` call, with the domain experts protected — and reports the paired
+delta on both question sets:
+
+```
+  Masked 2496 expert-layer pairs
+    domain: delta=+0.0812 nats/token (degraded)
+    general: delta=+0.3140 nats/token (degraded)
+```
+
+`--verify-metric`, `--verify-strategy`, `--verify-model-wide` and
+`--verify-min-experts-per-layer` mirror the corresponding `prune` flags. Note
+this masks experts in the *original* router; a real pruned checkpoint has a
+smaller expert axis, so confirm the result with `smoke-test` on the pruned
+model.
+
+### Outputs
+
+`--output` writes a superset of `domain_report.json`, so `prune --domain-map`,
+`amplify`, `serve --domain-map` and the steering API read it unchanged.
+`--saliency-output` writes a `SaliencyAccumulator` `.npz` built from the domain
+answer tokens, for `prune --saliency`:
+
+```bash
+mlx-fun prune --model ./model \
+    --saliency probe.npz --metric freq --n-prune 32 \
+    --domain-map probe_report.json --domain-mode protect \
+    --output ./pruned
+```
+
+By default each question contributes equally to that `.npz`
+(`--saliency-weighting question`); pass `token` for raw per-token counts.
+
+### Cost
+
+The trace is one forward pass per question. The knockout is
+`(2 + N) x questions` forward passes, plus `2 x questions` more for the prune
+check. On a 78-layer model with 80 questions and `--verify-top 32` expect tens
+of minutes; `--verify-questions`, a smaller `--verify-top`, and omitting
+`--verify-prune` are the levers.
+
+Thinking-mode templates are best disabled for probing:
+`--chat-template-args '{"enable_thinking": false}'`.
+
+Gemma 4 is not supported for knockout verification; the trace pass works.
+
 ## Amplify — permanent domain gate boost
 
 `amplify` permanently modifies gate weights so domain-specialized experts

@@ -26,6 +26,7 @@ mlx-fun safety-scan --help
 mlx-fun steer --help
 mlx-fun abliterate --help
 mlx-fun domain-scan --help
+mlx-fun domain-probe --help
 mlx-fun amplify --help
 mlx-fun convert-nvfp4 --help
 mlx-fun ui --help
@@ -57,10 +58,11 @@ src/mlx_fun/
 ├── abliterate.py          # Abliteration: residual hooks, refusal direction orthogonalization
 ├── convert_nvfp4.py       # NVIDIA NVFP4 (modelopt) -> MLX NVFP4 checkpoint converter
 ├── domain.py              # Domain expert identification, amplification bias computation, gate modification
+├── probe.py               # Q&A expert relevance: routing trace over answers + knockout verification
 ├── frontend.py            # Gradio web dashboard: chat, heatmaps, steering controls, server management
 ├── data.py                # JSONL + directory dataset loading with random subsampling
 ├── save.py                # mlx_lm.utils.save_model + reap/ream/abliteration/amplification metadata
-└── cli.py                 # Click CLI: collect, prune, merge, smoke-test, serve, ui, safety-scan, steer, abliterate, domain-scan, amplify
+└── cli.py                 # Click CLI: collect, prune, merge, smoke-test, serve, ui, safety-scan, steer, abliterate, domain-scan, domain-probe, amplify
 ```
 
 ## Key Design Decisions
@@ -92,6 +94,48 @@ src/mlx_fun/
 - **Gate amplification** permanently modifies gate parameters so domain experts are favored natively — no hooks needed at inference time. Per model type: MiniMax/Qwen3 set `gate.bias` on `nn.Linear(bias=False)` (MLX's `nn.Linear.__call__` checks `if "bias" in self`), GLM4/GLM5/DSv3 add to `gate.e_score_correction_bias` (post-sigmoid). The amplified model saves/loads with standard `mlx_lm.load()`.
 
 - **Pruner domain constraints** (`load_domain_constraints`) only support `"protect"` mode (never prune domain experts). Domain and safety constraints merge via union of protected sets.
+
+- **`pruner.build_keep_map` is the single entry point** for the three-way
+  selection branch (model-wide / strided / bottom). `cli.prune` and the probe's
+  prune-set verification both call it, so what the probe masks is exactly what
+  `prune` would remove.
+
+- **Probe routing is attributed to answer-*producing* positions**
+  (`probe.slice_answer_captures`): logits at position `t` predict token `t+1`,
+  so the scored predictions come from `[prompt_len-1 : prompt_len-1+n_answer]`.
+  This keeps the observational score and the knockout delta describing the same
+  predictions, and includes the routing that picks the first answer token. In
+  generate mode mlx-lm forwards every token before yielding it, so captures
+  cover exactly `prompt_len + n_generated` positions — asserted, not assumed.
+
+- **Probe scores are question-weighted**, not token-weighted: each question
+  contributes one vector normalized by its own answer length (`question_vectors`),
+  so a verbose answer cannot outvote a terse one. The `.npz` for `prune
+  --saliency` is folded the same way unless `--saliency-weighting token`.
+
+- **Knockout masks the router's selection-score parameter**, never a surrogate
+  router (`probe.expert_mask`). MiniMax and the GLM/DeepSeek family select on
+  `sigmoid(logits) + e_score_correction_bias`, so the mask must land *after* the
+  sigmoid — biasing pre-sigmoid logits (what `amplify` does) cannot reliably
+  deselect an expert with a large positive correction. Qwen types get a
+  temporary pre-softmax `gate.bias`. The model's own `__call__` runs, so grouped
+  selection, `norm_topk_prob`, `routed_scaling_factor` and latent projections all
+  still apply. Gemma 4 is unsupported and raises. Parameters are restored in
+  `finally`, including on exception.
+
+- **Probe datasets live in `data/probes/`, corpora in `data/corpora/`** — both
+  un-ignored in `.gitignore` because they are authored source, unlike the
+  downloaded sets in `data/datasets/`. Two domain sets (`solidity`, `security`)
+  and two contrast sets (`general`, `solidity_benign`); pairing `security`
+  against `solidity_benign` isolates vulnerability reasoning from Solidity
+  knowledge, since both sides are Solidity. Every Solidity sample in
+  `data/corpora/evm_security.jsonl` compiles under solc 0.8.28 Cancun and the
+  Yul object under `--strict-assembly`; keep it that way when adding samples.
+
+- **Knockout deltas are paired per question** with a bootstrap CI
+  (`paired_delta_stats`). A masked run that goes non-finite counts as a collapse
+  rather than being dropped, so a mask that destroys half the answers cannot
+  average out to "harmless".
 
 - **NVFP4 conversion** (`convert_nvfp4.py`): NVIDIA's `modelopt` NVFP4 checkpoints use a two-level scale hierarchy (`fp4_val * e4m3_group_scale * f32_global_scale`) that MLX Metal doesn't support. The converter folds `weight_scale_2` into per-group E4M3 scales via `from_fp8()` → multiply → `to_fp8()`, preserving trained FP4 codes exactly while accepting ~1-2% scale rounding. FP8 layers (Mamba, shared experts) are dequantized to bfloat16. Expert weights are repacked from uint8 `[M, N/2]` to uint32 `[M, N/8]` via `numpy.view` (lossless).
 
@@ -174,12 +218,13 @@ Reference source files (mlx-lm 0.32.0 upstream, mlx-vlm 0.6.17):
 Tests use tiny MoE fixtures (4 experts, hidden=32) defined in `tests/conftest.py`. No real models are needed for unit tests.
 
 ```bash
-pytest tests/ -v                    # All 604 tests
+pytest tests/ -v                    # All 705 tests
 pytest tests/test_pruner.py -v      # Just pruner tests
 pytest tests/test_safety.py -v      # Safety analysis tests
 pytest tests/test_steering.py -v    # Steering hook tests
 pytest tests/test_abliterate.py -v  # Abliteration tests
 pytest tests/test_domain.py -v      # Domain identification + amplification tests
+pytest tests/test_probe.py -v       # Q&A probe: scoring, knockout mask, trace pass
 pytest tests/test_frontend.py -v   # Frontend API + visualization tests
 pytest tests/test_convert_nvfp4.py -v  # NVFP4 converter tests
 pytest tests/test_loader.py -v      # Backend routing (mlx-lm vs mlx-vlm)

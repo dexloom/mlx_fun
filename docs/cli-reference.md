@@ -184,6 +184,28 @@ mlx-fun abliterate --model ./model \
 Same shape as `safety-scan`, but classifies experts into domain-specialized vs
 general groups.
 
+## `domain-probe` — score expert relevance by asking questions
+
+Traces routing while the model answers domain questions versus general ones,
+then verifies the top experts by masking them out of the real router.
+
+```bash
+mlx-fun domain-probe --model ./model \
+    --domain-questions ./data/probes/solidity.jsonl \
+    --general-questions ./data/probes/general.jsonl \
+    --output probe_report.json --saliency-output probe.npz \
+    --verify-top 32 --verify-prune 8 --seed 42
+```
+
+Key options: `--answer-mode teacher|generate`, `--max-questions`,
+`--max-answer-tokens`, `--min-coverage`, `--verify-top`, `--verify-questions`,
+`--min-delta`, `--bootstrap`, `--verify-prune` (plus `--verify-metric`,
+`--verify-strategy`, `--verify-model-wide`), `--chat-template-args`, `--system`.
+
+The report is a `domain_report.json` superset, so it feeds `prune --domain-map`,
+`amplify` and `serve --domain-map` unchanged. See
+[safety-and-domain](safety-and-domain.md#domain-probe--ask-the-model-questions).
+
 ## `amplify` — permanent domain-expert gate boost
 
 ```bash

@@ -445,6 +445,64 @@ def select_experts_to_keep_strided(
     return keep_map
 
 
+def build_keep_map(
+    scores: np.ndarray,
+    n_prune: int,
+    *,
+    strategy: str = "bottom",
+    model_wide: bool = False,
+    protected_experts: Dict[int, np.ndarray] = None,
+    targeted_experts: Dict[int, np.ndarray] = None,
+    min_experts_per_layer: int = 1,
+    ignored_experts: set = None,
+) -> Dict[int, np.ndarray]:
+    """Build a keep_map with the same selection logic ``prune`` uses.
+
+    One entry point for the three-way branch (model-wide column selection,
+    strided per-layer, bottom per-layer) so callers that need to reproduce
+    exactly what ``mlx-fun prune`` would remove — the probe's prune-set
+    verification, for instance — never drift from the CLI.
+
+    Args:
+        scores: (num_layers, num_experts) saliency scores. Higher = more important.
+        n_prune: Experts to prune per layer, or globally when ``model_wide``.
+        strategy: "bottom" (lowest-scoring) or "strided". Ignored when
+            ``model_wide`` is set.
+        model_wide: Select expert *indices* globally and drop them from every layer.
+        protected_experts: Optional layer_idx -> expert IDs to never prune.
+        targeted_experts: Optional layer_idx -> expert IDs to always prune.
+        min_experts_per_layer: Minimum experts to keep per layer (model-wide only).
+        ignored_experts: Optional set of expert indices never pruned (model-wide only).
+
+    Returns:
+        Dict mapping layer_index -> numpy array of kept expert indices (sorted).
+
+    Raises:
+        ValueError: For an unknown strategy, or from the underlying selector.
+    """
+    if model_wide:
+        return select_experts_to_keep_model_wide(
+            scores, n_prune,
+            protected_experts=protected_experts,
+            targeted_experts=targeted_experts,
+            min_experts_per_layer=min_experts_per_layer,
+            ignored_experts=ignored_experts,
+        )
+    if strategy == "strided":
+        return select_experts_to_keep_strided(
+            scores, n_prune,
+            protected_experts=protected_experts,
+            targeted_experts=targeted_experts,
+        )
+    if strategy != "bottom":
+        raise ValueError(f"Unknown strategy '{strategy}'. Use: bottom, strided")
+    return select_experts_to_keep(
+        scores, n_prune,
+        protected_experts=protected_experts,
+        targeted_experts=targeted_experts,
+    )
+
+
 def _slice_switch_linear(proj, keep: mx.array):
     """Slice a SwitchLinear or QuantizedSwitchLinear on the expert axis."""
     proj.weight = mx.take(proj.weight, keep, axis=0)

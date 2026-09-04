@@ -35,9 +35,9 @@ class DomainReport:
     domain_experts: Dict[int, List[int]] = field(default_factory=dict)
     general_experts: Dict[int, List[int]] = field(default_factory=dict)
 
-    def save(self, path: str):
-        """Save report as JSON."""
-        data = {
+    def to_dict(self) -> dict:
+        """JSON-serializable form. Subclasses extend this with their extras."""
+        return {
             "domain_name": self.domain_name,
             "num_layers": self.num_layers,
             "num_experts": self.num_experts,
@@ -48,8 +48,11 @@ class DomainReport:
             "domain_experts": {str(k): v for k, v in self.domain_experts.items()},
             "general_experts": {str(k): v for k, v in self.general_experts.items()},
         }
+
+    def save(self, path: str):
+        """Save report as JSON."""
         with open(path, "w") as f:
-            json.dump(data, f, indent=2)
+            json.dump(self.to_dict(), f, indent=2)
 
     @classmethod
     def load(cls, path: str) -> "DomainReport":

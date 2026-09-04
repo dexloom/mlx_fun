@@ -6,7 +6,11 @@ build/
 .venv/
 *.npz
 *.safetensors
-data/
+data/*
+# Probe question sets are curated source, not data artifacts.
+!data/probes/
+# Hand-written calibration corpora are source too (downloaded sets are not).
+!data/corpora/
 datasets/
 pruned_*/
 .claude/

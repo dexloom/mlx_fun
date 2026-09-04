@@ -6,7 +6,7 @@
 ┌───────────────────────────────────────────────────────────────────────────────────────────────┐
 │                                         CLI (cli.py)                                           │
 │  collect / prune / merge / smoke-test / serve / ui / safety-scan / steer / abliterate          │
-│  domain-scan / amplify / convert-nvfp4 / stats-{diff,merge,purge}                              │
+│  domain-scan / domain-probe / amplify / convert-nvfp4 / stats-{diff,merge,purge}                │
 └──┬────────────┬───────────┬──────────┬─────────────┬────────────┬──────────────┬──────────────┘
    │            │           │          │             │            │              │
 ┌──▼──────┐ ┌──▼─────┐ ┌───▼────┐ ┌───▼──────────┐ │      ┌─────▼──────────┐ ┌─▼────────────┐
@@ -76,6 +76,18 @@
   for domain-vs-general analysis, classifies experts via `DomainReport`,
   computes amplification biases, and permanently modifies gate parameters
   (nn.Linear bias or correction_bias) for hook-free inference.
+- **Probe** (`probe.py`) scores expert relevance from a Q&A set instead of a
+  corpus. It traces routing over the answer-producing positions
+  (`[prompt_len-1 : prompt_len-1+n_answer]`, since logits at `t` predict token
+  `t+1`), weights every question equally regardless of answer length, and then
+  verifies candidates by masking them out of the *real* router:
+  `expert_mask` adds a large negative bias to the parameter that enters the
+  top-k selection score (post-sigmoid `e_score_correction_bias` for
+  MiniMax/GLM/DeepSeek, a temporary pre-softmax `gate.bias` for Qwen) and
+  restores it in `finally`. No surrogate router and no hooks during scoring, so
+  grouped selection, `norm_topk_prob` and `routed_scaling_factor` still apply.
+  `ProbeReport` extends `DomainReport`, so every existing consumer reads it
+  unchanged. Gemma 4 is unsupported for knockout.
 - **KV Compress** (`kv_compress.py`) implements TurboQuant PolarQuant
   rotation-based KV compression. `TurboQuantKVCache` stores rotated-quantized
   K/V in MLX's native packed format. For supported models, patches the
@@ -215,6 +227,69 @@ All output models load via `mlx_lm.load()` — no special loaders needed.
   }
 }
 ```
+
+### `probe_report.json` (domain-probe)
+
+A superset of `domain_report.json` — the nine base keys are written exactly as
+`DomainReport.save` writes them, so `prune --domain-map`, `amplify`,
+`serve --domain-map` and the steering API load it unchanged and ignore the rest.
+
+```json
+{
+  "domain_name": "solidity",
+  "num_layers": 78, "num_experts": 256, "threshold_percentile": 90.0,
+  "differential_freq": [[...]],
+  "differential_activation": [[...]],
+  "composite_score": [[...]],
+  "domain_experts": {"12": [201, 17]},
+  "general_experts": {"3": [45]},
+
+  "answer_mode": "teacher",
+  "scoring": "question_weighted",
+  "activation_metric": "routed_weight",
+  "saliency_weighting": "question",
+  "num_domain_questions": 84, "num_general_questions": 81,
+  "skipped_questions": {"domain": 2, "general": 0},
+  "min_coverage": 0.0,
+  "domain_mean_freq": [[...]], "general_mean_freq": [[...]],
+  "domain_coverage": [[...]], "general_coverage": [[...]],
+
+  "knockout": {
+    "backend": "gate_selection_mask", "mask_value": -1e9,
+    "num_questions": 84, "dropped_nonfinite_baseline": 0,
+    "plain_baseline_nll": 0.91, "baseline_nll": 0.91,
+    "min_delta": 0.02, "min_valid_fraction": 0.9, "bootstrap": 1000,
+    "per_expert": [
+      {"layer": 12, "expert": 201, "composite": 0.97, "domain_coverage": 0.62,
+       "mean_delta": 0.15, "median_delta": 0.11,
+       "ci_low": 0.09, "ci_high": 0.22,
+       "n_total": 84, "n_valid": 84, "n_nonfinite": 0,
+       "valid_fraction": 1.0, "status": "verified"}
+    ]
+  },
+  "knockout_delta": [[...]],
+  "verified_domain_experts": {"12": [201]},
+
+  "prune_check": {
+    "source": "build_keep_map", "n_prune": 32, "metric": "freq",
+    "strategy": "bottom", "model_wide": false, "protect_domain": true,
+    "masked_pairs": 2496,
+    "domain":  {"mean_delta": 0.08, "status": "verified", "interpretation": "degraded", "...": "..."},
+    "general": {"mean_delta": 0.31, "status": "verified", "interpretation": "degraded", "...": "..."}
+  }
+}
+```
+
+`differential_activation` holds the differential mean *routed weight* here, not
+the mean gate logit `domain-scan` records — `activation_metric` says which.
+`knockout` is `null` with `--verify-top 0`, `prune_check` is `null` unless
+`--verify-prune` is given, and `knockout_delta` is zero at every pair that was
+not checked. In `prune_check` a `verified` status means the damage is credible,
+which is why each entry also carries `interpretation` (`degraded` /
+`unchanged`).
+
+`--saliency-output` writes a standard `SaliencyAccumulator` `.npz` alongside it,
+built from the domain answer tokens, for `prune --saliency`.
 
 ### `conversion_metadata.json` (NVFP4 / streaming converters)
 

@@ -55,3 +55,22 @@ def test_prune_requires_args():
     runner = CliRunner()
     result = runner.invoke(main, ["prune"])
     assert result.exit_code != 0
+
+
+def test_domain_probe_command_registered():
+    """domain-probe is wired up and exposes its key options."""
+    runner = CliRunner()
+    result = runner.invoke(main, ["domain-probe", "--help"])
+    assert result.exit_code == 0
+    for flag in (
+        "--model", "--domain-questions", "--general-questions", "--output",
+        "--answer-mode", "--verify-top", "--verify-prune", "--saliency-output",
+        "--min-coverage", "--chat-template-args",
+    ):
+        assert flag in result.output
+
+
+def test_domain_probe_requires_args():
+    runner = CliRunner()
+    result = runner.invoke(main, ["domain-probe"])
+    assert result.exit_code != 0

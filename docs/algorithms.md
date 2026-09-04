@@ -165,6 +165,124 @@ centroids.
 | **Memory at prune time** | Low | Higher (computes expert outputs for similarity) |
 | **Dependencies** | None extra | `scipy` (optional, for Hungarian alignment) |
 
+## Domain probing: Q&A scoring + knockout
+
+`domain-probe` answers a different question from REAP saliency. REAP asks "how
+much does this expert contribute overall"; the probe asks "does this expert
+matter *for this domain*", using questions rather than a corpus.
+
+### 1. Answer-position routing
+
+Each question is chat-templated with `add_generation_prompt=True`, giving a
+prompt of length `P`. In teacher mode the reference answer's `A` tokens are
+appended and one forward pass scores them; in generate mode the model writes
+the answer with the observer hooks live.
+
+Logits at position `t` predict token `t+1`, so the `A` scored predictions are
+produced by positions `[P-1, P+A-2]`. Routing is attributed to exactly those
+positions. Two consequences:
+
+- The observational score and the knockout delta describe the same predictions.
+- The routing decision that produces the *first* answer token is included —
+  often the most domain-specific one (`pragma`, `function`, `mapping`).
+
+In generate mode mlx-lm forwards every token before yielding it (prefill of
+`P-1`, then the last prompt token, then one forward per generated token), so
+captures cover exactly `P + G` positions for `G` generated tokens. The slicer
+asserts this rather than assuming it.
+
+### 2. Question-weighted differential
+
+For question `q`, layer `l`, expert `e`, over its `A_q` answer positions:
+
+```
+freq_q[l,e]   = (positions routing to e) / A_q      # rows sum to top_k
+weight_q[l,e] = (sum of e's routed weight) / A_q
+```
+
+These per-question vectors are averaged across questions, so a 200-token answer
+and a 10-token answer count the same. This is the substantive difference from
+`domain-scan`, which normalizes by total tokens and lets one long sample
+dominate.
+
+```
+diff_freq   = mean_freq(domain)   - mean_freq(general)
+diff_weight = mean_weight(domain) - mean_weight(general)
+composite   = 0.5 * layer_norm(diff_freq) + 0.5 * layer_norm(diff_weight)
+```
+
+`layer_norm` is the same per-layer min-max used by `safety-scan`. Classification
+into domain/general experts then reuses `identify_domain_experts` unchanged.
+
+`coverage[l,e]` — the fraction of questions in which the expert fired at least
+once — is tracked separately. `--min-coverage` uses it to drop experts whose
+high score rests on one or two questions.
+
+Because the differential is computed from captured routing rather than
+recomputed from logits, it reflects the true selection (correction bias,
+per-expert scale included) and needs no per-architecture top-k replication.
+
+### 3. Knockout verification
+
+An expert with a high differential is *correlated* with the domain. To test
+whether it *matters*, mask it and measure the damage:
+
+```
+baseline_i = NLL of answer i with a zero mask installed
+masked_i   = NLL of answer i with expert (l,e) unselectable
+delta_i    = masked_i - baseline_i
+```
+
+The mask is a large negative bias added to the parameter that enters the top-k
+**selection score**:
+
+| Architecture family | Parameter | Why |
+|---|---|---|
+| MiniMax (M1, M2) | `block.e_score_correction_bias` | selection is `argmax(sigmoid(logits) + bias)`, so the mask must land *after* the sigmoid |
+| GLM4 / GLM-5 / DeepSeek V3.2 / Nemotron-H | `gate.e_score_correction_bias` | `group_expert_select` adds it before group scoring and top-k |
+| Qwen3 / Qwen3-Next / Qwen4-Exp | temporary `gate.bias` | pre-softmax logit; softmax is monotonic and there is no post-softmax correction |
+
+Masking the pre-sigmoid logits instead (what `amplify` biases) would not work
+for the sigmoid families: an expert with a large positive correction bias can
+survive an arbitrarily negative pre-sigmoid bias. Because only a parameter
+changes, the model's own routing runs — grouped selection, `norm_topk_prob`,
+`routed_scaling_factor`, latent projections — with no surrogate router and no
+hooks. Gemma 4 has no mapping and raises.
+
+The baseline is measured with an all-zero mask installed, on the same code
+path, so an expert the router never selects yields a delta of exactly `0.0`.
+
+### 4. Paired statistics
+
+Deltas are paired per question, never pooled means of different question sets.
+A masked run that goes non-finite is a *collapse* for that question and is
+counted, not dropped — otherwise a mask that destroys half the answers could
+average out to "harmless" over the surviving half.
+
+| status | condition |
+|---|---|
+| `catastrophic` | usable pairs < 50% |
+| `inconclusive` | usable pairs < `--min-valid-fraction` (default 0.9) |
+| `verified` | `mean_delta >= --min-delta` and the bootstrap CI lower bound > 0 |
+| `not_verified` | otherwise |
+
+The CI comes from a seeded bootstrap over the paired deltas (`--bootstrap`,
+default 1000 resamples). Only `verified` experts enter
+`verified_domain_experts`; the classified `domain_experts` set is never narrowed
+by the knockout, since only the top `--verify-top` are checked.
+
+### 5. Prune-set verification
+
+`--verify-prune N` masks the exact set `prune` would remove — the same
+`pruner.build_keep_map` call the CLI makes, with the domain experts protected —
+and reports the paired delta on both question sets. A healthy result is small
+damage on the domain set relative to the general set.
+
+The check masks experts in the *original* router; a real pruned checkpoint has
+a smaller expert axis (and a grouped router keeps `n_group` over fewer experts).
+It is the closest available stand-in, not proof — confirm with `smoke-test` or
+an eval on the pruned model.
+
 ## Supported architectures
 
 | Architecture | Config key | MoE location | Notes |

@@ -144,8 +144,7 @@ def prune(model, saliency, expert_list, output, n_prune, metric, strategy, model
 
     from .adapters import get_adapter
     from .pruner import (
-        select_experts_to_keep, select_experts_to_keep_strided,
-        select_experts_to_keep_model_wide,
+        build_keep_map,
         prune_model, load_safety_constraints, load_domain_constraints,
         load_expert_list, parse_expert_list,
     )
@@ -222,7 +221,8 @@ def prune(model, saliency, expert_list, output, n_prune, metric, strategy, model
                         np.union1d(protected_experts[li], ex) if li in protected_experts else ex
                     )
 
-        keep_map = select_experts_to_keep(
+        # Stream mode has always used per-layer bottom selection; keep it that way.
+        keep_map = build_keep_map(
             scores, n_prune,
             protected_experts=protected_experts,
             targeted_experts=targeted_experts,
@@ -299,38 +299,31 @@ def prune(model, saliency, expert_list, output, n_prune, metric, strategy, model
             raise click.UsageError("--domain-mode is required when --domain-map is provided.")
 
         # Select experts to keep based on mode
+        ignored_set = None
         if model_wide:
             # Parse ignored experts if provided
-            ignored_set = None
             if ignore_experts:
                 ignored_set = parse_expert_list(ignore_experts)
                 click.echo(f"Ignoring {len(ignored_set)} expert indices: {sorted(ignored_set)}")
-            
+
             click.echo(f"Selecting experts to prune (model-wide: {n_prune} total, metric={metric})")
-            keep_map = select_experts_to_keep_model_wide(
-                scores, n_prune,
-                protected_experts=protected_experts,
-                targeted_experts=targeted_experts,
-                min_experts_per_layer=min_experts_per_layer,
-                ignored_experts=ignored_set,
-            )
+        else:
+            click.echo(f"Selecting experts to prune (per-layer: {n_prune}/layer, metric={metric}, strategy={strategy})")
+
+        keep_map = build_keep_map(
+            scores, n_prune,
+            strategy=strategy,
+            model_wide=model_wide,
+            protected_experts=protected_experts,
+            targeted_experts=targeted_experts,
+            min_experts_per_layer=min_experts_per_layer,
+            ignored_experts=ignored_set,
+        )
+
+        if model_wide:
             # Calculate total pruned and per-layer distribution
             total_pruned = sum(original_n_experts - len(keep_map[i]) for i in range(len(keep_map)))
             click.echo(f"Model-wide pruning: {total_pruned} experts removed across {num_moe_layers} layers")
-        else:
-            click.echo(f"Selecting experts to prune (per-layer: {n_prune}/layer, metric={metric}, strategy={strategy})")
-            if strategy == "strided":
-                keep_map = select_experts_to_keep_strided(
-                    scores, n_prune,
-                    protected_experts=protected_experts,
-                    targeted_experts=targeted_experts,
-                )
-            else:
-                keep_map = select_experts_to_keep(
-                    scores, n_prune,
-                    protected_experts=protected_experts,
-                    targeted_experts=targeted_experts,
-                )
 
     # Map from accumulator layer indices to actual model layer indices
     moe_indices = adapter.moe_layer_indices()
@@ -1195,6 +1188,332 @@ def domain_scan(model, domain_dataset, general_dataset, output, domain_name,
     click.echo(f"Domain report saved to: {output}")
     click.echo(f"  Domain '{domain_name}' experts: {total_domain}, "
                f"General experts: {total_general}")
+
+
+@main.command("domain-probe")
+@click.option("--model", required=True, help="Model path or HuggingFace repo ID.")
+@click.option("--domain-questions", required=True,
+              help="JSONL of domain Q&A (e.g. data/probes/solidity.jsonl).")
+@click.option("--general-questions", required=True,
+              help="JSONL of contrast Q&A (e.g. data/probes/general.jsonl).")
+@click.option("--output", required=True, help="Output path for probe_report.json.")
+@click.option("--saliency-output", default=None,
+              help="Optional .npz of domain answer routing, for prune --saliency.")
+@click.option("--saliency-weighting", default="question",
+              type=click.Choice(["question", "token"]),
+              help="Weight each question equally, or each answer token equally.")
+@click.option("--answers-output", default=None,
+              help="Optional JSONL of generated answers (generate mode).")
+@click.option("--domain-name", default=None,
+              help="Domain label. Default: the stem of --domain-questions.")
+@click.option("--answer-mode", default="teacher",
+              type=click.Choice(["teacher", "generate"]),
+              help="'teacher' scores reference answers; 'generate' has the model answer.")
+@click.option("--max-questions", default=0, type=int,
+              help="Subsample this many questions per set (0 = all).")
+@click.option("--max-answer-tokens", default=128, type=int,
+              help="Cap on reference-answer tokens and generated tokens.")
+@click.option("--threshold-percentile", default=90.0, type=float,
+              help="Percentile threshold for classifying domain experts.")
+@click.option("--min-coverage", default=0.0, type=float,
+              help="Drop domain experts used in fewer than this fraction of questions.")
+@click.option("--verify-top", default=32, type=int,
+              help="Knockout-verify this many top experts (0 disables).")
+@click.option("--verify-questions", default=0, type=int,
+              help="Use this many domain questions for verification (0 = all).")
+@click.option("--min-delta", default=0.02, type=float,
+              help="Minimum mean NLL increase (nats/token) to call an expert verified.")
+@click.option("--min-valid-fraction", default=0.9, type=float,
+              help="Below this fraction of usable question pairs, a result is inconclusive.")
+@click.option("--bootstrap", default=1000, type=int,
+              help="Bootstrap resamples for the delta confidence interval (0 disables).")
+@click.option("--verify-prune", default=0, type=int,
+              help="Also verify the exact set `prune` would remove at this n_prune.")
+@click.option("--verify-metric", default="freq",
+              type=click.Choice(["reap", "ean", "freq", "weighted_freq"]),
+              help="Saliency metric for the prune-set check.")
+@click.option("--verify-strategy", default="bottom",
+              type=click.Choice(["bottom", "strided"]),
+              help="Selection strategy for the prune-set check.")
+@click.option("--verify-model-wide", is_flag=True,
+              help="Prune-set check uses model-wide column selection.")
+@click.option("--verify-min-experts-per-layer", default=1, type=int,
+              help="Minimum experts per layer for a model-wide prune-set check.")
+@click.option("--verify-protect-domain/--no-verify-protect-domain", default=True,
+              help="Protect domain experts in the prune-set check, as prune --domain-mode protect does.")
+@click.option("--mask-value", default=-1e9, type=float,
+              help="Additive selection-score mask used for knockouts.")
+@click.option("--chat-template-args", default=None,
+              help="JSON object of extra chat-template kwargs, e.g. "
+                   "--chat-template-args '{\"enable_thinking\":false}'.")
+@click.option("--system", default=None, help="Default system prompt for every question.")
+@click.option("--seed", default=None, type=int, help="Random seed.")
+@click.option("--show-questions", is_flag=True, help="Echo each question and answer.")
+def domain_probe(model, domain_questions, general_questions, output, saliency_output,
+                 saliency_weighting, answers_output, domain_name, answer_mode,
+                 max_questions, max_answer_tokens, threshold_percentile, min_coverage,
+                 verify_top, verify_questions, min_delta, min_valid_fraction, bootstrap,
+                 verify_prune, verify_metric, verify_strategy, verify_model_wide,
+                 verify_min_experts_per_layer, verify_protect_domain, mask_value,
+                 chat_template_args, system, seed, show_questions):
+    """Score expert relevance to a domain by asking the model questions.
+
+    Traces which experts the model routes to while answering domain questions
+    versus general ones, then verifies the top candidates by masking them out of
+    the real router and measuring how much the answers degrade. The report feeds
+    `prune --domain-map`, `amplify` and `serve --domain-map` unchanged.
+    """
+    import json as _json
+    import random
+    from pathlib import Path
+
+    import numpy as np
+    from tqdm import tqdm
+
+    from .adapters import get_adapter
+    from .domain import identify_domain_experts
+    from .loader import load_model, text_forward, is_vision_model
+    from .observer import install_hooks, remove_hooks
+    from .probe import (
+        DOMAIN, GENERAL, ProbeReport, ProbeStats,
+        apply_coverage_filter, compute_probe_scores, load_probe_set,
+        run_knockout, run_prune_check, select_knockout_candidates,
+        trace_question_set,
+    )
+    from .pruner import build_keep_map
+
+    if seed is not None:
+        random.seed(seed)
+
+    parsed_chat_template_args = {}
+    if chat_template_args:
+        try:
+            parsed_chat_template_args = _json.loads(chat_template_args)
+            if not isinstance(parsed_chat_template_args, dict):
+                raise ValueError("expected a JSON object")
+        except Exception as e:
+            raise click.BadParameter(
+                f"--chat-template-args must be a JSON object: {e}"
+            )
+
+    if domain_name is None:
+        domain_name = Path(domain_questions).stem
+
+    expanded_model = os.path.expanduser(model)
+    if os.path.exists(expanded_model):
+        model = expanded_model
+    click.echo(f"Loading model: {model}")
+    mlx_model, tokenizer, config = load_model(model)
+
+    if answer_mode == "generate" and is_vision_model(config):
+        raise click.ClickException(
+            f"--answer-mode generate drives mlx-lm's text generation loop, which "
+            f"cannot run the vision-language model '{config.get('model_type')}'. "
+            f"Use --answer-mode teacher, which scores reference answers with a "
+            f"token-only forward pass."
+        )
+
+    adapter = get_adapter(mlx_model, config)
+    moe_indices = adapter.moe_layer_indices()
+    n_experts = adapter.num_routed_experts()
+    top_k = adapter.num_experts_per_tok()
+    model_type = config.get("model_type", "")
+    moe_blocks = [adapter.get_moe_block(i) for i in moe_indices]
+    forward = text_forward(mlx_model, config)
+
+    click.echo(f"Model type: {model_type}, MoE layers: {len(moe_indices)}, "
+               f"Experts: {n_experts}, top_k: {top_k}")
+
+    stats = ProbeStats(num_layers=len(moe_indices), num_experts=n_experts)
+    examples = {}
+    skipped = {}
+    generated_rows = []
+
+    for label, path in ((DOMAIN, domain_questions), (GENERAL, general_questions)):
+        questions = load_probe_set(path, max_questions)
+        click.echo(f"Loaded {len(questions)} {label} questions from {path}")
+
+        def _echo(index, question, answer, _label=label):
+            if show_questions:
+                click.echo(f"  [{_label} {index}] {question}\n    -> {answer}")
+            if _label == DOMAIN and answer_mode == "generate":
+                generated_rows.append({
+                    "question": question,
+                    "answer": answer,
+                    "tags": questions[index].tags,
+                })
+
+        bar = tqdm(total=len(questions), desc=f"Probing {label}")
+        install_hooks(moe_blocks, model_type)
+        try:
+            examples[label], skipped[label] = trace_question_set(
+                forward, mlx_model, tokenizer, questions, label, stats, moe_blocks,
+                num_experts=n_experts,
+                answer_mode=answer_mode,
+                max_answer_tokens=max_answer_tokens,
+                chat_template_args=parsed_chat_template_args,
+                system=system,
+                saliency_weighting=saliency_weighting,
+                echo=_echo,
+                progress=lambda done, total: bar.update(1),
+            )
+        finally:
+            remove_hooks(moe_blocks)
+            bar.close()
+
+        if skipped[label]:
+            click.echo(f"  Skipped {len(skipped[label])} {label} questions "
+                       f"(first: {skipped[label][0]['reason']})")
+
+    if not examples[DOMAIN]:
+        raise click.ClickException(
+            "No domain questions produced usable answers. In teacher mode every "
+            "question needs a non-empty 'answer' field."
+        )
+
+    click.echo("Computing differential scores...")
+    diff_freq, diff_weight, composite = compute_probe_scores(stats)
+    report = identify_domain_experts(
+        diff_freq, diff_weight, composite, domain_name, threshold_percentile,
+    )
+    domain_coverage = stats.coverage_fraction(DOMAIN)
+    domain_experts = apply_coverage_filter(
+        report.domain_experts, domain_coverage, min_coverage,
+    )
+
+    probe = ProbeReport(
+        domain_name=domain_name,
+        num_layers=report.num_layers,
+        num_experts=report.num_experts,
+        threshold_percentile=threshold_percentile,
+        differential_freq=diff_freq,
+        differential_activation=diff_weight,
+        composite_score=composite,
+        domain_experts=domain_experts,
+        general_experts=report.general_experts,
+        answer_mode=answer_mode,
+        saliency_weighting=saliency_weighting,
+        num_domain_questions=stats.n_questions[DOMAIN],
+        num_general_questions=stats.n_questions[GENERAL],
+        skipped_questions={k: len(v) for k, v in skipped.items()},
+        min_coverage=min_coverage,
+        domain_mean_freq=stats.mean_freq(DOMAIN),
+        general_mean_freq=stats.mean_freq(GENERAL),
+        domain_coverage=domain_coverage,
+        general_coverage=stats.coverage_fraction(GENERAL),
+    )
+
+    verify_examples = examples[DOMAIN]
+    verify_general = examples[GENERAL]
+    if verify_questions > 0:
+        verify_examples = verify_examples[:verify_questions]
+        verify_general = verify_general[:verify_questions]
+
+    candidates = select_knockout_candidates(composite, domain_experts, verify_top)
+    if candidates:
+        click.echo(f"Knocking out {len(candidates)} candidate experts over "
+                   f"{len(verify_examples)} questions...")
+        bar = tqdm(total=len(candidates), desc="Knockout")
+        try:
+            knockout = run_knockout(
+                forward, verify_examples, moe_blocks, model_type,
+                num_experts=n_experts, top_k=top_k, candidates=candidates,
+                composite=composite, coverage=domain_coverage,
+                mask_value=mask_value, min_delta=min_delta,
+                min_valid_fraction=min_valid_fraction, n_boot=bootstrap,
+                seed=seed or 0,
+                progress=lambda done, total: bar.update(1),
+            )
+        finally:
+            bar.close()
+
+        delta = np.zeros_like(composite)
+        verified = {}
+        for entry in knockout.per_expert:
+            delta[entry["layer"], entry["expert"]] = entry["mean_delta"]
+            if entry["status"] == "verified":
+                verified.setdefault(entry["layer"], []).append(entry["expert"])
+        probe.knockout = {
+            "backend": "gate_selection_mask",
+            "mask_value": mask_value,
+            "num_questions": knockout.num_questions,
+            "dropped_nonfinite_baseline": knockout.dropped_nonfinite_baseline,
+            "plain_baseline_nll": knockout.plain_baseline_nll,
+            "baseline_nll": knockout.baseline_nll,
+            "min_delta": min_delta,
+            "min_valid_fraction": min_valid_fraction,
+            "bootstrap": bootstrap,
+            "per_expert": knockout.per_expert,
+        }
+        probe.knockout_delta = delta
+        probe.verified_domain_experts = verified
+
+        click.echo(f"  Baseline NLL: {knockout.baseline_nll:.4f} "
+                   f"(unmasked {knockout.plain_baseline_nll:.4f})")
+        for entry in sorted(knockout.per_expert,
+                            key=lambda e: -abs(e["mean_delta"]))[:5]:
+            click.echo(f"    L{entry['layer']} E{entry['expert']}: "
+                       f"delta={entry['mean_delta']:+.4f} "
+                       f"[{entry['ci_low']:+.4f}, {entry['ci_high']:+.4f}] "
+                       f"{entry['status']}")
+        n_verified = sum(len(v) for v in verified.values())
+        click.echo(f"  Verified {n_verified} of {len(candidates)} candidates")
+
+    if verify_prune > 0:
+        scores = stats.saliency.compute_scores(verify_metric)
+        protected = None
+        if verify_protect_domain:
+            protected = {
+                k: np.array(v, dtype=np.intp) for k, v in domain_experts.items()
+            }
+        keep_map = build_keep_map(
+            scores, verify_prune,
+            strategy=verify_strategy,
+            model_wide=verify_model_wide,
+            protected_experts=protected,
+            min_experts_per_layer=verify_min_experts_per_layer,
+        )
+        click.echo(f"Verifying the prune set (n_prune={verify_prune}, "
+                   f"metric={verify_metric}, strategy={verify_strategy})...")
+        check = run_prune_check(
+            forward, verify_examples, verify_general, moe_blocks, model_type,
+            num_experts=n_experts, top_k=top_k, keep_map=keep_map,
+            mask_value=mask_value, min_delta=min_delta,
+            min_valid_fraction=min_valid_fraction, n_boot=bootstrap, seed=seed or 0,
+        )
+        check.update({
+            "source": "build_keep_map",
+            "n_prune": verify_prune,
+            "metric": verify_metric,
+            "strategy": verify_strategy,
+            "model_wide": verify_model_wide,
+            "protect_domain": verify_protect_domain,
+        })
+        probe.prune_check = check
+        click.echo(f"  Masked {check['masked_pairs']} expert-layer pairs")
+        for label in (DOMAIN, GENERAL):
+            if check.get(label):
+                click.echo(f"    {label}: delta={check[label]['mean_delta']:+.4f} "
+                           f"nats/token ({check[label]['interpretation']})")
+        click.echo("  Note: this masks experts in the original router. Confirm the "
+                   "real pruned checkpoint with smoke-test.")
+
+    probe.save(output)
+    click.echo(f"Probe report saved to: {output}")
+    total_domain = sum(len(v) for v in domain_experts.values())
+    total_general = sum(len(v) for v in report.general_experts.values())
+    click.echo(f"  Domain '{domain_name}' experts: {total_domain}, "
+               f"General experts: {total_general}")
+
+    if saliency_output:
+        stats.saliency.save(saliency_output)
+        click.echo(f"Domain saliency saved to: {saliency_output}")
+
+    if answers_output and generated_rows:
+        with open(answers_output, "w") as f:
+            for row in generated_rows:
+                f.write(_json.dumps(row) + "\n")
+        click.echo(f"Generated answers saved to: {answers_output}")
 
 
 @main.command()

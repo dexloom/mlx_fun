@@ -33,6 +33,7 @@ checkpoints that load with stock `mlx_lm.load()`.
 | Feature | What it does | Docs |
 |---|---|---|
 | **Domain Scan** | Find domain-specialized experts via differential routing | [safety-and-domain](docs/safety-and-domain.md#domain-scan) |
+| **Domain Probe** | Score expert relevance by asking questions, verified by knockout | [safety-and-domain](docs/safety-and-domain.md#domain-probe--ask-the-model-questions) |
 | **Amplify** | Permanently bias gate weights so domain experts are favored natively | [safety-and-domain](docs/safety-and-domain.md#amplify--permanent-domain-gate-boost) |
 
 ### Inference optimization
@@ -124,6 +125,33 @@ from mlx_lm import load
 model, tokenizer = load("./pruned_model")
 ```
 
+### Tailor to a domain by asking questions
+
+Instead of calibrating on a corpus, ask the model domain questions and see which
+experts it uses to answer them — then check the answer holds up by masking those
+experts out of the real router:
+
+```bash
+mlx-fun domain-probe \
+    --model mlx-community/MiniMax-M1-40k-4bit \
+    --domain-questions ./data/probes/solidity.jsonl \
+    --general-questions ./data/probes/general.jsonl \
+    --output probe_report.json --saliency-output probe.npz \
+    --verify-top 32 --verify-prune 16 --seed 42
+```
+
+The report drops into `prune --domain-map` (protect those experts),
+`amplify --domain-map` (favor them permanently) and `serve --domain-map`
+(boost them at runtime); the `.npz` feeds `prune --saliency`.
+
+Four question sets ship in `data/probes/`. Pairing `security.jsonl` (vulnerability
+discovery, EVM internals, Yul) against `solidity_benign.jsonl` holds ordinary
+Solidity knowledge constant on both sides, so the probe isolates the experts used
+for security reasoning rather than for Solidity in general. A matching raw corpus
+for `collect` and `domain-scan` lives in `data/corpora/`. See
+[`safety-and-domain.md`](docs/safety-and-domain.md#domain-probe--ask-the-model-questions)
+and [`datasets.md`](docs/datasets.md#choosing-a-pair).
+
 ### Online instead of offline calibration
 
 Serve an OpenAI-compatible API with hooks that count expert activations from
@@ -214,14 +242,14 @@ Anthropic endpoints) is not wired up — the server remains text-only.
 
 | Doc | Topic |
 |---|---|
-| [`docs/algorithms.md`](docs/algorithms.md) | REAP, REAM, saliency metrics, pruning strategies, model-wide vs per-layer selection |
+| [`docs/algorithms.md`](docs/algorithms.md) | REAP, REAM, saliency metrics, pruning strategies, model-wide vs per-layer selection, Q&A probing + knockout |
 | [`docs/quantization.md`](docs/quantization.md) | NVFP4 native, mixed NVFP4+MXFP8, INT4-source streaming, NVIDIA NVFP4 reader |
 | [`docs/tool-parsers.md`](docs/tool-parsers.md) | Kimi-K2.6 permissive parser, mlx-lm tool-parser dispatch, risk audit per family |
 | [`docs/serving.md`](docs/serving.md) | Server, REST endpoints, online expert counting, runtime steering, Gradio dashboard |
-| [`docs/safety-and-domain.md`](docs/safety-and-domain.md) | SAFEx, SteerMoE, abliteration, domain scan, gate amplification |
+| [`docs/safety-and-domain.md`](docs/safety-and-domain.md) | SAFEx, SteerMoE, abliteration, domain scan, domain probe, gate amplification |
 | [`docs/kv-cache.md`](docs/kv-cache.md) | TurboQuant (PolarQuant) and RotorQuant (Clifford rotors) deep dive |
 | [`docs/cli-reference.md`](docs/cli-reference.md) | All CLI commands and flags |
-| [`docs/datasets.md`](docs/datasets.md) | Dataset formats and Solidity prep script |
+| [`docs/datasets.md`](docs/datasets.md) | Dataset formats, probe question sets, Solidity prep script |
 | [`docs/architecture.md`](docs/architecture.md) | Architecture diagram, components, Python API, output formats |
 | [`docs/convert-nvfp4.md`](docs/convert-nvfp4.md) | NVIDIA modelopt NVFP4 → MLX converter (existing) |
 

@@ -103,7 +103,8 @@ curl -X POST http://localhost:8080/v1/reap/steer \
     -H "Content-Type: application/json" \
     -d '{"safety_map": "/path/to/safety_report.json", "mode": "safe"}'
 
-# Enable steering from a domain report
+# Enable steering from a domain report (a domain-probe report works here too —
+# probe_report.json is a superset and the extra keys are ignored)
 curl -X POST http://localhost:8080/v1/reap/steer \
     -d '{"domain_map": "/path/to/domain_report.json", "mode": "boost"}'
 

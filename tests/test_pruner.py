@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from mlx_fun.pruner import (
+    build_keep_map,
     select_experts_to_keep,
     select_experts_to_keep_strided,
     select_experts_to_keep_model_wide,
@@ -886,3 +887,75 @@ def test_load_expert_list_csv_case_insensitive_action(tmp_path):
     
     # Experts 0 and 1 should be kept (case-insensitive)
     np.testing.assert_array_equal(keep_map[0], [0, 1])
+
+
+# ---------------------------------------------------------------------------
+# build_keep_map — the single entry point cli.prune and the probe both use
+# ---------------------------------------------------------------------------
+
+class TestBuildKeepMap:
+    """build_keep_map must reproduce the three selection branches exactly."""
+
+    @staticmethod
+    def _scores():
+        rng = np.random.default_rng(0)
+        return rng.random((4, 8))
+
+    def _assert_same(self, a, b):
+        assert set(a.keys()) == set(b.keys())
+        for layer in a:
+            np.testing.assert_array_equal(a[layer], b[layer])
+
+    def test_matches_bottom(self):
+        scores = self._scores()
+        self._assert_same(
+            build_keep_map(scores, 3),
+            select_experts_to_keep(scores, 3),
+        )
+
+    def test_matches_strided(self):
+        scores = self._scores()
+        self._assert_same(
+            build_keep_map(scores, 3, strategy="strided"),
+            select_experts_to_keep_strided(scores, 3),
+        )
+
+    def test_matches_model_wide(self):
+        scores = self._scores()
+        self._assert_same(
+            build_keep_map(scores, 3, model_wide=True, min_experts_per_layer=2),
+            select_experts_to_keep_model_wide(
+                scores, 3, min_experts_per_layer=2,
+            ),
+        )
+
+    def test_model_wide_ignores_strategy(self):
+        """model_wide wins over strategy, matching cli.prune's branch order."""
+        scores = self._scores()
+        self._assert_same(
+            build_keep_map(scores, 3, strategy="strided", model_wide=True),
+            select_experts_to_keep_model_wide(scores, 3),
+        )
+
+    def test_forwards_constraints(self):
+        scores = self._scores()
+        protected = {0: np.array([1], dtype=np.intp)}
+        targeted = {1: np.array([2], dtype=np.intp)}
+        keep = build_keep_map(
+            scores, 3, protected_experts=protected, targeted_experts=targeted,
+        )
+        assert 1 in keep[0]
+        assert 2 not in keep[1]
+
+    def test_forwards_ignored_experts(self):
+        scores = self._scores()
+        keep = build_keep_map(
+            scores, 3, model_wide=True, ignored_experts={0, 1},
+        )
+        for layer_keep in keep.values():
+            assert 0 in layer_keep
+            assert 1 in layer_keep
+
+    def test_unknown_strategy_raises(self):
+        with pytest.raises(ValueError, match="Unknown strategy"):
+            build_keep_map(self._scores(), 3, strategy="nonsense")

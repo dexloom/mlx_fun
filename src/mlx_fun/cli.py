@@ -843,7 +843,7 @@ def safety_scan(model, harmful_dataset, benign_dataset, output, max_samples,
     from .ream_hooks import install_ream_hooks, collect_ream_data, remove_ream_hooks
     from .safety import (
         DifferentialAccumulator, compute_differential_scores,
-        identify_safety_experts, compute_top_k_from_logits,
+        identify_safety_experts,
     )
 
     # Load model
@@ -879,13 +879,13 @@ def safety_scan(model, harmful_dataset, benign_dataset, output, max_samples,
 
             captures = collect_ream_data(moe_blocks)
             for block_idx, block_captures in enumerate(captures):
-                for layer_input, gate_logits in block_captures:
+                for layer_input, gate_logits, sel_inds in block_captures:
                     # Flatten batch and seq dims
                     gl_2d = gate_logits.reshape(-1, gate_logits.shape[-1])
                     acc.update_from_gate_logits(block_idx, gl_2d, dataset_name)
-                    # Compute top-k and update frequency
-                    top_k_inds = compute_top_k_from_logits(gl_2d, model_type, top_k)
-                    acc.update_from_top_k(block_idx, top_k_inds, dataset_name)
+                    # Real selection captured from the gate, not reconstructed.
+                    inds_2d = sel_inds.reshape(-1, sel_inds.shape[-1])
+                    acc.update_from_top_k(block_idx, inds_2d, dataset_name)
 
         remove_ream_hooks(moe_blocks)
 
@@ -1128,7 +1128,6 @@ def domain_scan(model, domain_dataset, general_dataset, output, domain_name,
     from .ream_hooks import install_ream_hooks, collect_ream_data, remove_ream_hooks
     from .safety import (
         DifferentialAccumulator, compute_differential_scores,
-        compute_top_k_from_logits,
     )
 
     # Load model
@@ -1168,11 +1167,12 @@ def domain_scan(model, domain_dataset, general_dataset, output, domain_name,
 
             captures = collect_ream_data(moe_blocks)
             for block_idx, block_captures in enumerate(captures):
-                for layer_input, gate_logits in block_captures:
+                for layer_input, gate_logits, sel_inds in block_captures:
                     gl_2d = gate_logits.reshape(-1, gate_logits.shape[-1])
                     acc.update_from_gate_logits(block_idx, gl_2d, acc_label)
-                    top_k_inds = compute_top_k_from_logits(gl_2d, model_type, top_k)
-                    acc.update_from_top_k(block_idx, top_k_inds, acc_label)
+                    # Real selection captured from the gate, not reconstructed.
+                    inds_2d = sel_inds.reshape(-1, sel_inds.shape[-1])
+                    acc.update_from_top_k(block_idx, inds_2d, acc_label)
 
         remove_ream_hooks(moe_blocks)
 
@@ -1406,8 +1406,13 @@ def domain_probe(model, domain_questions, general_questions, output, saliency_ou
     verify_examples = examples[DOMAIN]
     verify_general = examples[GENERAL]
     if verify_questions > 0:
-        verify_examples = verify_examples[:verify_questions]
-        verify_general = verify_general[:verify_questions]
+        # Seeded sample, not the first N: the shipped sets are ordered by topic,
+        # so a prefix would over-test whatever tag happens to come first.
+        vrng = random.Random(seed if seed is not None else 0)
+        if len(verify_examples) > verify_questions:
+            verify_examples = vrng.sample(verify_examples, verify_questions)
+        if len(verify_general) > verify_questions:
+            verify_general = vrng.sample(verify_general, verify_questions)
 
     candidates = select_knockout_candidates(composite, domain_experts, verify_top)
     if candidates:

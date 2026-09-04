@@ -4,6 +4,12 @@ Unlike the REAP observer which captures top-k indices/scores/norms, REAM needs:
 - The raw MoE block input x (for similarity and permutation alignment)
 - Full gate logits for ALL experts (before top-k selection)
 
+Each capture also carries the **real** selected expert indices the block's own
+routing produced, so callers that need selection frequency use the true
+selection (grouped top-k, ``e_score_correction_bias``, per-expert scale and all)
+rather than reconstructing it from the raw logits. The REAM merger ignores the
+third element; the safety and domain scans use it.
+
 Uses the same __class__ swap pattern as observer.py.
 """
 
@@ -16,18 +22,19 @@ from .observer import _to_numpy
 
 
 def _minimax_ream_call(self, x: mx.array) -> mx.array:
-    """Capture input + full gate logits, then run normal MiniMax forward."""
-    # Capture input and gate logits
+    """Capture input, full gate logits and real selection; then normal forward."""
     gates = self.gate(x.astype(mx.float32))
-    mx.eval(x, gates)
-    self._ream_captures.append((_to_numpy(x), _to_numpy(gates)))
 
-    # Normal forward
     scores = mx.sigmoid(gates)
     orig_scores = scores
+    # Real selection is on the correction-bias-adjusted score, not raw sigmoid.
     scores = scores + self.e_score_correction_bias
     k = self.num_experts_per_tok
     inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+
+    mx.eval(x, gates, inds)
+    self._ream_captures.append((_to_numpy(x), _to_numpy(gates), _to_numpy(inds)))
+
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
     scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
     scores = scores.astype(x.dtype)
@@ -37,19 +44,20 @@ def _minimax_ream_call(self, x: mx.array) -> mx.array:
 
 
 def _glm4_ream_call(self, x: mx.array) -> mx.array:
-    """Capture input + full gate logits, then run normal GLM4 forward."""
+    """Capture input, full gate logits and real selection; then normal forward."""
     if getattr(self, "sharding_group", None) is not None:
         raise RuntimeError(
             "Merging sharded models not supported. Load without sharding."
         )
 
-    # Capture input and gate logits
     gates = x @ self.gate.weight.T
-    mx.eval(x, gates)
-    self._ream_captures.append((_to_numpy(x), _to_numpy(gates)))
-
-    # Normal forward
+    # The gate applies grouped top-k selection and the correction bias — capture
+    # what it actually selects, not a raw-sigmoid reconstruction.
     inds, scores = self.gate(x)
+
+    mx.eval(x, gates, inds)
+    self._ream_captures.append((_to_numpy(x), _to_numpy(gates), _to_numpy(inds)))
+
     # Latent projection (Nemotron-H): hidden → moe_latent_size before experts
     x_experts = x
     if hasattr(self, "fc1_latent_proj"):
@@ -64,16 +72,16 @@ def _glm4_ream_call(self, x: mx.array) -> mx.array:
 
 
 def _qwen3_moe_ream_call(self, x: mx.array) -> mx.array:
-    """Capture input + full gate logits, then run normal Qwen3 forward."""
-    # Capture input and raw gate logits (before softmax)
+    """Capture input, full gate logits and real selection; then normal forward."""
     gates_raw = self.gate(x)
-    mx.eval(x, gates_raw)
-    self._ream_captures.append((_to_numpy(x), _to_numpy(gates_raw)))
 
-    # Normal forward
     gates = mx.softmax(gates_raw, axis=-1, precise=True)
     k = self.top_k
     inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+
+    mx.eval(x, gates_raw, inds)
+    self._ream_captures.append((_to_numpy(x), _to_numpy(gates_raw), _to_numpy(inds)))
+
     scores = mx.take_along_axis(gates, inds, axis=-1)
     if self.norm_topk_prob:
         scores = scores / mx.sum(scores, axis=-1, keepdims=True)
@@ -83,16 +91,16 @@ def _qwen3_moe_ream_call(self, x: mx.array) -> mx.array:
 
 
 def _qwen3_next_ream_call(self, x: mx.array) -> mx.array:
-    """Capture input + full gate logits, then run normal Qwen3Next forward."""
-    # Capture input and raw gate logits (before softmax)
+    """Capture input, full gate logits and real selection; then normal forward."""
     gates_raw = self.gate(x)
-    mx.eval(x, gates_raw)
-    self._ream_captures.append((_to_numpy(x), _to_numpy(gates_raw)))
 
-    # Normal forward
     gates = mx.softmax(gates_raw, axis=-1, precise=True)
     k = self.top_k
     inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+
+    mx.eval(x, gates_raw, inds)
+    self._ream_captures.append((_to_numpy(x), _to_numpy(gates_raw), _to_numpy(inds)))
+
     scores = mx.take_along_axis(gates, inds, axis=-1)
     if self.norm_topk_prob:
         scores = scores / mx.sum(scores, axis=-1, keepdims=True)
@@ -106,32 +114,34 @@ def _qwen3_next_ream_call(self, x: mx.array) -> mx.array:
 
 
 def _gemma4_ream_call(self, h: mx.array) -> mx.array:
-    """Capture input + full gate logits, then run normal Gemma4 forward."""
+    """Capture input, full gate logits and real selection; then normal forward."""
     router = self.router
 
-    # Get raw gate logits (before softmax / top-k)
     x_normed = mx.fast.rms_norm(h, router.scale * router._root_size, router.eps)
     gates_raw = router.proj(x_normed)
-
-    mx.eval(h, gates_raw)
-    self._ream_captures.append((_to_numpy(h), _to_numpy(gates_raw)))
-
-    # Normal forward
+    # Real selection from the router (softmax + per-expert scale + top-k).
     top_k_indices, top_k_weights = self.router(h)
+
+    mx.eval(h, gates_raw, top_k_indices)
+    self._ream_captures.append(
+        (_to_numpy(h), _to_numpy(gates_raw), _to_numpy(top_k_indices))
+    )
+
     h2 = self.pre_feedforward_layernorm_2(h)
     return self.experts(h2, top_k_indices, top_k_weights)
 
 
 def _qwen4_exp_ream_call(self, x: mx.array) -> mx.array:
-    """Capture input + full gate logits, then run normal Qwen4-Exp forward."""
+    """Capture input, full gate logits and real selection; then normal forward."""
     gates_raw = self.gate(x)
-    mx.eval(x, gates_raw)
-    self._ream_captures.append((_to_numpy(x), _to_numpy(gates_raw)))
 
-    # Normal forward
     gates = mx.softmax(gates_raw, axis=-1, precise=True)
     k = self.top_k
     inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+
+    mx.eval(x, gates_raw, inds)
+    self._ream_captures.append((_to_numpy(x), _to_numpy(gates_raw), _to_numpy(inds)))
+
     scores = mx.take_along_axis(gates, inds, axis=-1)
     scores = scores / mx.sum(scores, axis=-1, keepdims=True)
     y = self.switch_mlp(x, inds)
@@ -160,11 +170,11 @@ _REAM_HOOK_MAP = {
 
 
 def install_ream_hooks(moe_blocks: List, model_type: str) -> None:
-    """Install REAM capture hooks on MoE blocks.
+    """Install REAM capture hooks on a list of MoE blocks.
 
     Args:
         moe_blocks: List of MoE nn.Module instances.
-        model_type: Model type string (e.g. 'qwen3_moe').
+        model_type: Model type string.
     """
     hook_fn = _REAM_HOOK_MAP.get(model_type)
     if hook_fn is None:
@@ -183,7 +193,7 @@ def install_ream_hooks(moe_blocks: List, model_type: str) -> None:
 
 
 def remove_ream_hooks(moe_blocks: List) -> None:
-    """Remove REAM hooks, restoring original class."""
+    """Remove REAM capture hooks, restoring the original class."""
     for block in moe_blocks:
         if hasattr(block, "_ream_original_cls"):
             block.__class__ = block._ream_original_cls
@@ -194,13 +204,13 @@ def remove_ream_hooks(moe_blocks: List) -> None:
 
 def collect_ream_data(
     moe_blocks: List,
-) -> List[List[Tuple[np.ndarray, np.ndarray]]]:
-    """Collect and clear captured (input, gate_logits) from hooked blocks.
+) -> List[List[Tuple[np.ndarray, np.ndarray, np.ndarray]]]:
+    """Collect and clear captured REAM data.
 
     Returns:
-        List (per block) of lists of (layer_input, gate_logits) tuples.
-        layer_input shape: (batch, seq, hidden_dim)
-        gate_logits shape: (batch, seq, num_experts)
+        List (per block) of lists of ``(layer_input, gate_logits, selected_inds)``
+        tuples. ``selected_inds`` is the real top-k selection the block's routing
+        produced, shaped ``(..., top_k)``.
     """
     all_captures = []
     for block in moe_blocks:

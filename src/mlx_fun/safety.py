@@ -29,6 +29,13 @@ def compute_top_k_from_logits(
     Replicates each model's routing logic in numpy to derive which experts
     would be selected, without running the actual model forward.
 
+    Note: for the sigmoid families (MiniMax, GLM/DeepSeek) this is only an
+    approximation — it ignores ``e_score_correction_bias`` and the GLM grouped
+    top-k, so the selection can differ from the real router. ``safety-scan`` and
+    ``domain-scan`` no longer use it; they take the real selected indices the
+    gate produced (see ``ream_hooks``). It is kept for callers that only have
+    raw logits and accept the approximation.
+
     Args:
         gate_logits: (n_tokens, num_experts) raw gate logits.
         model_type: Model type string.

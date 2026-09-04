@@ -211,7 +211,7 @@ class TestGLM5NextHooks:
     def test_ream_hook_captures_gate_logits(self, tiny_glm4_moe, sample_input):
         install_ream_hooks([tiny_glm4_moe], "glm5_next")
         tiny_glm4_moe(sample_input)
-        layer_input, gate_logits = collect_ream_data([tiny_glm4_moe])[0][0]
+        layer_input, gate_logits, sel_inds = collect_ream_data([tiny_glm4_moe])[0][0]
         remove_ream_hooks([tiny_glm4_moe])
 
         assert layer_input.shape == (1, 8, 32)

@@ -645,7 +645,7 @@ def merge_model(
         # Concatenate all captured inputs and gate logits
         all_inputs = []
         all_gates = []
-        for inp, gates in captures[0]:
+        for inp, gates, _sel in captures[0]:
             # Flatten batch and seq dims
             flat_inp = inp.reshape(-1, inp.shape[-1])
             flat_gates = gates.reshape(-1, gates.shape[-1])
@@ -768,7 +768,7 @@ def merge_model_with_keep_map(
         # Concatenate all captured inputs and gate logits
         all_inputs = []
         all_gates = []
-        for inp, gates in captures[0]:
+        for inp, gates, _sel in captures[0]:
             # Flatten batch and seq dims
             flat_inp = inp.reshape(-1, inp.shape[-1])
             flat_gates = gates.reshape(-1, gates.shape[-1])

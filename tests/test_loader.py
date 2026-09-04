@@ -170,3 +170,21 @@ class TestLoadModelRouting:
         assert (model, tokenizer) == ("model", "tokenizer")
         assert config["model_type"] == "qwen3_moe"
         assert called["return_config"] is True
+
+
+class TestGemma4AssistantImports:
+    """Regression: the Gemma 4 MTP drafter's mask helper must import from
+    mlx_lm.models.base, not a nonexistent mlx_fun.models.base (which raised
+    ModuleNotFoundError only at forward time, inside _make_masks)."""
+
+    def test_no_bad_module_reference(self):
+        import inspect
+        import mlx_fun.models.gemma4_assistant as g
+
+        src = inspect.getsource(g)
+        assert "from mlx_fun.models.base" not in src
+        assert "from .base import" not in src
+
+    def test_mask_helper_resolves(self):
+        # The symbol _make_masks pulls in must actually exist where it now points.
+        from mlx_lm.models.base import create_attention_mask  # noqa: F401

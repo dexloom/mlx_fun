@@ -35,14 +35,22 @@ mlx-fun safety-scan \
 
 ### Classification
 
-Each expert gets a composite score combining differential frequency,
-weighted frequency, and routing entropy. Experts are bucketed:
+Each expert gets a composite score, the per-layer-normalized blend of two
+differentials: the selection frequency (how often the expert is in the top-k)
+and the mean routed weight. Experts are bucketed:
 
-- **HCDG** (Harmful Content Detection Group) — activate MORE on harmful content
+- **HCDG** (Harmful Content Detection Group) — routed MORE by harmful **prompts**
   (high composite score).
-- **HRCG** (Harmful Response Control Group) — activate MORE on benign content
-  (low composite score) — these are the experts the model uses to refuse.
+- **HRCG** (Harmful Response Control Group) — routed MORE by benign **prompts**
+  (low composite score).
 - **Safety-critical** — union of HCDG and HRCG.
+
+> **What this does and does not measure.** `safety-scan` forwards prompt tokens
+> only; it never observes the model's *response*. So these groups describe which
+> experts the two prompt distributions route to differently — not, on their own,
+> the machinery the model uses to refuse. Treat HRCG as "benign-prompt-preferred
+> experts", and verify any refusal claim causally (e.g. with `domain-probe`'s
+> knockout, or by regenerating under a mask and classifying the output).
 
 The report is consumed by `prune --safety-map`, `steer`, `abliterate --target
 safety-experts`, and the server's steering API.

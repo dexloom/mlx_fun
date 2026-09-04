@@ -119,7 +119,7 @@ class TestHooksAgainstRealBlock:
 
         install_ream_hooks([real_block], "qwen4_exp")
         hooked = np.array(real_block(x), copy=False).copy()
-        layer_input, gate_logits = collect_ream_data([real_block])[0][0]
+        layer_input, gate_logits, sel_inds = collect_ream_data([real_block])[0][0]
         remove_ream_hooks([real_block])
 
         assert np.allclose(reference, hooked, atol=1e-6)
@@ -219,7 +219,7 @@ class TestGLM5NextRealBlock:
 
         install_ream_hooks([glm5_next_block], "glm5_next")
         hooked = np.array(glm5_next_block(x), copy=False).copy()
-        layer_input, gate_logits = collect_ream_data([glm5_next_block])[0][0]
+        layer_input, gate_logits, sel_inds = collect_ream_data([glm5_next_block])[0][0]
         remove_ream_hooks([glm5_next_block])
 
         assert np.allclose(reference, hooked, atol=1e-6)

@@ -195,7 +195,7 @@ class TestQwen4ExpReamHook:
         captures = collect_ream_data([tiny_qwen4_exp_moe])
         remove_ream_hooks([tiny_qwen4_exp_moe])
 
-        layer_input, gate_logits = captures[0][0]
+        layer_input, gate_logits, sel_inds = captures[0][0]
         assert layer_input.shape == (1, 8, 32)
         assert gate_logits.shape == (1, 8, N_EXPERTS)
 

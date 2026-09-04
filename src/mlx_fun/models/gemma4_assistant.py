@@ -108,7 +108,7 @@ class Model(nn.Module):
         return self.model.layers
 
     def _make_masks(self, h, cache):
-        from .base import create_attention_mask
+        from mlx_lm.models.base import create_attention_mask
 
         window = self.text_args.sliding_window
         masks_by_type = {}

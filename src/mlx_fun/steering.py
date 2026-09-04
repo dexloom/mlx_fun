@@ -232,6 +232,26 @@ def _gemma4_steering_call(self, h: mx.array) -> mx.array:
     return self.experts(h2, inds, scores)
 
 
+def _qwen4_exp_steering_call(self, x: mx.array) -> mx.array:
+    """Qwen4-Exp forward with gate logit steering."""
+    gates = self.gate(x)
+    if self._steering_bias is not None:
+        gates = gates + self._steering_bias
+    gates = mx.softmax(gates, axis=-1, precise=True)
+
+    k = self.top_k
+    inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+    scores = mx.take_along_axis(gates, inds, axis=-1)
+    scores = scores / mx.sum(scores, axis=-1, keepdims=True)
+
+    y = self.switch_mlp(x, inds)
+    y = (y * scores[..., None]).sum(axis=-2)
+
+    shared_y = self.shared_expert(x)
+    shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
+    return y + shared_y
+
+
 _STEERING_HOOK_MAP = {
     "minimax": _minimax_steering_call,
     "minimax_m2": _minimax_steering_call,
@@ -240,9 +260,11 @@ _STEERING_HOOK_MAP = {
     "glm_moe_dsa": _glm4_steering_call,
     "deepseek_v32": _glm4_steering_call,
     "nemotron_h": _glm4_steering_call,
+    "glm5_next": _glm4_steering_call,
     "qwen3_moe": _qwen3_moe_steering_call,
     "qwen3_next": _qwen3_next_steering_call,
     "gemma4": _gemma4_steering_call,
+    "qwen4_exp": _qwen4_exp_steering_call,
 }
 
 

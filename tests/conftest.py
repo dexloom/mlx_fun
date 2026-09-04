@@ -123,6 +123,36 @@ class TinyQwen3NextMoE(nn.Module):
         return y + shared_y
 
 
+class TinyQwen4ExpMoE(nn.Module):
+    """Minimal replica of Qwen4-Exp's MoE block (mlx-vlm Qwen3_5MoeSparseMoeBlock).
+
+    Same shape as Qwen3-Next's block but with unconditional score
+    renormalization — there is no ``norm_topk_prob`` switch.
+    """
+
+    def __init__(self, hidden=32, intermediate=64, n_experts=4, top_k=2):
+        super().__init__()
+        self.num_experts = n_experts
+        self.top_k = top_k
+        self.gate = nn.Linear(hidden, n_experts, bias=False)
+        self.switch_mlp = SwitchGLU(hidden, intermediate, n_experts)
+        self.shared_expert = nn.Linear(hidden, hidden)
+        self.shared_expert_gate = nn.Linear(hidden, 1, bias=False)
+
+    def __call__(self, x):
+        gates = self.gate(x)
+        gates = mx.softmax(gates, axis=-1, precise=True)
+        k = self.top_k
+        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+        scores = scores / mx.sum(scores, axis=-1, keepdims=True)
+        y = self.switch_mlp(x, inds)
+        y = (y * scores[..., None]).sum(axis=-2)
+        shared_y = self.shared_expert(x)
+        shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
+        return y + shared_y
+
+
 @pytest.fixture
 def tiny_minimax_moe():
     """Create a tiny MiniMax-style MoE block."""
@@ -157,6 +187,15 @@ def tiny_qwen3_next_moe():
     """Create a tiny Qwen3Next-style MoE block with shared expert."""
     mx.random.seed(42)
     block = TinyQwen3NextMoE(hidden=32, intermediate=64, n_experts=4, top_k=2)
+    mx.eval(block.parameters())
+    return block
+
+
+@pytest.fixture
+def tiny_qwen4_exp_moe():
+    """Create a tiny Qwen4-Exp-style MoE block with shared expert."""
+    mx.random.seed(42)
+    block = TinyQwen4ExpMoE(hidden=32, intermediate=64, n_experts=4, top_k=2)
     mx.eval(block.parameters())
     return block
 

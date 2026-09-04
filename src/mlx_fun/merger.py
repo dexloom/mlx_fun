@@ -13,6 +13,7 @@ import mlx.nn as nn
 import numpy as np
 
 from .adapters.base import BaseAdapter
+from .loader import text_forward
 from .observer import _to_numpy
 from .pruner import _slice_linear
 from .ream_hooks import install_ream_hooks, remove_ream_hooks, collect_ream_data
@@ -604,6 +605,8 @@ def merge_model(
     n_experts = adapter.num_routed_experts()
     top_k = adapter.num_experts_per_tok()
     model_type = adapter.config.get("model_type", "")
+    # Vision checkpoints run token-only calibration against the language stack.
+    forward = text_forward(model, adapter.config)
 
     if n_keep < top_k:
         raise ValueError(
@@ -633,7 +636,7 @@ def merge_model(
 
         for sample in calibration_samples:
             tokens = sample.reshape(1, -1)
-            model(tokens)
+            forward(tokens)
             mx.eval(model.parameters())
 
         captures = collect_ream_data([moe_block])
@@ -723,6 +726,8 @@ def merge_model_with_keep_map(
     n_experts = adapter.num_routed_experts()
     top_k = adapter.num_experts_per_tok()
     model_type = adapter.config.get("model_type", "")
+    # Vision checkpoints run token-only calibration against the language stack.
+    forward = text_forward(model, adapter.config)
 
     # Validate keep_map
     for acc_idx in range(len(moe_indices)):
@@ -754,7 +759,7 @@ def merge_model_with_keep_map(
 
         for sample in calibration_samples:
             tokens = sample.reshape(1, -1)
-            model(tokens)
+            forward(tokens)
             mx.eval(model.parameters())
 
         captures = collect_ream_data([moe_block])

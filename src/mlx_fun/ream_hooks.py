@@ -122,6 +122,27 @@ def _gemma4_ream_call(self, h: mx.array) -> mx.array:
     return self.experts(h2, top_k_indices, top_k_weights)
 
 
+def _qwen4_exp_ream_call(self, x: mx.array) -> mx.array:
+    """Capture input + full gate logits, then run normal Qwen4-Exp forward."""
+    gates_raw = self.gate(x)
+    mx.eval(x, gates_raw)
+    self._ream_captures.append((_to_numpy(x), _to_numpy(gates_raw)))
+
+    # Normal forward
+    gates = mx.softmax(gates_raw, axis=-1, precise=True)
+    k = self.top_k
+    inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+    scores = mx.take_along_axis(gates, inds, axis=-1)
+    scores = scores / mx.sum(scores, axis=-1, keepdims=True)
+    y = self.switch_mlp(x, inds)
+    y = (y * scores[..., None]).sum(axis=-2)
+
+    # Shared expert (always active, sigmoid-gated)
+    shared_y = self.shared_expert(x)
+    shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
+    return y + shared_y
+
+
 _REAM_HOOK_MAP = {
     "minimax": _minimax_ream_call,
     "minimax_m2": _minimax_ream_call,
@@ -130,9 +151,11 @@ _REAM_HOOK_MAP = {
     "glm_moe_dsa": _glm4_ream_call,
     "deepseek_v32": _glm4_ream_call,
     "nemotron_h": _glm4_ream_call,
+    "glm5_next": _glm4_ream_call,
     "qwen3_moe": _qwen3_moe_ream_call,
     "qwen3_next": _qwen3_next_ream_call,
     "gemma4": _gemma4_ream_call,
+    "qwen4_exp": _qwen4_exp_ream_call,
 }
 
 

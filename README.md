@@ -187,8 +187,26 @@ the streaming dequant→requant pattern for already-quantized sources.
 
 MiniMax (M1/M2), GLM4-MoE, GLM4-MoE-Lite, Qwen3-MoE, Qwen3-Next, GLM-5
 (GLM-MoE-DSA), DeepSeek V3.2, Kimi-K2/K2.6 (`kimi_k25` multimodal wrapper),
-Nemotron-H (hybrid Mamba-2/Attn/MoE), Gemma4. Both quantized and unquantized
+Nemotron-H (hybrid Mamba-2/Attn/MoE), Gemma4, GLM-5.3, Qwen4-Exp
+(`Qwen/Qwen3.8-Flash-Next`), GLM-5.3-Flash. Both quantized and unquantized
 sources work. New architectures plug in via the `BaseAdapter` interface.
+
+**Vision-language models.** Qwen4-Exp (`Qwen/Qwen3.8-Flash-Next`) and
+GLM-5.3-Flash (`zai-org/GLM-5.3-Flash`) are VLMs: mlx-lm does not implement
+them, so mlx_fun loads them through
+[mlx-vlm](https://github.com/Blaizzy/mlx-vlm) and runs the analysis stack
+(saliency collection, SAFEx, domain scan, steering) against their language
+half. Install the optional extra and point any analysis command at the
+checkpoint as usual:
+
+```bash
+uv pip install -e ".[vlm]"
+mlx-fun collect --model Qwen/Qwen3.8-Flash-Next --dataset ./data.jsonl --output stats.npz
+```
+
+`mlx_fun.loader.load_model()` picks the backend from `config.json`, so nothing
+else in the workflow changes. Serving VLMs (image inputs on the OpenAI /
+Anthropic endpoints) is not wired up — the server remains text-only.
 
 ---
 

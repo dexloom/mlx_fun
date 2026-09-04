@@ -41,7 +41,12 @@ src/mlx_fun/
 │   ├── glm4_moe_lite.py  # GLM4-Lite: adds moe_layer_freq stride
 │   ├── glm_moe_dsa.py    # GLM-5/DeepSeek V3.2: DeepseekV32MoE with MoEGate
 │   ├── qwen3_moe.py      # Qwen3/Qwen3-Next: sparse layers by decoder_sparse_step, mlp
-│   └── nemotron_h.py      # Nemotron-H: hybrid Mamba-2/Attn/MoE via hybrid_override_pattern
+│   ├── nemotron_h.py      # Nemotron-H: hybrid Mamba-2/Attn/MoE via hybrid_override_pattern
+│   ├── qwen4_exp.py       # Qwen4-Exp (Qwen3.8-Flash-Next): VLM, MoE under language_model
+│   └── glm5_next.py       # GLM-5.3-Flash: VLM, DeepseekV32MoE under language_model
+├── models/                # Out-of-tree model types published into mlx_lm.models
+│   └── gemma4_assistant.py # Gemma 4 MTP drafter (was a fork of mlx-lm)
+├── loader.py              # Backend-aware load: mlx-lm for text, mlx-vlm for vision
 ├── observer.py            # Hooks via __class__ swap (not MethodType — special methods)
 ├── ream_hooks.py          # REAM hooks: capture MoE inputs + full gate logits
 ├── saliency.py            # numpy float64 accumulator with np.add.at() scatter-add
@@ -90,6 +95,49 @@ src/mlx_fun/
 
 - **NVFP4 conversion** (`convert_nvfp4.py`): NVIDIA's `modelopt` NVFP4 checkpoints use a two-level scale hierarchy (`fp4_val * e4m3_group_scale * f32_global_scale`) that MLX Metal doesn't support. The converter folds `weight_scale_2` into per-group E4M3 scales via `from_fp8()` → multiply → `to_fp8()`, preserving trained FP4 codes exactly while accepting ~1-2% scale rounding. FP8 layers (Mamba, shared experts) are dequantized to bfloat16. Expert weights are repacked from uint8 `[M, N/2]` to uint32 `[M, N/8]` via `numpy.view` (lossless).
 
+- **No fork of mlx-lm.** `src/mlx_fun/models/` holds model classes upstream
+  does not ship (currently `gemma4_assistant`, the Gemma 4 MTP drafter).
+  `register_model_types()` — called from `mlx_fun/__init__.py` — inserts them
+  into `sys.modules` as `mlx_lm.models.<type>`, which is where mlx-lm's
+  `_get_classes` looks via `importlib.import_module`. Upstream always wins: a
+  type mlx-lm has since shipped is left alone, so registrations retire
+  themselves.
+
+- **Vision models load through mlx-vlm** (`loader.py`). `load_model()` reads
+  `config.json` first and routes: a checkpoint with a `vision_config` (or a
+  `model_type` in `_VLM_ONLY_MODEL_TYPES`) goes to `mlx_vlm.load()`, everything
+  else to `mlx_lm.load()`. It returns the same `(model, tokenizer, config)`
+  triple either way, so CLI call sites are backend-agnostic. mlx-vlm is an
+  optional extra (`.[vlm]`); text models never import it.
+
+- **Analysis passes on a VLM run against the language stack.**
+  `text_forward(model, config)` returns `model.language_model` for vision
+  checkpoints — the multimodal wrapper's `__call__` expects pixel values, while
+  calibration and routing scans feed token ids only. Serving VLMs is *not*
+  wired up; `smoke-test` rejects them with a pointer to `mlx_vlm.generate`.
+
+- **GLM-5.3 needs no new code** — it is `glm_moe_dsa`, the type mlx_fun already
+  supports (78 layers, 256 experts). It is the first config in that family to
+  ship an explicit per-layer `mlp_layer_types` list, which
+  `GLMMoeDsaAdapter.moe_layer_indices` now prefers over the
+  `first_k_dense_replace` + `moe_layer_freq` stride rule. Configs without the
+  key (GLM-5, DeepSeek V3.2) keep the old path.
+
+- **GLM-5.3-Flash (`glm5_next`) is a VLM whose MoE block is mlx-vlm's
+  `DeepseekV32MoE`** — the same sigmoid/`noaux_tc` block as GLM-5, so it maps
+  onto the existing `_glm4_*` hooks in `observer.py`, `ream_hooks.py`, and
+  `steering.py` rather than getting its own. Only the adapter is new: it reaches
+  through `language_model` and honors `mlp_layer_types`.
+
+- **Qwen4-Exp MoE blocks are mlx-vlm's `Qwen3_5MoeSparseMoeBlock`** at
+  `model.language_model.model.layers[i].mlp`, on *every* layer (the
+  linear/full-attention split applies to the attention branch only). Routing is
+  softmax → top-k → unconditional renormalization; unlike Qwen3-Next there is
+  no `norm_topk_prob` attribute, which is why it gets its own hooks in
+  `observer.py`, `ream_hooks.py`, and `steering.py` rather than reusing
+  Qwen3-Next's. The sigmoid-gated shared expert is not routed and is not a
+  pruning target.
+
 ## Supported Models
 
 | Type | Config `model_type` | Expert count key | MoE block path |
@@ -103,8 +151,11 @@ src/mlx_fun/
 | GLM-5 | `glm_moe_dsa` | `n_routed_experts` | `model.model.layers[i].mlp` (DeepSeek V3.2 MoE) |
 | DeepSeek V3.2 | `deepseek_v32` | `n_routed_experts` | Same as GLM-5 (shared architecture) |
 | Nemotron-H | `nemotron_h` | `n_routed_experts` | `model.backbone.layers[i].mixer` (hybrid Mamba-2/Attn/MoE) |
+| Qwen4-Exp | `qwen4_exp` | `num_experts` (in `text_config`) | `model.language_model.model.layers[i].mlp` (VLM — loads via mlx-vlm) |
+| GLM-5.3 | `glm_moe_dsa` | `n_routed_experts` | Same as GLM-5 — 78 layers, 256 experts, adds `mlp_layer_types` |
+| GLM-5.3-Flash | `glm5_next` | `n_routed_experts` (in `text_config`) | `model.language_model.model.layers[i].mlp` (VLM — loads via mlx-vlm) |
 
-Reference source files (mlx-lm 0.31.2):
+Reference source files (mlx-lm 0.32.0 upstream, mlx-vlm 0.6.17):
 - MiniMax: `mlx_lm/models/minimax.py` — `MiniMaxSparseMoeBlock`
 - GLM4: `mlx_lm/models/glm4_moe.py` — `MoE`, `MoEGate`
 - GLM4-Lite: `mlx_lm/models/glm4_moe_lite.py` — `Glm4MoeLiteMoE`, `MoEGate`
@@ -113,13 +164,17 @@ Reference source files (mlx-lm 0.31.2):
 - GLM-5 / DeepSeek V3.2: `mlx_lm/models/deepseek_v32.py` — `DeepseekV32MoE`, `MoEGate`
 - Nemotron-H: `mlx_lm/models/nemotron_h.py` — `NemotronHMoE`, `MoEGate` (hybrid Mamba-2/Attention/MoE)
 - Switch layers: `mlx_lm/models/switch_layers.py` — `SwitchGLU`, `SwitchLinear`, `QuantizedSwitchLinear`
+- Qwen4-Exp: **mlx-vlm** `mlx_vlm/models/qwen4_exp/language.py` — `Qwen4ExpDecoderLayer`,
+  whose `.mlp` is `mlx_vlm/models/qwen3_5_moe/language.py::Qwen3_5MoeSparseMoeBlock`
+- GLM-5.3-Flash: **mlx-vlm** `mlx_vlm/models/glm5_next/language.py` — `Glm5NextDecoderLayer`,
+  whose `.mlp` is `mlx_vlm/models/deepseek_v32/language.py::DeepseekV32MoE`
 
 ## Testing
 
 Tests use tiny MoE fixtures (4 experts, hidden=32) defined in `tests/conftest.py`. No real models are needed for unit tests.
 
 ```bash
-pytest tests/ -v                    # All 227 tests
+pytest tests/ -v                    # All 604 tests
 pytest tests/test_pruner.py -v      # Just pruner tests
 pytest tests/test_safety.py -v      # Safety analysis tests
 pytest tests/test_steering.py -v    # Steering hook tests
@@ -127,13 +182,18 @@ pytest tests/test_abliterate.py -v  # Abliteration tests
 pytest tests/test_domain.py -v      # Domain identification + amplification tests
 pytest tests/test_frontend.py -v   # Frontend API + visualization tests
 pytest tests/test_convert_nvfp4.py -v  # NVFP4 converter tests
+pytest tests/test_loader.py -v      # Backend routing (mlx-lm vs mlx-vlm)
+pytest tests/test_qwen4_exp.py -v   # Qwen4-Exp adapter + hooks (tiny replicas)
+pytest tests/test_glm53.py -v       # GLM-5.3 + GLM-5.3-Flash adapters + hooks
+pytest tests/test_vlm_integration.py -v  # Both, against real mlx-vlm classes
 ```
 
 ## Dependencies
 
-Runtime: `mlx >= 0.30.0`, `mlx-lm >= 0.30.7`, `click`, `tqdm`, `numpy`
+Runtime: `mlx >= 0.32.1`, `mlx-lm` (upstream `main`, no fork), `click`, `tqdm`, `numpy`
 Dev: `pytest`
 REAM merging: `scipy` (optional extra `.[ream]`)
 Web dashboard: `gradio`, `matplotlib`, `requests` (optional extra `.[ui]`)
+Vision models: `mlx-vlm` (optional extra `.[vlm]`)
 NVFP4 conversion: `safetensors`, `huggingface-hub` (optional extra `.[convert]`)
 Dataset prep: `datasets`, `huggingface-hub` (optional extra `.[dataset]`)

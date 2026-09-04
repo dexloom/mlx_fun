@@ -195,13 +195,13 @@ def amplify_gate_weights(
                 block.gate.bias = bias_mx
 
         elif model_type in ("glm4_moe", "glm4_moe_lite", "glm_moe_dsa", "deepseek_v32",
-                             "nemotron_h"):
+                             "nemotron_h", "glm5_next"):
             # Custom MoEGate: add to e_score_correction_bias (post-sigmoid)
             block.gate.e_score_correction_bias = (
                 block.gate.e_score_correction_bias + bias_mx
             )
 
-        elif model_type in ("qwen3_moe", "qwen3_next"):
+        elif model_type in ("qwen3_moe", "qwen3_next", "qwen4_exp"):
             # nn.Linear gate: set bias attribute (adds to pre-softmax logits)
             if "bias" in block.gate:
                 block.gate.bias = block.gate.bias + bias_mx

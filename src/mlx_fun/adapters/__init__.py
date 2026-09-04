@@ -11,6 +11,8 @@ from .glm_moe_dsa import GLMMoeDsaAdapter
 from .kimi_k25 import KimiK25Adapter
 from .nemotron_h import NemotronHAdapter
 from .gemma4 import Gemma4Adapter
+from .qwen4_exp import Qwen4ExpAdapter
+from .glm5_next import GLM5NextAdapter
 
 _ADAPTER_MAP = {
     "minimax": MiniMaxAdapter,
@@ -24,6 +26,8 @@ _ADAPTER_MAP = {
     "kimi_k25": KimiK25Adapter,
     "nemotron_h": NemotronHAdapter,
     "gemma4": Gemma4Adapter,
+    "qwen4_exp": Qwen4ExpAdapter,
+    "glm5_next": GLM5NextAdapter,
 }
 
 

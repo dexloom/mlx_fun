@@ -24,7 +24,7 @@ def collect(model, dataset, output, max_samples, max_tokens, text_key, seed):
     """Collect saliency statistics via calibration."""
     import random
     import mlx.core as mx
-    from mlx_lm import load as mlx_load
+    from .loader import load_model, text_forward
     from tqdm import tqdm
 
     if seed is not None:
@@ -44,7 +44,7 @@ def collect(model, dataset, output, max_samples, max_tokens, text_key, seed):
         click.echo(f"Loading model: {model}")
     
     try:
-        mlx_model, tokenizer, config = mlx_load(model, return_config=True)
+        mlx_model, tokenizer, config = load_model(model)
     except Exception as e:
         if "HFValidationError" in str(type(e).__name__) or "Repo id must be in the form" in str(e):
             click.echo(f"\nError: Model path '{model}' could not be loaded as a local file or HuggingFace repo.", err=True)
@@ -73,10 +73,12 @@ def collect(model, dataset, output, max_samples, max_tokens, text_key, seed):
     acc = SaliencyAccumulator(num_layers=len(moe_indices), num_experts=n_experts)
 
     click.echo("Running calibration...")
+    # Vision checkpoints route token-only passes through the language stack.
+    forward = text_forward(mlx_model, config)
     for sample in tqdm(samples, desc="Calibrating"):
         # Run forward pass: (1, seq_len)
         tokens = sample.reshape(1, -1)
-        mlx_model(tokens)
+        forward(tokens)
         mx.eval(mlx_model.parameters())
 
         # Collect captures and accumulate
@@ -138,7 +140,7 @@ def prune(model, saliency, expert_list, output, n_prune, metric, strategy, model
     2. Using expert list from frontend (new):
        mlx-fun prune --model ./model --expert-list filtered_experts.json --output ./pruned
     """
-    from mlx_lm import load as mlx_load
+    from .loader import load_model
 
     from .adapters import get_adapter
     from .pruner import (
@@ -239,7 +241,7 @@ def prune(model, saliency, expert_list, output, n_prune, metric, strategy, model
         return
 
     try:
-        mlx_model, tokenizer, config = mlx_load(model, return_config=True)
+        mlx_model, tokenizer, config = load_model(model)
     except Exception as e:
         if "HFValidationError" in str(type(e).__name__) or "Repo id must be in the form" in str(e):
             click.echo(f"\nError: Model path '{model}' could not be loaded as a local file or HuggingFace repo.", err=True)
@@ -402,7 +404,7 @@ def merge(model, saliency, expert_list, dataset, output, n_prune, metric, model_
     """
     import random
     import mlx.core as mx
-    from mlx_lm import load as mlx_load
+    from .loader import load_model
     from tqdm import tqdm
 
     # Validate inputs
@@ -449,7 +451,7 @@ def merge(model, saliency, expert_list, dataset, output, n_prune, metric, model_
         click.echo(f"Loading model: {model}")
 
     try:
-        mlx_model, tokenizer, config = mlx_load(model, return_config=True)
+        mlx_model, tokenizer, config = load_model(model)
     except Exception as e:
         if "HFValidationError" in str(type(e).__name__) or "Repo id must be in the form" in str(e):
             click.echo(f"\nError: Model path '{model}' could not be loaded.", err=True)
@@ -582,7 +584,7 @@ def merge(model, saliency, expert_list, dataset, output, n_prune, metric, model_
               help="Bits per channel for KV compression (2-8). Default: 4 (turbo), 3 (rotor).")
 def smoke_test(model, prompt, max_tokens, kv_compress, kv_compress_bits):
     """Verify generation works with a pruned model."""
-    from mlx_lm import load as mlx_load
+    from .loader import load_model
     from mlx_lm.generate import generate_step, stream_generate
 
     # Expand user path and validate if it's a local path
@@ -594,7 +596,7 @@ def smoke_test(model, prompt, max_tokens, kv_compress, kv_compress_bits):
         click.echo(f"Loading model: {model}")
 
     try:
-        mlx_model, tokenizer = mlx_load(model)
+        mlx_model, tokenizer, model_config = load_model(model)
     except Exception as e:
         if "HFValidationError" in str(type(e).__name__) or "Repo id must be in the form" in str(e):
             click.echo(f"\nError: Model path '{model}' could not be loaded as a local file or HuggingFace repo.", err=True)
@@ -603,6 +605,16 @@ def smoke_test(model, prompt, max_tokens, kv_compress, kv_compress_bits):
             click.echo(f"  2. If using a HuggingFace repo, ensure the repo ID is correct (format: 'username/repo-name')", err=True)
             raise
         raise
+
+    from .loader import is_vision_model
+
+    if is_vision_model(model_config):
+        raise click.ClickException(
+            f"smoke-test drives mlx-lm's text generation loop, which cannot run "
+            f"the vision-language model '{model_config.get('model_type')}'. "
+            f"Generate with mlx-vlm directly: "
+            f"`python -m mlx_vlm.generate --model {model} --prompt ...`"
+        )
 
     prompt_cache = None
     if kv_compress == "turbo":
@@ -827,7 +839,7 @@ def safety_scan(model, harmful_dataset, benign_dataset, output, max_samples,
     """
     import random
     import mlx.core as mx
-    from mlx_lm import load as mlx_load
+    from .loader import load_model, text_forward
     from tqdm import tqdm
 
     if seed is not None:
@@ -846,7 +858,7 @@ def safety_scan(model, harmful_dataset, benign_dataset, output, max_samples,
     if os.path.exists(expanded_model):
         model = expanded_model
     click.echo(f"Loading model: {model}")
-    mlx_model, tokenizer, config = mlx_load(model, return_config=True)
+    mlx_model, tokenizer, config = load_model(model)
 
     adapter = get_adapter(mlx_model, config)
     moe_indices = adapter.moe_layer_indices()
@@ -866,9 +878,10 @@ def safety_scan(model, harmful_dataset, benign_dataset, output, max_samples,
         click.echo(f"  Loaded {len(samples)} samples")
 
         install_ream_hooks(moe_blocks, model_type)
+        forward = text_forward(mlx_model, config)
         for sample in tqdm(samples, desc=f"Scanning {dataset_name}"):
             tokens = sample.reshape(1, -1)
-            mlx_model(tokens)
+            forward(tokens)
             mx.eval(mlx_model.parameters())
 
             captures = collect_ream_data(moe_blocks)
@@ -916,7 +929,9 @@ def steer(model, safety_map, mode, prompt, max_tokens, mask_value, boost_value,
     Uses SteerMoE-style gate logit injection to selectively activate or
     deactivate safety-critical experts during inference.
     """
-    from mlx_lm import load as mlx_load, generate
+    from mlx_lm import generate
+
+    from .loader import load_model
 
     from .adapters import get_adapter
     from .steering import SteeringConfig, install_steering_hooks, remove_steering_hooks
@@ -925,7 +940,7 @@ def steer(model, safety_map, mode, prompt, max_tokens, mask_value, boost_value,
     if os.path.exists(expanded_model):
         model = expanded_model
     click.echo(f"Loading model: {model}")
-    mlx_model, tokenizer, config = mlx_load(model, return_config=True)
+    mlx_model, tokenizer, config = load_model(model)
 
     adapter = get_adapter(mlx_model, config)
     moe_indices = adapter.moe_layer_indices()
@@ -1002,7 +1017,7 @@ def abliterate(model, harmful_dataset, benign_dataset, output, layers, target,
     """
     import random
     import mlx.core as mx
-    from mlx_lm import load as mlx_load
+    from .loader import load_model
 
     if seed is not None:
         random.seed(seed)
@@ -1019,7 +1034,7 @@ def abliterate(model, harmful_dataset, benign_dataset, output, layers, target,
     if os.path.exists(expanded_model):
         model = expanded_model
     click.echo(f"Loading model: {model}")
-    mlx_model, tokenizer, config = mlx_load(model, return_config=True)
+    mlx_model, tokenizer, config = load_model(model)
     adapter = get_adapter(mlx_model, config)
 
     # Load safety report if needed
@@ -1108,7 +1123,7 @@ def domain_scan(model, domain_dataset, general_dataset, output, domain_name,
     """
     import random
     import mlx.core as mx
-    from mlx_lm import load as mlx_load
+    from .loader import load_model, text_forward
     from tqdm import tqdm
 
     if seed is not None:
@@ -1128,7 +1143,7 @@ def domain_scan(model, domain_dataset, general_dataset, output, domain_name,
     if os.path.exists(expanded_model):
         model = expanded_model
     click.echo(f"Loading model: {model}")
-    mlx_model, tokenizer, config = mlx_load(model, return_config=True)
+    mlx_model, tokenizer, config = load_model(model)
 
     adapter = get_adapter(mlx_model, config)
     moe_indices = adapter.moe_layer_indices()
@@ -1152,9 +1167,10 @@ def domain_scan(model, domain_dataset, general_dataset, output, domain_name,
         click.echo(f"  Loaded {len(samples)} samples")
 
         install_ream_hooks(moe_blocks, model_type)
+        forward = text_forward(mlx_model, config)
         for sample in tqdm(samples, desc=f"Scanning {dataset_name}"):
             tokens = sample.reshape(1, -1)
-            mlx_model(tokens)
+            forward(tokens)
             mx.eval(mlx_model.parameters())
 
             captures = collect_ream_data(moe_blocks)
@@ -1194,7 +1210,7 @@ def amplify(model, domain_map, output, scale, threshold):
     and modifies gate parameters so domain experts are favored natively.
     The amplified model works with standard mlx_lm.load() — no hooks needed.
     """
-    from mlx_lm import load as mlx_load
+    from .loader import load_model
 
     from .adapters import get_adapter
     from .domain import DomainReport, compute_amplification_biases, amplify_gate_weights
@@ -1204,7 +1220,7 @@ def amplify(model, domain_map, output, scale, threshold):
     if os.path.exists(expanded_model):
         model = expanded_model
     click.echo(f"Loading model: {model}")
-    mlx_model, tokenizer, config = mlx_load(model, return_config=True)
+    mlx_model, tokenizer, config = load_model(model)
 
     adapter = get_adapter(mlx_model, config)
     moe_indices = adapter.moe_layer_indices()

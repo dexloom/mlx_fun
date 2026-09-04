@@ -174,6 +174,41 @@ def _gemma4_hooked_call(self, h: mx.array) -> mx.array:
     return (expert_out * weights).sum(axis=-2).reshape(B, S, H)
 
 
+def _qwen4_exp_hooked_call(self, x: mx.array) -> mx.array:
+    """Replacement __call__ for Qwen4-Exp's MoE block that captures metrics.
+
+    Mirrors mlx-vlm's ``Qwen3_5MoeSparseMoeBlock``: softmax gate, top-k, and an
+    unconditional score renormalization (no ``norm_topk_prob`` switch), plus a
+    sigmoid-gated shared expert that bypasses routing.
+    """
+    gates = self.gate(x)
+    gates = mx.softmax(gates, axis=-1, precise=True)
+
+    k = self.top_k
+    inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+    scores = mx.take_along_axis(gates, inds, axis=-1)
+    scores = scores / mx.sum(scores, axis=-1, keepdims=True)
+
+    y = self.switch_mlp(x, inds)
+    # y shape: (batch, seq, top_k, hidden)
+    activation_norms = mx.linalg.norm(y, axis=-1)
+
+    # Materialize and capture
+    mx.eval(inds, scores, activation_norms)
+    self._reap_captures.append((
+        _to_numpy(inds),
+        _to_numpy(scores),
+        _to_numpy(activation_norms),
+    ))
+
+    y = (y * scores[..., None]).sum(axis=-2)
+
+    # Shared expert (always active, sigmoid-gated) — not routed, not prunable
+    shared_y = self.shared_expert(x)
+    shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
+    return y + shared_y
+
+
 _HOOK_MAP = {
     "minimax": _minimax_hooked_call,
     "minimax_m2": _minimax_hooked_call,
@@ -182,9 +217,11 @@ _HOOK_MAP = {
     "glm_moe_dsa": _glm4_hooked_call,
     "deepseek_v32": _glm4_hooked_call,
     "nemotron_h": _glm4_hooked_call,
+    "glm5_next": _glm4_hooked_call,
     "qwen3_moe": _qwen3_moe_hooked_call,
     "qwen3_next": _qwen3_next_hooked_call,
     "gemma4": _gemma4_hooked_call,
+    "qwen4_exp": _qwen4_exp_hooked_call,
 }
 
 

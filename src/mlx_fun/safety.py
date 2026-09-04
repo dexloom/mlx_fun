@@ -38,12 +38,13 @@ def compute_top_k_from_logits(
         (n_tokens, top_k) int array of selected expert indices.
     """
     if model_type in ("minimax", "minimax_m2", "glm4_moe", "glm4_moe_lite",
-                       "glm_moe_dsa", "deepseek_v32", "nemotron_h"):
+                       "glm_moe_dsa", "deepseek_v32", "nemotron_h",
+                       "glm5_next"):
         # Sigmoid activation, select top-k by descending score
         scores = 1.0 / (1.0 + np.exp(-gate_logits.astype(np.float64)))
         # argpartition for top-k (highest scores = lowest negated scores)
         inds = np.argpartition(-scores, kth=top_k - 1, axis=-1)[..., :top_k]
-    elif model_type in ("qwen3_moe", "qwen3_next"):
+    elif model_type in ("qwen3_moe", "qwen3_next", "qwen4_exp"):
         # Softmax activation, select top-k by descending probability
         logits = gate_logits.astype(np.float64)
         logits_max = logits.max(axis=-1, keepdims=True)

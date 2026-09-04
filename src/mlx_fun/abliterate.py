@@ -13,6 +13,7 @@ import mlx.nn as nn
 import numpy as np
 
 from .adapters.base import BaseAdapter
+from .loader import language_model, text_forward
 from .observer import _to_numpy
 
 
@@ -32,7 +33,8 @@ def install_residual_hooks(model, layer_indices: List[int]) -> List:
     """Install hooks on decoder layers to capture residual stream.
 
     Args:
-        model: The MLX model (model.model.layers accessible).
+        model: The MLX model (text or multimodal — the language stack's decoder
+            layers are located either way).
         layer_indices: Which decoder layers to hook.
 
     Returns:
@@ -40,7 +42,7 @@ def install_residual_hooks(model, layer_indices: List[int]) -> List:
     """
     hooked_layers = []
     for idx in layer_indices:
-        layer = model.model.layers[idx]
+        layer = language_model(model).model.layers[idx]
         layer._abliterate_captures = []
         original_cls = type(layer)
         layer._abliterate_original_cls = original_cls
@@ -109,11 +111,13 @@ def compute_refusal_directions(
         Dict[layer_idx, unit_direction_vector] where each vector is (hidden_dim,).
     """
     if layer_indices is None:
-        n_layers = len(model.model.layers)
+        n_layers = len(language_model(model).model.layers)
         layer_indices = list(range(n_layers))
 
     directions = {}
     chunk_size = 4  # Hook a few layers at a time to limit memory
+    # Vision checkpoints run token-only passes against the language stack.
+    forward = text_forward(model, adapter.config)
 
     for chunk_start in range(0, len(layer_indices), chunk_size):
         chunk_layers = layer_indices[chunk_start : chunk_start + chunk_size]
@@ -123,7 +127,7 @@ def compute_refusal_directions(
         hooked = install_residual_hooks(model, chunk_layers)
         for sample in harmful_samples:
             tokens = sample.reshape(1, -1)
-            model(tokens)
+            forward(tokens)
             captures = collect_residual_captures(hooked)
             for i, layer_idx in enumerate(chunk_layers):
                 for cap in captures[i]:
@@ -136,7 +140,7 @@ def compute_refusal_directions(
         hooked = install_residual_hooks(model, chunk_layers)
         for sample in benign_samples:
             tokens = sample.reshape(1, -1)
-            model(tokens)
+            forward(tokens)
             captures = collect_residual_captures(hooked)
             for i, layer_idx in enumerate(chunk_layers):
                 for cap in captures[i]:
@@ -217,7 +221,7 @@ def orthogonalize_weights(
 
     for layer_idx, direction in refusal_directions.items():
         d = mx.array(direction.astype(np.float32))
-        layer = model.model.layers[layer_idx]
+        layer = language_model(model).model.layers[layer_idx]
 
         # Orthogonalize attention output projection
         if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "o_proj"):

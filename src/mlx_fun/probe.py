@@ -133,6 +133,32 @@ def _has_chat_template(tokenizer) -> bool:
     return getattr(tokenizer, "chat_template", None) is not None
 
 
+def _template_ids_to_list(prompt) -> List[int]:
+    """Normalize an ``apply_chat_template(tokenize=True)`` result to flat ids.
+
+    Tokenizer backends disagree on the return shape: mlx-lm's
+    ``TokenizerWrapper`` yields a flat ``list[int]``, but transformers' newer
+    ``TokenizersBackend`` (GLM-5.3-Flash, Qwen4-Exp and other recent VLMs)
+    returns a ``BatchEncoding`` keyed by ``input_ids``, and some return a raw
+    ``Encoding``. Left unhandled, ``list(prompt)`` yields ``Encoding`` objects
+    or dict keys instead of token ids. Everything collapses to a single flat
+    ``list[int]`` here; an already-flat list passes through unchanged.
+    """
+    # dict / BatchEncoding: take the ids field.
+    if isinstance(prompt, dict) or (hasattr(prompt, "keys") and "input_ids" in prompt):
+        prompt = prompt["input_ids"]
+    # A bare transformers Encoding.
+    if hasattr(prompt, "ids") and not isinstance(prompt, (list, tuple)):
+        prompt = prompt.ids
+    seq = list(prompt)
+    # A list wrapping a single Encoding, or a batched [[...]] of one row.
+    if len(seq) == 1 and hasattr(seq[0], "ids"):
+        seq = list(seq[0].ids)
+    elif seq and isinstance(seq[0], (list, tuple)):
+        seq = list(seq[0])
+    return [int(t) for t in seq]
+
+
 def build_probe_tokens(
     tokenizer,
     q: ProbeQuestion,
@@ -174,12 +200,12 @@ def build_probe_tokens(
             add_generation_prompt=True,
             **(chat_template_args or {}),
         )
+        prompt = _template_ids_to_list(prompt)
     else:
         text = q.question + "\n"
         if sys_prompt:
             text = f"{sys_prompt}\n\n{text}"
-        prompt = tokenizer.encode(text)
-    prompt = list(prompt)
+        prompt = [int(t) for t in tokenizer.encode(text)]
 
     if answer_mode == "generate":
         return prompt, len(prompt)

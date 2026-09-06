@@ -17,10 +17,16 @@ from mlx_fun.loader import (
 # Vision-model detection
 # ---------------------------------------------------------------------------
 
+# The Qwen MoE VLM family: one adapter and one hook set, two model_type strings.
+QWEN_MOE_VLM_TYPES = ["qwen4_exp", "qwen3_5_moe"]
+
+
 class TestIsVisionModel:
-    def test_qwen4_exp_is_vision(self):
-        # Qwen3.8-Flash-Next: mlx-vlm-only, even before looking at its blocks.
-        assert is_vision_model({"model_type": "qwen4_exp"})
+    @pytest.mark.parametrize("model_type", QWEN_MOE_VLM_TYPES)
+    def test_qwen_moe_vlm_is_vision(self, model_type):
+        # Qwen3.8-Flash-Next / Qwen3.6-35B-A3B: mlx-vlm-only, even before
+        # looking at their blocks.
+        assert is_vision_model({"model_type": model_type})
 
     def test_explicit_vision_config(self):
         assert is_vision_model({
@@ -55,8 +61,9 @@ class TestIsVisionModel:
 # ---------------------------------------------------------------------------
 
 class TestTextConfig:
-    def test_returns_nested_when_present(self):
-        cfg = {"model_type": "qwen4_exp", "text_config": {"num_experts": 512}}
+    @pytest.mark.parametrize("model_type", QWEN_MOE_VLM_TYPES)
+    def test_returns_nested_when_present(self, model_type):
+        cfg = {"model_type": model_type, "text_config": {"num_experts": 512}}
         assert text_config(cfg) == {"num_experts": 512}
 
     def test_returns_flat_when_absent(self):
@@ -108,9 +115,10 @@ class TestLanguageModel:
 
 
 class TestTextForward:
-    def test_vision_forward_targets_language_stack(self):
+    @pytest.mark.parametrize("model_type", QWEN_MOE_VLM_TYPES)
+    def test_vision_forward_targets_language_stack(self, model_type):
         model = FakeVLM()
-        forward = text_forward(model, {"model_type": "qwen4_exp"})
+        forward = text_forward(model, {"model_type": model_type})
         assert forward(["tok"]) == ("language", ["tok"])
 
     def test_text_forward_is_the_model_itself(self):
@@ -125,10 +133,13 @@ class TestTextForward:
 # ---------------------------------------------------------------------------
 
 class TestLoadModelRouting:
-    def test_vision_checkpoint_without_mlx_vlm_explains_itself(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("model_type", QWEN_MOE_VLM_TYPES)
+    def test_vision_checkpoint_without_mlx_vlm_explains_itself(
+        self, tmp_path, monkeypatch, model_type,
+    ):
         """A VLM checkpoint with mlx-vlm absent must say how to install it."""
         (tmp_path / "config.json").write_text(json.dumps({
-            "model_type": "qwen4_exp",
+            "model_type": model_type,
             "vision_config": {"depth": 27},
             "text_config": {"num_hidden_layers": 48},
         }))
@@ -170,6 +181,55 @@ class TestLoadModelRouting:
         assert (model, tokenizer) == ("model", "tokenizer")
         assert config["model_type"] == "qwen3_moe"
         assert called["return_config"] is True
+
+
+class TestVLMTokenizerConfig:
+    """``mlx_vlm.load`` takes no tokenizer_config, so a chat-template override
+    has to be applied to the tokenizer it returns."""
+
+    @staticmethod
+    def _fake_vlm(tmp_path, monkeypatch, model_type="qwen3_5_moe"):
+        pytest.importorskip("mlx_vlm", reason="mlx-vlm not installed")
+        import mlx_vlm
+
+        (tmp_path / "config.json").write_text(json.dumps({
+            "model_type": model_type,
+            "image_token_id": 151655,
+            "text_config": {"num_hidden_layers": 40, "num_experts": 256},
+        }))
+
+        class FakeTokenizer:
+            chat_template = "ORIGINAL"
+
+        class FakeProcessor:
+            def __init__(self):
+                self.tokenizer = FakeTokenizer()
+
+        processor = FakeProcessor()
+        monkeypatch.setattr(
+            mlx_vlm, "load",
+            lambda path, lazy=False, trust_remote_code=False: ("model", processor),
+        )
+        return processor
+
+    def test_chat_template_is_applied(self, tmp_path, monkeypatch):
+        processor = self._fake_vlm(tmp_path, monkeypatch)
+        from mlx_fun.loader import load_model
+
+        _model, tokenizer, config = load_model(
+            str(tmp_path), tokenizer_config={"chat_template": "OVERRIDE"},
+        )
+        assert tokenizer is processor.tokenizer
+        assert tokenizer.chat_template == "OVERRIDE"
+        assert config["model_type"] == "qwen3_5_moe"
+
+    def test_no_override_leaves_the_checkpoint_template(self, tmp_path, monkeypatch):
+        processor = self._fake_vlm(tmp_path, monkeypatch)
+        from mlx_fun.loader import load_model
+
+        _model, tokenizer, _config = load_model(str(tmp_path))
+        assert tokenizer.chat_template == "ORIGINAL"
+        assert processor.tokenizer.chat_template == "ORIGINAL"
 
 
 class TestGemma4AssistantImports:

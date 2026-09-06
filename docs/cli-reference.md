@@ -200,7 +200,13 @@ mlx-fun domain-probe --model ./model \
 Key options: `--answer-mode teacher|generate`, `--max-questions`,
 `--max-answer-tokens`, `--min-coverage`, `--verify-top`, `--verify-questions`,
 `--min-delta`, `--bootstrap`, `--verify-prune` (plus `--verify-metric`,
-`--verify-strategy`, `--verify-model-wide`), `--chat-template-args`, `--system`.
+`--verify-strategy`, `--verify-model-wide`), `--chat-template-args`,
+`--chat-template`, `--system`. Both answer modes run on vision models.
+
+`--chat-template` takes a file path, the literal `bundled` (the template
+bundled for this `model_type`), or an inline Jinja string; the default keeps
+the checkpoint's own. Thinking is off by default — see
+[Thinking mode](safety-and-domain.md#thinking-mode).
 
 The report is a `domain_report.json` superset, so it feeds `prune --domain-map`,
 `amplify` and `serve --domain-map` unchanged. See
@@ -221,7 +227,10 @@ mlx-fun refusal-probe --model ./model \
 Key options: `--refusal-markers` (extra phrases), `--max-answer-tokens`,
 `--min-coverage`, `--verify-top`, `--verify-questions`, `--min-flip-rate`,
 `--bootstrap`, `--stratify-tags/--no-stratify-tags` (control topic confounding),
-`--chat-template-args`, `--system`. Runs on vision models too. The report keeps
+`--chat-template-args`, `--chat-template`, `--system`. Runs on vision models
+too. A response whose reasoning block never closed is counted as neither
+answered nor refused and reported in the summary line; raise
+`--max-answer-tokens` to recover those. The report keeps
 `candidate_refusal_experts` and `verified_refusal_experts` distinct;
 `domain_experts` defaults to the verified set.
 See [safety-and-domain](safety-and-domain.md#refusal-probe--find-the-guardrail-experts).

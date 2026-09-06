@@ -8,6 +8,8 @@ Skipped when mlx-vlm is not installed (``pip install "mlx-fun[vlm]"``).
 
 Covers:
   * Qwen4-Exp (``Qwen/Qwen3.8-Flash-Next``) -> ``Qwen3_5MoeSparseMoeBlock``
+  * Qwen3.5/3.6 MoE (``Qwen/Qwen3.6-35B-A3B``, model_type ``qwen3_5_moe``) ->
+    the same block, which is why the two share an adapter and a hook set
   * GLM-5.3-Flash (``zai-org/GLM-5.3-Flash``) -> ``DeepseekV32MoE``
 """
 
@@ -36,6 +38,14 @@ from mlx_fun.steering import (  # noqa: E402
 HIDDEN = 32
 N_EXPERTS = 8
 TOP_K = 2
+
+# Both model_type strings map onto Qwen3_5MoeSparseMoeBlock.
+QWEN_MOE_VLM_TYPES = ["qwen4_exp", "qwen3_5_moe"]
+
+
+@pytest.fixture(params=QWEN_MOE_VLM_TYPES)
+def model_type(request):
+    return request.param
 
 
 @pytest.fixture
@@ -84,6 +94,42 @@ class TestRealBlockShape:
         layer = Qwen4ExpDecoderLayer(text_config, 0)
         assert isinstance(layer.mlp, Qwen3_5MoeSparseMoeBlock)
 
+    def test_qwen3_5_moe_decoder_layer_has_the_same_mlp(self):
+        """``qwen3_5_moe`` (Qwen3.6-35B-A3B) reuses the block ``qwen4_exp``
+        does, which is what lets one adapter and one hook set serve both."""
+        from mlx_vlm.models.qwen3_5_moe.config import (
+            TextConfig as Qwen35TextConfig,
+        )
+        from mlx_vlm.models.qwen3_5_moe.language import (
+            Qwen3_5MoeDecoderLayer,
+            Qwen3_5MoeSparseMoeBlock as Qwen35Block,
+        )
+
+        assert Qwen35Block is Qwen3_5MoeSparseMoeBlock
+
+        cfg = Qwen35TextConfig(
+            model_type="qwen3_5_moe",
+            hidden_size=HIDDEN,
+            num_hidden_layers=4,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=16,
+            num_experts=N_EXPERTS,
+            num_experts_per_tok=TOP_K,
+            shared_expert_intermediate_size=64,
+            moe_intermediate_size=64,
+            rms_norm_eps=1e-6,
+            vocab_size=128,
+            linear_num_value_heads=4,
+            linear_num_key_heads=2,
+            linear_key_head_dim=16,
+            linear_value_head_dim=16,
+            linear_conv_kernel_dim=4,
+            max_position_embeddings=256,
+        )
+        layer = Qwen3_5MoeDecoderLayer(cfg, 0)
+        assert isinstance(layer.mlp, Qwen3_5MoeSparseMoeBlock)
+
     def test_attribute_names_the_hooks_rely_on(self, real_block):
         for attr in ("gate", "switch_mlp", "shared_expert", "shared_expert_gate",
                      "top_k", "num_experts"):
@@ -99,10 +145,10 @@ class TestRealBlockShape:
 
 
 class TestHooksAgainstRealBlock:
-    def test_saliency_hook_is_output_identical(self, real_block, x):
+    def test_saliency_hook_is_output_identical(self, real_block, x, model_type):
         reference = np.array(real_block(x), copy=False).copy()
 
-        install_hooks([real_block], "qwen4_exp")
+        install_hooks([real_block], model_type)
         hooked = np.array(real_block(x), copy=False).copy()
         inds, scores, norms = collect_captures([real_block])[0][0]
         remove_hooks([real_block])
@@ -114,10 +160,10 @@ class TestHooksAgainstRealBlock:
         assert np.allclose(scores.sum(axis=-1), 1.0, atol=1e-5)
         assert inds.max() < N_EXPERTS
 
-    def test_ream_hook_is_output_identical(self, real_block, x):
+    def test_ream_hook_is_output_identical(self, real_block, x, model_type):
         reference = np.array(real_block(x), copy=False).copy()
 
-        install_ream_hooks([real_block], "qwen4_exp")
+        install_ream_hooks([real_block], model_type)
         hooked = np.array(real_block(x), copy=False).copy()
         layer_input, gate_logits, sel_inds = collect_ream_data([real_block])[0][0]
         remove_ream_hooks([real_block])
@@ -126,11 +172,11 @@ class TestHooksAgainstRealBlock:
         assert layer_input.shape == (1, 6, HIDDEN)
         assert gate_logits.shape == (1, 6, N_EXPERTS)
 
-    def test_steering_masks_experts(self, real_block, x):
+    def test_steering_masks_experts(self, real_block, x, model_type):
         reference = np.array(real_block(x), copy=False).copy()
 
         install_steering_hooks(
-            [real_block], "qwen4_exp",
+            [real_block], model_type,
             SteeringConfig(deactivate={0: [0, 1]}, mask_value=-1e9),
             num_experts=N_EXPERTS,
         )
@@ -139,11 +185,11 @@ class TestHooksAgainstRealBlock:
 
         assert not np.allclose(reference, steered, atol=1e-5)
 
-    def test_steering_without_targets_is_a_no_op(self, real_block, x):
+    def test_steering_without_targets_is_a_no_op(self, real_block, x, model_type):
         reference = np.array(real_block(x), copy=False).copy()
 
         install_steering_hooks(
-            [real_block], "qwen4_exp", SteeringConfig(), num_experts=N_EXPERTS,
+            [real_block], model_type, SteeringConfig(), num_experts=N_EXPERTS,
         )
         unsteered = np.array(real_block(x), copy=False).copy()
         remove_steering_hooks([real_block])

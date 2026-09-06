@@ -240,7 +240,7 @@ The mask is a large negative bias added to the parameter that enters the top-k
 |---|---|---|
 | MiniMax (M1, M2) | `block.e_score_correction_bias` | selection is `argmax(sigmoid(logits) + bias)`, so the mask must land *after* the sigmoid |
 | GLM4 / GLM-5 / DeepSeek V3.2 / Nemotron-H | `gate.e_score_correction_bias` | `group_expert_select` adds it before group scoring and top-k |
-| Qwen3 / Qwen3-Next / Qwen4-Exp | temporary `gate.bias` | pre-softmax logit; softmax is monotonic and there is no post-softmax correction |
+| Qwen3 / Qwen3-Next / Qwen4-Exp / Qwen3.5-3.6 MoE | temporary `gate.bias` | pre-softmax logit; softmax is monotonic and there is no post-softmax correction |
 
 Masking the pre-sigmoid logits instead (what `amplify` biases) would not work
 for the sigmoid families: an expert with a large positive correction bias can

@@ -1490,68 +1490,12 @@ class ModelManager:
 # Chat template auto-detection
 # ---------------------------------------------------------------------------
 
-# Map model_type to bundled template filename in src/mlx_fun/templates/
-_MODEL_TYPE_TEMPLATES = {
-    "gemma4": "gemma.jinja",
-    "glm4_moe": "glm.jinja",
-    "glm4_moe_lite": "glm_flash.jinja",
-    "glm_moe_dsa": "glm51.jinja",
-    "deepseek_v32": "glm.jinja",
-    "minimax": "minimax.jinja",
-    "minimax_m2": "minimax_25.jinja",
-    "qwen3_moe": "qwen35.jinja",
-    "qwen3_next": "qwen35.jinja",
-}
-
-
-def _resolve_chat_template(
-    chat_template: Optional[str],
-    model_type: str,
-    model_dir: Optional[Path] = None,
-) -> Optional[str]:
-    """Resolve chat template to a Jinja string.
-
-    Priority:
-      1. Explicit value — if it's a file path, read it; otherwise use as-is.
-      2. The model directory's own ``chat_template.jinja`` (per-version-accurate
-         and tracks upstream HF). Falls through if the file is missing.
-      3. Bundled template by model_type — legacy fallback for quants that
-         shipped without a chat_template.jinja or with a broken one.
-      4. None — let the tokenizer's built-in template (if any) handle it.
-    """
-    if chat_template:
-        p = Path(chat_template)
-        if p.is_file():
-            logging.info(f"Using chat template from file: {p}")
-            return p.read_text()
-        # Assume it's an inline Jinja string
-        return chat_template
-
-    if model_dir is not None:
-        standalone = Path(model_dir) / "chat_template.jinja"
-        if standalone.is_file():
-            logging.info(
-                f"Using model's own chat template: {standalone.name} "
-                f"(model_type={model_type})"
-            )
-            return standalone.read_text()
-
-    # Bundled fallback
-    template_name = _MODEL_TYPE_TEMPLATES.get(model_type)
-    if template_name:
-        template_dir = Path(__file__).parent / "templates"
-        template_path = template_dir / template_name
-        if template_path.is_file():
-            logging.info(
-                f"Falling back to bundled chat template for {model_type}: "
-                f"{template_name}"
-            )
-            return template_path.read_text()
-        else:
-            logging.warning(
-                f"Bundled template {template_name} not found at {template_path}"
-            )
-    return None
+# Both live in `chat_template.py` so the probe commands can resolve templates
+# without importing the serving stack. Re-exported under their original names.
+from .chat_template import (  # noqa: E402
+    _MODEL_TYPE_TEMPLATES,
+    _resolve_chat_template,
+)
 
 
 # ---------------------------------------------------------------------------

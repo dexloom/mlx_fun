@@ -208,8 +208,49 @@ corpus used by `collect` and `domain-scan`.
   checkpoints through their language stack.
 - `--answer-mode generate` — the model writes its own answer with the hooks
   live during decoding. `--answers-output` dumps what it wrote in the probe
-  schema, so a generate run can be replayed in teacher mode. Not available for
-  vision models.
+  schema, so a generate run can be replayed in teacher mode.
+
+Both modes run on vision checkpoints. Generation drives the unwrapped language
+stack with token ids only (no pixels) through a logits shim, the same path
+`refusal-probe` uses.
+
+### Thinking mode
+
+Thinking is **off by default** in both probes. mlx-lm's tokenizer wrapper turns
+`enable_thinking` on whenever the vocabulary carries think tokens, which would
+end every Qwen/GLM generation prompt at an open `<think>`: teacher mode would
+then score the reference answer *inside* the thinking channel, and generate mode
+would spend its whole token budget reasoning. So unless `--chat-template-args`
+carries a thinking flag itself, `enable_thinking=false` is sent — harmless for
+templates that never read it.
+
+Some templates ignore the flag entirely. MiniMax's always ends the generation
+prompt with `<think>\n`. When the rendered prompt still dangles at an open think
+marker, the probe appends the closing marker so the prompt reaches the canonical
+empty-think form (for Qwen, exactly `<think>\n\n</think>\n\n`), and logs once per
+tokenizer that it did. `prompt_len` counts the appended tokens, so answer
+attribution stays aligned.
+
+To probe *with* thinking on, ask for it explicitly:
+`--chat-template-args '{"enable_thinking": true}'`. An explicit value, true or
+false, is passed through unchanged and suppresses the force-close.
+
+### Overriding the chat template
+
+`--chat-template` replaces the template both probes render prompts with:
+
+| Value | Meaning |
+|---|---|
+| *(omitted)* | The checkpoint's own template. The default. |
+| a file path | Read that file. |
+| `bundled` | The template bundled for this `model_type` (errors if there is none). |
+| anything else | Used verbatim as an inline Jinja template. |
+
+This is deliberately narrower than `serve`, which falls back to a bundled
+template on its own: a probe reports on the checkpoint as shipped, so its valid
+template is never silently swapped out. The CLI prints which source is in use.
+The override reaches mlx-vlm checkpoints too — `mlx_vlm.load` takes no tokenizer
+config, so the template is assigned to the tokenizer it returns.
 
 ### How relevance is scored
 
@@ -301,8 +342,8 @@ check. On a 78-layer model with 80 questions and `--verify-top 32` expect tens
 of minutes; `--verify-questions`, a smaller `--verify-top`, and omitting
 `--verify-prune` are the levers.
 
-Thinking-mode templates are best disabled for probing:
-`--chat-template-args '{"enable_thinking": false}'`.
+Thinking is already off by default (see [Thinking mode](#thinking-mode)), which
+also keeps the cost of `--answer-mode generate` predictable.
 
 Gemma 4 is not supported for knockout verification; the trace pass works.
 
@@ -357,6 +398,24 @@ one would slot in; `--refusal-markers` is the cheap lever until then.
 Only refused and answered responses define the signal; partials are recorded
 but excluded, and a `partial` never counts as a knockout flip.
 
+### Reasoning blocks
+
+A reasoning model puts its answer *after* a `<think>…</think>` block, and the
+classifier only reads the opening of a response — so a refusal behind a long
+think block would read as "answered". The probe therefore strips the reasoning
+first: everything after the last closing marker is what gets classified. The
+`--answers-output` rows keep both, `answer` (what was classified) and
+`raw_answer` (the whole generation), so a run stays auditable.
+
+A block that never *closed* means the model ran out of tokens while still
+reasoning. There is no answer to judge, so the question is neither answered nor
+refused: it is skipped, excluded from the statistics, the buckets and the
+records, and counted on the summary line. The same rule holds during knockout
+verification — a truncated regeneration is never scored as the guardrail
+breaking. Raise `--max-answer-tokens` to recover those questions. Markers come
+from the tokenizer (`think_start`/`think_end`, or the vocabulary), falling back
+to `<think>`/`</think>`.
+
 If the model refuses none of the questions there is no signal to isolate, and
 the command says so and stops — try a set it actually declines, a stricter
 `--system` prompt, or wider markers.
@@ -400,10 +459,11 @@ matched allowed/disallowed prompts within each topic.
 
 ### Vision models
 
-Unlike the domain probe's generate mode, `refusal-probe` runs on vision models:
-it generates on the unwrapped language stack (token ids only, no pixels) through
-a logits shim. (This path has unit coverage but has not been validated on real
-VLM weights in this repo — no small VLM is available here.)
+Both probes run on vision models: generation drives the unwrapped language stack
+(token ids only, no pixels) through a logits shim, shared by `refusal-probe` and
+`domain-probe --answer-mode generate`. (This path has unit coverage but has not
+been validated on real VLM weights in this repo — no small VLM is available
+here.)
 
 ### Output
 

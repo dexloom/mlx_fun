@@ -44,11 +44,12 @@ src/mlx_fun/
 │   ├── glm_moe_dsa.py    # GLM-5/DeepSeek V3.2: DeepseekV32MoE with MoEGate
 │   ├── qwen3_moe.py      # Qwen3/Qwen3-Next: sparse layers by decoder_sparse_step, mlp
 │   ├── nemotron_h.py      # Nemotron-H: hybrid Mamba-2/Attn/MoE via hybrid_override_pattern
-│   ├── qwen4_exp.py       # Qwen4-Exp (Qwen3.8-Flash-Next): VLM, MoE under language_model
+│   ├── qwen4_exp.py       # Qwen4-Exp + Qwen3.5/3.6 MoE (qwen3_5_moe): VLM, MoE under language_model
 │   └── glm5_next.py       # GLM-5.3-Flash: VLM, DeepseekV32MoE under language_model
 ├── models/                # Out-of-tree model types published into mlx_lm.models
 │   └── gemma4_assistant.py # Gemma 4 MTP drafter (was a fork of mlx-lm)
 ├── loader.py              # Backend-aware load: mlx-lm for text, mlx-vlm for vision
+├── chat_template.py       # Bundled-template map + the serve and probe template resolvers
 ├── observer.py            # Hooks via __class__ swap (not MethodType — special methods)
 ├── ream_hooks.py          # REAM hooks: capture MoE inputs + full gate logits
 ├── saliency.py            # numpy float64 accumulator with np.add.at() scatter-add
@@ -201,6 +202,44 @@ src/mlx_fun/
   Qwen3-Next's. The sigmoid-gated shared expert is not routed and is not a
   pruning target.
 
+- **`qwen3_5_moe` is an alias of `qwen4_exp`, not new code.** Qwen3.5/3.6 MoE
+  (e.g. Qwen3.6-35B-A3B) declares its own `model_type` but mlx-vlm builds it
+  from the *same* `Qwen3_5MoeSparseMoeBlock`, so it is registered alongside
+  `qwen4_exp` in every map — adapter, observer/REAM/steering hooks, the
+  knockout selection target, the amplification and top-k branches, the
+  VLM-only loader set and the bundled-template map. `tests/test_qwen4_exp.py`
+  and `tests/test_vlm_integration.py` are parametrized over both strings so an
+  alias that gets missed in one map fails there.
+
+- **Probe prompts render with thinking OFF, and dangling think starts are
+  force-closed** (`probe.build_probe_tokens`). mlx-lm's `TokenizerWrapper`
+  injects `enable_thinking=True` whenever the vocab has think tokens, so every
+  Qwen/GLM prompt would otherwise end at an open `<think>` — teacher mode would
+  score the reference answer inside the thinking channel and generate mode would
+  burn its budget reasoning. An explicit caller value (either way, under
+  whatever name `_thinking_kwarg` gives) is passed through untouched. Templates
+  that ignore the flag (MiniMax's always emits `<think>\n`) are handled after
+  rendering: `probe.think_markers` resolves the delimiters from the tokenizer
+  (or its vocab, for the raw HF tokenizers the mlx-vlm path returns) and the
+  closing marker is appended, giving the canonical empty-think form.
+  `prompt_len` counts those tokens, so answer attribution stays aligned.
+
+- **The refusal probe classifies the *visible* answer** (`refusal.strip_thinking`):
+  `classify_response` reads only the first ~264 normalized chars, so a refusal
+  behind a `<think>…</think>` block would read as "answered". A block that never
+  closed means the model ran out of tokens while reasoning: that question is
+  neither answered nor refused, so it is skipped rather than bucketed, and is
+  never a knockout flip. `--answers-output` keeps `answer` (classified) and
+  `raw_answer` (verbatim) side by side.
+
+- **The probes' `--chat-template` is narrower than `serve`'s.** `serve` falls
+  back through model dir → bundled so a broken quant still runs; a probe
+  measures the checkpoint as shipped, so `resolve_probe_chat_template` defaults
+  to the checkpoint's own template and only uses a bundled one when asked by the
+  literal `bundled`. Both resolvers live in `chat_template.py` so the probes do
+  not import the serving stack; `server._MODEL_TYPE_TEMPLATES` and
+  `server._resolve_chat_template` are re-exports.
+
 ## Supported Models
 
 | Type | Config `model_type` | Expert count key | MoE block path |
@@ -215,6 +254,7 @@ src/mlx_fun/
 | DeepSeek V3.2 | `deepseek_v32` | `n_routed_experts` | Same as GLM-5 (shared architecture) |
 | Nemotron-H | `nemotron_h` | `n_routed_experts` | `model.backbone.layers[i].mixer` (hybrid Mamba-2/Attn/MoE) |
 | Qwen4-Exp | `qwen4_exp` | `num_experts` (in `text_config`) | `model.language_model.model.layers[i].mlp` (VLM — loads via mlx-vlm) |
+| Qwen3.5/3.6 MoE | `qwen3_5_moe` | `num_experts` (in `text_config`) | Same as Qwen4-Exp (alias) — e.g. Qwen3.6-35B-A3B |
 | GLM-5.3 | `glm_moe_dsa` | `n_routed_experts` | Same as GLM-5 — 78 layers, 256 experts, adds `mlp_layer_types` |
 | GLM-5.3-Flash | `glm5_next` | `n_routed_experts` (in `text_config`) | `model.language_model.model.layers[i].mlp` (VLM — loads via mlx-vlm) |
 
@@ -229,6 +269,8 @@ Reference source files (mlx-lm 0.32.0 upstream, mlx-vlm 0.6.17):
 - Switch layers: `mlx_lm/models/switch_layers.py` — `SwitchGLU`, `SwitchLinear`, `QuantizedSwitchLinear`
 - Qwen4-Exp: **mlx-vlm** `mlx_vlm/models/qwen4_exp/language.py` — `Qwen4ExpDecoderLayer`,
   whose `.mlp` is `mlx_vlm/models/qwen3_5_moe/language.py::Qwen3_5MoeSparseMoeBlock`
+- Qwen3.5/3.6 MoE: **mlx-vlm** `mlx_vlm/models/qwen3_5_moe/language.py` —
+  `Qwen3_5MoeDecoderLayer`, whose `.mlp` is the *same* `Qwen3_5MoeSparseMoeBlock`
 - GLM-5.3-Flash: **mlx-vlm** `mlx_vlm/models/glm5_next/language.py` — `Glm5NextDecoderLayer`,
   whose `.mlp` is `mlx_vlm/models/deepseek_v32/language.py::DeepseekV32MoE`
 
@@ -237,7 +279,7 @@ Reference source files (mlx-lm 0.32.0 upstream, mlx-vlm 0.6.17):
 Tests use tiny MoE fixtures (4 experts, hidden=32) defined in `tests/conftest.py`. No real models are needed for unit tests.
 
 ```bash
-pytest tests/ -v                    # All 752 tests
+pytest tests/ -v                    # All 826 tests
 pytest tests/test_pruner.py -v      # Just pruner tests
 pytest tests/test_safety.py -v      # Safety analysis tests
 pytest tests/test_steering.py -v    # Steering hook tests
@@ -248,7 +290,8 @@ pytest tests/test_refusal.py -v     # Refusal probe: classifier, regenerate knoc
 pytest tests/test_frontend.py -v   # Frontend API + visualization tests
 pytest tests/test_convert_nvfp4.py -v  # NVFP4 converter tests
 pytest tests/test_loader.py -v      # Backend routing (mlx-lm vs mlx-vlm)
-pytest tests/test_qwen4_exp.py -v   # Qwen4-Exp adapter + hooks (tiny replicas)
+pytest tests/test_chat_template.py -v  # serve vs probe template resolution
+pytest tests/test_qwen4_exp.py -v   # Qwen4-Exp / qwen3_5_moe adapter + hooks (tiny replicas)
 pytest tests/test_glm53.py -v       # GLM-5.3 + GLM-5.3-Flash adapters + hooks
 pytest tests/test_vlm_integration.py -v  # Both, against real mlx-vlm classes
 ```

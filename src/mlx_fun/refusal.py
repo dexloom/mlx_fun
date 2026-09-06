@@ -19,7 +19,9 @@ answer? A log-likelihood delta cannot tell a reworded refusal from actual
 compliance; a re-classification can.
 
 Reuses the domain probe's machinery — observer hooks, question-weighted routing
-statistics, the real-router expert mask — with refused/answered in place of
+statistics, the real-router expert mask, and the shared generation path
+(``probe.generate_response`` and its VLM logits shim, re-exported here so
+``refusal.generate_response`` keeps working) — with refused/answered in place of
 domain/general.
 """
 
@@ -37,9 +39,12 @@ from .probe import (
     ProbeExample,
     ProbeReport,
     ProbeStats,
+    _LogitsModel,
     _to_list,
     _from_list,
     compute_probe_scores,
+    generate_response,
+    think_markers,
 )
 
 REFUSED = "refused"
@@ -51,6 +56,49 @@ _OUTCOMES = (ANSWERED, REFUSED, PARTIAL)
 # the contrast. Partial answers carry both a refusal and content, so they are
 # recorded but never define the refusal signal.
 _OUTCOME_TO_LABEL = {REFUSED: DOMAIN, ANSWERED: GENERAL}
+
+
+DEFAULT_THINK_START = "<think>"
+DEFAULT_THINK_END = "</think>"
+
+# Reason recorded for a generation whose reasoning block never closed.
+UNFINISHED_THINKING = "thinking not finished within max_answer_tokens"
+
+
+# ---------------------------------------------------------------------------
+# Reasoning channel
+# ---------------------------------------------------------------------------
+
+def strip_thinking(
+    text: str,
+    think_start: str = DEFAULT_THINK_START,
+    think_end: str = DEFAULT_THINK_END,
+) -> Optional[str]:
+    """Return the visible answer, dropping any reasoning block before it.
+
+    ``classify_response`` only reads the opening of a response, so a refusal
+    that follows a ``<think>…</think>`` block reads as "answered" unless the
+    reasoning is removed first. And a block that never closed means the model
+    ran out of tokens while still reasoning: there is no answer at all, refused
+    or otherwise, so that case is neither — the question has to be dropped.
+
+    Args:
+        text: The raw generation.
+        think_start: Opening delimiter.
+        think_end: Closing delimiter.
+
+    Returns:
+        The text after the LAST ``think_end`` (lstripped); the text unchanged
+        when it has no reasoning block; ``None`` when reasoning opened and
+        never closed.
+    """
+    if text is None:
+        return None
+    if think_end and think_end in text:
+        return text.rsplit(think_end, 1)[1].lstrip()
+    if think_start and think_start in text:
+        return None
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -357,66 +405,6 @@ class RefusalReport(ProbeReport):
 
 
 # ---------------------------------------------------------------------------
-# Generation (text and vision models)
-# ---------------------------------------------------------------------------
-
-class _LogitsModel:
-    """Wrap a model so its ``__call__`` returns a raw logits array.
-
-    mlx-vlm language models return a ``LanguageModelOutput``; mlx-lm's
-    generation loop expects an array. This unwraps ``.logits`` and delegates
-    every other attribute (``layers`` for the KV cache, etc.) to the inner
-    model, so mlx-lm can drive a vision model's language stack token-only.
-    """
-
-    def __init__(self, inner):
-        object.__setattr__(self, "_inner", inner)
-
-    def __call__(self, *args, **kwargs):
-        out = self._inner(*args, **kwargs)
-        return getattr(out, "logits", out)
-
-    def __getattr__(self, name):
-        return getattr(object.__getattribute__(self, "_inner"), name)
-
-
-def generate_response(model, tokenizer, config, prompt_ids, max_tokens):
-    """Greedily generate a response, returning (token_ids, text).
-
-    Works for text models directly and for vision models by driving their
-    unwrapped language stack with a logits shim, so refusal probing is not
-    blocked on VLM targets.
-    """
-    from mlx_lm.generate import stream_generate
-    from mlx_lm.models.cache import make_prompt_cache
-
-    from .loader import is_vision_model, language_model
-
-    prompt = list(prompt_ids)
-    if not is_vision_model(config):
-        ids, chunks = [], []
-        for r in stream_generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens):
-            ids.append(int(r.token))
-            chunks.append(r.text)
-        return ids, "".join(chunks)
-
-    # Vision model: generate on the language stack only (token ids, no pixels).
-    lm = language_model(model)
-    shim = _LogitsModel(lm)
-    cache = make_prompt_cache(lm)
-    ids = []
-    for r in stream_generate(
-        shim, tokenizer, prompt=prompt, max_tokens=max_tokens, prompt_cache=cache
-    ):
-        ids.append(int(r.token))
-    if hasattr(tokenizer, "decode"):
-        text = tokenizer.decode(ids)
-    else:
-        text = ""
-    return ids, text
-
-
-# ---------------------------------------------------------------------------
 # Trace: generate, classify, and split routing by outcome
 # ---------------------------------------------------------------------------
 
@@ -447,9 +435,10 @@ def trace_refusals(
         refused/answered label to the ProbeExamples in that bucket, ``outcomes``
         is the per-question classification record (with the question text, so a
         record is identifiable even though ``--max-questions`` subsamples),
-        ``skipped`` lists questions that produced no usable generation, and
-        ``records`` carries per-question routing vectors + tags for tag-stratified
-        scoring.
+        ``skipped`` lists questions that produced no usable generation — an
+        unfinished reasoning block among them, flagged ``unfinished_thinking``
+        — and ``records`` carries per-question routing vectors + tags for
+        tag-stratified scoring.
     """
     from .observer import collect_captures
     from .probe import build_probe_tokens, question_vectors, slice_answer_captures
@@ -458,6 +447,10 @@ def trace_refusals(
     outcomes: List[dict] = []
     skipped: List[dict] = []
     records: List[dict] = []
+
+    think_start, think_end = (
+        think_markers(tokenizer) or (DEFAULT_THINK_START, DEFAULT_THINK_END)
+    )
 
     for index, q in enumerate(questions):
         prompt, prompt_len = build_probe_tokens(
@@ -471,7 +464,21 @@ def trace_refusals(
             skipped.append({"index": index, "reason": "generated no tokens"})
             continue
 
-        outcome = classify_response(text, extra_markers)
+        # The classifier reads the opening of the response, so the reasoning
+        # block has to go first. A block that never closed is not an outcome at
+        # all: the model never got to an answer, so it is neither refused nor
+        # answered and must not skew either bucket.
+        visible = strip_thinking(text, think_start, think_end)
+        if visible is None:
+            collect_captures(moe_blocks)
+            skipped.append({
+                "index": index,
+                "reason": UNFINISHED_THINKING,
+                "unfinished_thinking": True,
+            })
+            continue
+
+        outcome = classify_response(visible, extra_markers)
         tokens = list(prompt) + gen_ids
         n_answer = len(gen_ids)
 
@@ -500,10 +507,13 @@ def trace_refusals(
             "question": q.question,
             "outcome": outcome,
             "tags": list(q.tags),
-            "answer": text,
+            # "answer" is what was classified; "raw_answer" keeps the reasoning
+            # block so --answers-output stays auditable.
+            "answer": visible,
+            "raw_answer": text,
         })
         if echo is not None:
-            echo(index, q.question, outcome, text)
+            echo(index, q.question, outcome, visible)
         if progress is not None:
             progress(index + 1, len(questions))
 
@@ -574,6 +584,10 @@ def run_refusal_knockout(
     if not prompts:
         return results
 
+    think_start, think_end = (
+        think_markers(tokenizer) or (DEFAULT_THINK_START, DEFAULT_THINK_END)
+    )
+
     for done, (layer_idx, expert_id) in enumerate(candidates, start=1):
         masks = {layer_idx: [expert_id]}
         _check_mask_budget(masks, num_experts, top_k)
@@ -583,7 +597,13 @@ def run_refusal_knockout(
                 _ids, text = generate_response(
                     model, tokenizer, config, prompt, max_answer_tokens,
                 )
-                outcome = classify_response(text, extra_markers)
+                visible = strip_thinking(text, think_start, think_end)
+                if visible is None:
+                    # Reasoning never finished, so there is no answer to judge.
+                    # Not a flip: an expert is not verified by a truncation.
+                    flips[i] = 0.0
+                    continue
+                outcome = classify_response(visible, extra_markers)
                 # Only a clean answer, with no refusal marker at all, counts as
                 # the guardrail breaking. A lengthy hedged refusal (PARTIAL) or
                 # a reworded refusal still declined — treating it as a flip would

@@ -26,8 +26,9 @@ from typing import Any, Optional, Tuple
 # Model types that only mlx-vlm implements, even though their config carries no
 # ``vision_config`` (or carries one we would otherwise not recognise).
 _VLM_ONLY_MODEL_TYPES = {
-    "qwen4_exp",   # Qwen/Qwen3.8-Flash-Next
-    "glm5_next",   # zai-org/GLM-5.3-Flash
+    "qwen4_exp",     # Qwen/Qwen3.8-Flash-Next
+    "qwen3_5_moe",   # Qwen/Qwen3.6-35B-A3B and the rest of the Qwen3.5/3.6 MoE line
+    "glm5_next",     # zai-org/GLM-5.3-Flash
 }
 
 _VLM_INSTALL_HINT = (
@@ -123,6 +124,10 @@ def load_model(
     ``mlx_lm.load(..., return_config=True)``. For vision checkpoints the second
     element is mlx-vlm's processor, which exposes the same ``encode`` /
     ``decode`` / ``apply_chat_template`` surface the calibration paths use.
+
+    ``tokenizer_config["chat_template"]`` is honoured on both backends: mlx-lm
+    consumes it directly, and on the mlx-vlm path it is assigned to the returned
+    tokenizer after loading, since ``mlx_vlm.load`` takes no tokenizer config.
     """
     expanded = os.path.expanduser(model_path)
     if os.path.exists(expanded):
@@ -138,7 +143,8 @@ def load_model(
 
     if config and is_vision_model(config):
         return _load_vlm(model_path, config, lazy=lazy,
-                         trust_remote_code=trust_remote_code)
+                         trust_remote_code=trust_remote_code,
+                         tokenizer_config=tokenizer_config)
 
     return _load_text(model_path, tokenizer_config=tokenizer_config,
                       trust_remote_code=trust_remote_code, lazy=lazy)
@@ -159,7 +165,7 @@ def _load_text(model_path, *, tokenizer_config, trust_remote_code, lazy):
     )
 
 
-def _load_vlm(model_path, config, *, lazy, trust_remote_code):
+def _load_vlm(model_path, config, *, lazy, trust_remote_code, tokenizer_config=None):
     try:
         from mlx_vlm import load as vlm_load
     except ImportError as e:
@@ -180,6 +186,15 @@ def _load_vlm(model_path, config, *, lazy, trust_remote_code):
     # tokenizer surface. Processors proxy encode/decode to .tokenizer, but be
     # explicit so callers that introspect get the real thing.
     tokenizer = getattr(processor, "tokenizer", processor)
+
+    # mlx_vlm.load takes no tokenizer_config, so an override has to be applied
+    # after the fact. Only chat_template is honoured here — the rest of a
+    # tokenizer_config would have to reach the constructor to have any effect.
+    chat_template = (tokenizer_config or {}).get("chat_template")
+    if chat_template:
+        tokenizer.chat_template = chat_template
+        logging.info("Applied an explicit chat template to the mlx-vlm tokenizer")
+
     return model, tokenizer, config
 
 

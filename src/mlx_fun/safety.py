@@ -51,7 +51,7 @@ def compute_top_k_from_logits(
         scores = 1.0 / (1.0 + np.exp(-gate_logits.astype(np.float64)))
         # argpartition for top-k (highest scores = lowest negated scores)
         inds = np.argpartition(-scores, kth=top_k - 1, axis=-1)[..., :top_k]
-    elif model_type in ("qwen3_moe", "qwen3_next", "qwen4_exp"):
+    elif model_type in ("qwen3_moe", "qwen3_next", "qwen4_exp", "qwen3_5_moe"):
         # Softmax activation, select top-k by descending probability
         logits = gate_logits.astype(np.float64)
         logits_max = logits.max(axis=-1, keepdims=True)

@@ -22,6 +22,7 @@ The report is a superset of ``DomainReport``, so ``prune --domain-map``,
 """
 
 import json
+import logging
 import random
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -159,6 +160,108 @@ def _template_ids_to_list(prompt) -> List[int]:
     return [int(t) for t in seq]
 
 
+# Single-token think delimiters, in the order mlx-lm's ``_infer_thinking``
+# checks them. Used only when the tokenizer does not expose think_start /
+# think_end itself (raw HF tokenizers, which is what the mlx-vlm path returns).
+_THINK_TOKEN_PAIRS = (
+    ("<think>", "</think>"),
+    ("<longcat_think>", "</longcat_think>"),
+    ("<|think:start|>", "<|think:end|>"),
+)
+
+# Tokenizers already logged about, so the force-close notice is emitted once per
+# tokenizer rather than once per question.
+_FORCE_CLOSED_THINK: set = set()
+
+
+def think_markers(tokenizer) -> Optional[Tuple[str, str]]:
+    """Resolve a tokenizer's ``(think_start, think_end)`` strings, if it has any.
+
+    Prefers mlx-lm's ``TokenizerWrapper`` attributes; falls back to probing the
+    vocabulary the way upstream infers them, which covers the raw HuggingFace
+    tokenizers the mlx-vlm path hands back. Written defensively because probe
+    tests drive it with mocks whose attributes are not strings.
+
+    Returns:
+        ``(start, end)``, or ``None`` when the model has no thinking channel.
+    """
+    start = getattr(tokenizer, "think_start", None)
+    end = getattr(tokenizer, "think_end", None)
+    if isinstance(start, str) and isinstance(end, str) and start and end:
+        return start, end
+
+    get_vocab = getattr(tokenizer, "get_vocab", None)
+    if not callable(get_vocab):
+        return None
+    try:
+        vocab = get_vocab()
+    except Exception:  # pragma: no cover - defensive
+        return None
+    if not isinstance(vocab, dict):
+        return None
+
+    for think_start, think_end in _THINK_TOKEN_PAIRS:
+        if think_start in vocab and think_end in vocab:
+            return think_start, think_end
+    # Gemma 4 spells its channel open/close across several tokens.
+    if "<|channel>" in vocab and "<channel|>" in vocab:
+        return "<|channel>thought", "<channel|>"
+    return None
+
+
+def _thinking_kwarg_name(tokenizer) -> str:
+    """The chat-template kwarg this tokenizer reads for thinking mode."""
+    name = getattr(tokenizer, "_thinking_kwarg", None)
+    return name if isinstance(name, str) and name else "enable_thinking"
+
+
+def _close_dangling_think(tokenizer, prompt: List[int]) -> List[int]:
+    """Append an empty think block when the prompt ends with an open think start.
+
+    mlx-lm's wrapper defaults ``enable_thinking`` to True whenever the vocab has
+    think tokens, and templates like MiniMax's ignore the flag entirely, so a
+    generation prompt can still end at an *open* ``<think>``. Left that way,
+    teacher mode scores the reference answer inside the thinking channel and
+    generate mode spends its whole budget reasoning. Closing the block puts the
+    prompt in the canonical empty-think form the template renders for
+    ``enable_thinking=False`` (for Qwen, exactly ``<think>\\n\\n</think>\\n\\n``).
+    """
+    markers = think_markers(tokenizer)
+    if markers is None:
+        return prompt
+    think_start, think_end = markers
+
+    decode = getattr(tokenizer, "decode", None)
+    if not callable(decode) or not prompt:
+        return prompt
+    try:
+        tail = decode(prompt[-8:])
+    except Exception:  # pragma: no cover - defensive
+        return prompt
+    if not isinstance(tail, str) or not tail.rstrip().endswith(think_start):
+        return prompt
+
+    try:
+        closing = tokenizer.encode(
+            "\n" + think_end + "\n\n", add_special_tokens=False,
+        )
+        closing = [int(t) for t in closing]
+    except Exception:  # pragma: no cover - defensive
+        return prompt
+    if not closing:
+        return prompt
+
+    key = id(tokenizer)
+    if key not in _FORCE_CLOSED_THINK:
+        _FORCE_CLOSED_THINK.add(key)
+        logging.info(
+            f"Probe prompts end at an open '{think_start}'; appending "
+            f"'{think_end}' to force an empty think block. The template ignores "
+            f"the thinking flag or defaults it on."
+        )
+    return list(prompt) + closing
+
+
 def build_probe_tokens(
     tokenizer,
     q: ProbeQuestion,
@@ -172,17 +275,29 @@ def build_probe_tokens(
     The prompt ends at the assistant generation header; in teacher mode the
     reference answer is appended so a single forward pass scores it.
 
+    Thinking is **off by default**. mlx-lm's ``TokenizerWrapper`` injects
+    ``enable_thinking=True`` whenever the vocabulary carries think tokens, which
+    would make every Qwen/GLM prompt end at an open ``<think>``: teacher mode
+    would then score the reference answer inside the thinking channel, and
+    generate mode would burn its whole budget reasoning. So unless the caller
+    passes a thinking kwarg itself, ``enable_thinking=False`` is sent (harmless
+    for templates that never read it), and a prompt that *still* ends at an open
+    think start — MiniMax's templates ignore the flag — gets the block closed
+    explicitly.
+
     Args:
         tokenizer: The model tokenizer (mlx-lm TokenizerWrapper or similar).
         q: The question.
         answer_mode: "teacher" (append the reference answer) or "generate".
         max_answer_tokens: Truncate the reference answer to this many tokens.
-        chat_template_args: Extra kwargs for apply_chat_template, e.g.
-            ``{"enable_thinking": False}``.
+        chat_template_args: Extra kwargs for apply_chat_template. An explicit
+            thinking kwarg (``{"enable_thinking": True}``, or whatever name this
+            tokenizer uses) is respected unchanged.
         system: Default system prompt; ``q.system`` overrides it.
 
     Returns:
         (tokens, prompt_len). In generate mode tokens == the prompt.
+        ``prompt_len`` includes any force-closed think tokens.
 
     Raises:
         ValueError: If teacher mode gets a question with no usable answer.
@@ -194,13 +309,22 @@ def build_probe_tokens(
     messages.append({"role": "user", "content": q.question})
 
     if _has_chat_template(tokenizer):
+        template_args = dict(chat_template_args or {})
+        thinking_keys = {"enable_thinking", _thinking_kwarg_name(tokenizer)}
+        caller_thinking = [template_args[k] for k in thinking_keys if k in template_args]
+        if not caller_thinking:
+            template_args["enable_thinking"] = False
+        thinking_enabled = any(bool(v) for v in caller_thinking)
+
         prompt = tokenizer.apply_chat_template(
             messages,
             tokenize=True,
             add_generation_prompt=True,
-            **(chat_template_args or {}),
+            **template_args,
         )
         prompt = _template_ids_to_list(prompt)
+        if not thinking_enabled:
+            prompt = _close_dangling_think(tokenizer, prompt)
     else:
         text = q.question + "\n"
         if sys_prompt:
@@ -634,6 +758,7 @@ _SELECTION_TARGETS = {
     "qwen3_moe": ("gate", "bias"),
     "qwen3_next": ("gate", "bias"),
     "qwen4_exp": ("gate", "bias"),
+    "qwen3_5_moe": ("gate", "bias"),
 }
 
 
@@ -993,38 +1118,90 @@ def run_prune_check(
 # Trace pass
 # ---------------------------------------------------------------------------
 
-def generate_answer(model, tokenizer, prompt_ids: Sequence[int], max_tokens: int):
-    """Greedily generate an answer, returning its token ids and text.
+class _LogitsModel:
+    """Wrap a model so its ``__call__`` returns a raw logits array.
+
+    mlx-vlm language models return a ``LanguageModelOutput``; mlx-lm's
+    generation loop expects an array. This unwraps ``.logits`` and delegates
+    every other attribute (``layers`` for the KV cache, etc.) to the inner
+    model, so mlx-lm can drive a vision model's language stack token-only.
+    """
+
+    def __init__(self, inner):
+        object.__setattr__(self, "_inner", inner)
+
+    def __call__(self, *args, **kwargs):
+        out = self._inner(*args, **kwargs)
+        return getattr(out, "logits", out)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_inner"), name)
+
+
+def generate_response(model, tokenizer, config, prompt_ids, max_tokens):
+    """Greedily generate a response, returning ``(token_ids, text)``.
+
+    Works for text models directly and for vision models by driving their
+    unwrapped language stack with a logits shim, so neither probe is blocked on
+    VLM targets.
 
     Every token yielded by ``stream_generate`` — including the final EOS or
     truncation token — was already forwarded by the model before being yielded,
     so ``len(ids)`` is exactly the number of decode positions captured.
-
-    Args:
-        model: The model (the full wrapper; mlx-lm handles the forward).
-        tokenizer: The tokenizer.
-        prompt_ids: Prompt token ids.
-        max_tokens: Maximum tokens to generate.
-
-    Returns:
-        (ids, text).
     """
     from mlx_lm.generate import stream_generate
+    from mlx_lm.models.cache import make_prompt_cache
 
-    ids: List[int] = []
-    chunks: List[str] = []
-    for response in stream_generate(
-        model, tokenizer, prompt=list(prompt_ids), max_tokens=max_tokens,
+    from .loader import is_vision_model, language_model
+
+    prompt = list(prompt_ids)
+    if not is_vision_model(config):
+        ids, chunks = [], []
+        for r in stream_generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens):
+            ids.append(int(r.token))
+            chunks.append(r.text)
+        return ids, "".join(chunks)
+
+    # Vision model: generate on the language stack only (token ids, no pixels).
+    lm = language_model(model)
+    shim = _LogitsModel(lm)
+    cache = make_prompt_cache(lm)
+    ids = []
+    for r in stream_generate(
+        shim, tokenizer, prompt=prompt, max_tokens=max_tokens, prompt_cache=cache
     ):
-        ids.append(int(response.token))
-        chunks.append(response.text)
-    return ids, "".join(chunks)
+        ids.append(int(r.token))
+    decode = getattr(tokenizer, "decode", None)
+    if not callable(decode):
+        return ids, ""
+    # Match the text path, whose streaming detokenizer never sees the EOS
+    # token: drop a trailing EOS and decode everything else verbatim. Do NOT
+    # skip special tokens here — some checkpoints flag <think>/</think> as
+    # special, and the refusal probe needs those markers to find the answer.
+    eos_ids = _eos_token_ids(tokenizer)
+    visible_ids = ids[:-1] if ids and ids[-1] in eos_ids else ids
+    return ids, decode(visible_ids)
+
+
+def _eos_token_ids(tokenizer) -> set:
+    """The tokenizer's EOS ids as a set (mlx-lm wrapper or raw HF tokenizer)."""
+    ids = getattr(tokenizer, "eos_token_ids", None)
+    if isinstance(ids, (set, frozenset, list, tuple)):
+        return {int(i) for i in ids}
+    eid = getattr(tokenizer, "eos_token_id", None)
+    return {int(eid)} if isinstance(eid, int) else set()
+
+
+def generate_answer(model, tokenizer, prompt_ids: Sequence[int], max_tokens: int):
+    """Text-only :func:`generate_response`, kept for callers with no config."""
+    return generate_response(model, tokenizer, {}, prompt_ids, max_tokens)
 
 
 def trace_question_set(
     forward,
     model,
     tokenizer,
+    config,
     questions: Sequence[ProbeQuestion],
     label: str,
     stats: ProbeStats,
@@ -1049,6 +1226,8 @@ def trace_question_set(
         forward: Token-only forward callable (used in teacher mode).
         model: The model, for generation.
         tokenizer: The tokenizer.
+        config: The model config, which selects the generation path (a vision
+            checkpoint generates on its unwrapped language stack).
         questions: The question set.
         label: "domain" or "general".
         stats: ProbeStats to update.
@@ -1082,8 +1261,8 @@ def trace_question_set(
 
         answer_text = q.answer or ""
         if answer_mode == "generate":
-            generated, answer_text = generate_answer(
-                model, tokenizer, tokens, max_answer_tokens,
+            generated, answer_text = generate_response(
+                model, tokenizer, config, tokens, max_answer_tokens,
             )
             if not generated:
                 collect_captures(moe_blocks)

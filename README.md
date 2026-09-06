@@ -217,11 +217,13 @@ the streaming dequant→requant pattern for already-quantized sources.
 MiniMax (M1/M2), GLM4-MoE, GLM4-MoE-Lite, Qwen3-MoE, Qwen3-Next, GLM-5
 (GLM-MoE-DSA), DeepSeek V3.2, Kimi-K2/K2.6 (`kimi_k25` multimodal wrapper),
 Nemotron-H (hybrid Mamba-2/Attn/MoE), Gemma4, GLM-5.3, Qwen4-Exp
-(`Qwen/Qwen3.8-Flash-Next`), GLM-5.3-Flash. Both quantized and unquantized
+(`Qwen/Qwen3.8-Flash-Next`), Qwen3.5/3.6 MoE (`qwen3_5_moe`, e.g.
+`Qwen/Qwen3.6-35B-A3B`), GLM-5.3-Flash. Both quantized and unquantized
 sources work. New architectures plug in via the `BaseAdapter` interface.
 
-**Vision-language models.** Qwen4-Exp (`Qwen/Qwen3.8-Flash-Next`) and
-GLM-5.3-Flash (`zai-org/GLM-5.3-Flash`) are VLMs: mlx-lm does not implement
+**Vision-language models.** Qwen4-Exp (`Qwen/Qwen3.8-Flash-Next`), the
+Qwen3.5/3.6 MoE line (`Qwen/Qwen3.6-35B-A3B`, which shares Qwen4-Exp's MoE
+block) and GLM-5.3-Flash (`zai-org/GLM-5.3-Flash`) are VLMs: mlx-lm does not implement
 them, so mlx_fun loads them through
 [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) and runs the analysis stack
 (saliency collection, SAFEx, domain scan, steering) against their language

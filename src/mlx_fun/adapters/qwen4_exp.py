@@ -1,7 +1,12 @@
-"""Adapter for Qwen4-Exp (``Qwen/Qwen3.8-Flash-Next``) MoE architecture.
+"""Adapter for the Qwen4-Exp / Qwen3.5-3.6 MoE architecture.
 
-Qwen4-Exp is a vision-language model, so it loads through mlx-vlm rather than
-mlx-lm (see ``mlx_fun.loader``) and its language hyperparameters live under a
+Serves two ``model_type`` strings that share one block:
+
+* ``qwen4_exp`` — ``Qwen/Qwen3.8-Flash-Next``
+* ``qwen3_5_moe`` — the Qwen3.5/3.6 MoE line, e.g. ``Qwen/Qwen3.6-35B-A3B``
+
+Both are vision-language models, so they load through mlx-vlm rather than
+mlx-lm (see ``mlx_fun.loader``) and their language hyperparameters live under a
 nested ``text_config``. The MoE stack itself is conventional: every decoder
 layer carries an ``mlp`` that is mlx-vlm's ``Qwen3_5MoeSparseMoeBlock`` —
 softmax gate → top-k → ``SwitchGLU``, plus a sigmoid-gated shared expert that
@@ -24,9 +29,11 @@ from .base import BaseAdapter
 
 
 class Qwen4ExpAdapter(BaseAdapter):
-    """Qwen4-Exp: all decoder layers are MoE; block at ``.mlp``.
+    """Qwen4-Exp and Qwen3.5/3.6 MoE: every decoder layer is MoE, block at ``.mlp``.
 
-    The vision tower is left untouched — it holds no experts.
+    Registered for both ``qwen4_exp`` and ``qwen3_5_moe``; the two differ in
+    expert count and layer depth, not in layout. The vision tower is left
+    untouched — it holds no experts.
     """
 
     def __init__(self, model: nn.Module, config: dict):

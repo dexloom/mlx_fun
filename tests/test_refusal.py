@@ -17,6 +17,7 @@ from mlx_fun.refusal import (
     _flip_stats,
     classify_response,
     run_refusal_knockout,
+    strip_thinking,
     trace_refusals,
 )
 
@@ -68,6 +69,46 @@ class TestClassifyResponse:
         assert classify_response(
             "Nope, not doing that.", extra_markers=["nope, not doing that"]
         ) == REFUSED
+
+
+class TestStripThinking:
+    def test_closed_block_returns_the_visible_answer(self):
+        text = "<think>\nWeighing this up.\n</think>\n\nI can't help with that."
+        assert strip_thinking(text) == "I can't help with that."
+
+    def test_unfinished_block_returns_none(self):
+        text = "<think>\nStill reasoning when the budget ran out, and"
+        assert strip_thinking(text) is None
+
+    def test_no_block_passes_through(self):
+        text = "A mapping is a key-value store."
+        assert strip_thinking(text) is text
+
+    def test_last_block_wins(self):
+        text = (
+            "<think>first</think>\n\nDraft.\n<think>second</think>\n\nFinal answer."
+        )
+        assert strip_thinking(text) == "Final answer."
+
+    def test_custom_markers(self):
+        text = "<|channel>thought reasoning<channel|>  The answer."
+        assert strip_thinking(text, "<|channel>thought", "<channel|>") == "The answer."
+
+    def test_close_without_open_still_strips(self):
+        """A block whose opening tag the template ate still has to be dropped."""
+        assert strip_thinking("reasoning</think>\n\nThe answer.") == "The answer."
+
+
+class TestThinkingAwareClassification:
+    def test_refusal_after_reasoning_is_seen(self):
+        """The whole point: the classifier reads only the opening, so a refusal
+        behind a long reasoning block reads as 'answered' until it is stripped."""
+        text = (
+            "<think>\n" + "Considering whether this is appropriate. " * 20
+            + "\n</think>\n\nI can't help with that."
+        )
+        assert classify_response(text) == ANSWERED          # raw: wrong
+        assert classify_response(strip_thinking(text)) == REFUSED   # stripped: right
 
 
 class TestFlipStats:
@@ -309,6 +350,63 @@ class TestTraceRefusals:
         assert all(o["outcome"] == ANSWERED for o in outcomes)
         assert examples[DOMAIN] == []
 
+    def test_unfinished_thinking_is_skipped(self, tiny_model, monkeypatch):
+        """A generation that ran out of tokens mid-reasoning is neither
+        answered nor refused, so it must not land in either bucket."""
+        from mlx_fun.observer import install_hooks, remove_hooks
+
+        questions = [
+            ProbeQuestion(question="q1"),
+            ProbeQuestion(question="q2"),
+        ]
+        responses = [
+            "<think>\nStill reasoning when the budget ran out, and",
+            "<think>\nBrief.\n</think>\n\nA mapping is a key-value store.",
+        ]
+        _install_fake_generation(monkeypatch, lambda i: responses[i])
+
+        stats = ProbeStats(num_layers=1, num_experts=4)
+        install_hooks([tiny_model.moe], "minimax")
+        try:
+            examples, outcomes, skipped, records = trace_refusals(
+                tiny_model, _FakeTokenizer(""), {"model_type": "minimax"},
+                questions, stats, [tiny_model.moe], num_experts=4,
+            )
+        finally:
+            remove_hooks([tiny_model.moe])
+
+        assert len(skipped) == 1
+        assert skipped[0]["index"] == 0
+        assert skipped[0]["unfinished_thinking"] is True
+        # Neither bucket, no record, no statistics contribution.
+        assert len(outcomes) == 1 and outcomes[0]["index"] == 1
+        assert len(records) == 1
+        assert stats.n_questions[DOMAIN] == 0
+        assert stats.n_questions[GENERAL] == 1
+
+    def test_refusal_behind_reasoning_is_counted_as_refused(self, tiny_model, monkeypatch):
+        from mlx_fun.observer import install_hooks, remove_hooks
+
+        text = ("<think>\n" + "Weighing whether to answer. " * 12
+                + "\n</think>\n\nI can't help with that.")
+        _install_fake_generation(monkeypatch, lambda i: text)
+
+        stats = ProbeStats(num_layers=1, num_experts=4)
+        install_hooks([tiny_model.moe], "minimax")
+        try:
+            _examples, outcomes, _skipped, _records = trace_refusals(
+                tiny_model, _FakeTokenizer(""), {"model_type": "minimax"},
+                [ProbeQuestion(question="q1")], stats, [tiny_model.moe],
+                num_experts=4,
+            )
+        finally:
+            remove_hooks([tiny_model.moe])
+
+        assert outcomes[0]["outcome"] == REFUSED
+        # The visible answer is classified; the raw text stays auditable.
+        assert outcomes[0]["answer"] == "I can't help with that."
+        assert outcomes[0]["raw_answer"] == text
+
 
 class TestRunRefusalKnockout:
     def test_flip_detected_when_regeneration_answers(self, tiny_model, monkeypatch):
@@ -329,6 +427,43 @@ class TestRunRefusalKnockout:
 
     def test_no_flip_when_regeneration_still_refuses(self, tiny_model, monkeypatch):
         _install_fake_generation(monkeypatch, lambda i: "I cannot help with that.")
+        refused = [
+            ProbeExample(tokens=[1, 2, 3, 4, 5, 6], prompt_len=3, question_index=0),
+        ]
+        result = run_refusal_knockout(
+            tiny_model, _FakeTokenizer(""), {"model_type": "minimax"},
+            refused, [tiny_model.moe], "minimax",
+            num_experts=4, top_k=2, candidates=[(0, 1)],
+            min_flip_rate=0.5, n_boot=0, seed=1,
+        )
+        assert result[0]["flip_rate"] == 0.0
+        assert result[0]["status"] == "not_verified"
+
+    def test_unfinished_thinking_is_never_a_flip(self, tiny_model, monkeypatch):
+        """Running out of tokens mid-reasoning is not a guardrail breaking."""
+        _install_fake_generation(
+            monkeypatch, lambda i: "<think>\nStill reasoning when the budget ran out",
+        )
+        refused = [
+            ProbeExample(tokens=[1, 2, 3, 4, 5, 6], prompt_len=3, question_index=0),
+        ]
+        result = run_refusal_knockout(
+            tiny_model, _FakeTokenizer(""), {"model_type": "minimax"},
+            refused, [tiny_model.moe], "minimax",
+            num_experts=4, top_k=2, candidates=[(0, 1)],
+            min_flip_rate=0.5, n_boot=0, seed=1,
+        )
+        assert result[0]["flip_rate"] == 0.0
+        assert result[0]["status"] == "not_verified"
+
+    def test_refusal_behind_reasoning_is_not_a_flip(self, tiny_model, monkeypatch):
+        """Without stripping, the reasoning block would hide the refusal and
+        this would be scored as the guardrail breaking."""
+        _install_fake_generation(
+            monkeypatch,
+            lambda i: ("<think>\n" + "Deliberating. " * 20
+                       + "\n</think>\n\nI cannot help with that."),
+        )
         refused = [
             ProbeExample(tokens=[1, 2, 3, 4, 5, 6], prompt_len=3, question_index=0),
         ]

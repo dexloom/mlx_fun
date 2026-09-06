@@ -204,7 +204,8 @@ def amplify_gate_weights(
                 block.gate.e_score_correction_bias + bias_mx
             )
 
-        elif model_type in ("qwen3_moe", "qwen3_next", "qwen4_exp"):
+        elif model_type in ("qwen3_moe", "qwen3_next", "qwen4_exp",
+                             "qwen3_5_moe"):
             # nn.Linear gate: set bias attribute (adds to pre-softmax logits)
             if "bias" in block.gate:
                 block.gate.bias = block.gate.bias + bias_mx

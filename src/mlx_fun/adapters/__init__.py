@@ -27,6 +27,7 @@ _ADAPTER_MAP = {
     "nemotron_h": NemotronHAdapter,
     "gemma4": Gemma4Adapter,
     "qwen4_exp": Qwen4ExpAdapter,
+    "qwen3_5_moe": Qwen4ExpAdapter,
     "glm5_next": GLM5NextAdapter,
 }
 

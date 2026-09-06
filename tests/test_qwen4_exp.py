@@ -1,8 +1,10 @@
-"""Tests for Qwen4-Exp (Qwen3.8-Flash-Next) MoE support.
+"""Tests for the Qwen4-Exp / Qwen3.5-3.6 MoE family.
 
-Qwen4-Exp loads through mlx-vlm, so its adapter has to reach through the
-multimodal wrapper and read hyperparameters from a nested ``text_config``.
-The hooks mirror mlx-vlm's ``Qwen3_5MoeSparseMoeBlock``.
+``qwen4_exp`` (Qwen3.8-Flash-Next) and ``qwen3_5_moe`` (the Qwen3.5/3.6 MoE
+line, e.g. Qwen3.6-35B-A3B) share one adapter and one hook set, so every case
+here runs against both strings. Both load through mlx-vlm, so the adapter has
+to reach through the multimodal wrapper and read hyperparameters from a nested
+``text_config``. The hooks mirror mlx-vlm's ``Qwen3_5MoeSparseMoeBlock``.
 """
 
 import mlx.core as mx
@@ -26,6 +28,9 @@ from .conftest import TinyQwen4ExpMoE
 N_LAYERS = 3
 N_EXPERTS = 4
 TOP_K = 2
+
+# Both model_type strings resolve to the same adapter and the same hooks.
+MODEL_TYPES = ["qwen4_exp", "qwen3_5_moe"]
 
 
 # ---------------------------------------------------------------------------
@@ -55,10 +60,16 @@ class FakeQwen4ExpModel:
         self.language_model = FakeLanguageModel(blocks)
 
 
-@pytest.fixture
-def qwen4_exp_config():
+@pytest.fixture(params=MODEL_TYPES)
+def model_type(request):
+    """Both strings the Qwen MoE VLM family registers under."""
+    return request.param
+
+
+@pytest.fixture(params=MODEL_TYPES)
+def qwen4_exp_config(request):
     return {
-        "model_type": "qwen4_exp",
+        "model_type": request.param,
         "image_token_id": 248056,
         "vision_config": {"depth": 27, "hidden_size": 1152},
         "text_config": {
@@ -132,19 +143,19 @@ class TestQwen4ExpAdapter:
 # ---------------------------------------------------------------------------
 
 class TestQwen4ExpObserverHook:
-    def test_hook_preserves_output(self, tiny_qwen4_exp_moe, sample_input):
+    def test_hook_preserves_output(self, tiny_qwen4_exp_moe, sample_input, model_type):
         expected = tiny_qwen4_exp_moe(sample_input)
         mx.eval(expected)
 
-        install_hooks([tiny_qwen4_exp_moe], "qwen4_exp")
+        install_hooks([tiny_qwen4_exp_moe], model_type)
         got = tiny_qwen4_exp_moe(sample_input)
         mx.eval(got)
         remove_hooks([tiny_qwen4_exp_moe])
 
         assert np.allclose(np.array(expected), np.array(got), atol=1e-5)
 
-    def test_hook_captures_routing(self, tiny_qwen4_exp_moe, sample_input):
-        install_hooks([tiny_qwen4_exp_moe], "qwen4_exp")
+    def test_hook_captures_routing(self, tiny_qwen4_exp_moe, sample_input, model_type):
+        install_hooks([tiny_qwen4_exp_moe], model_type)
         tiny_qwen4_exp_moe(sample_input)
         captures = collect_captures([tiny_qwen4_exp_moe])
         remove_hooks([tiny_qwen4_exp_moe])
@@ -156,18 +167,18 @@ class TestQwen4ExpObserverHook:
         assert norms.shape == (1, 8, TOP_K)
         assert inds.max() < N_EXPERTS
 
-    def test_scores_are_renormalized(self, tiny_qwen4_exp_moe, sample_input):
+    def test_scores_are_renormalized(self, tiny_qwen4_exp_moe, sample_input, model_type):
         # Qwen4-Exp renormalizes unconditionally — no norm_topk_prob switch.
-        install_hooks([tiny_qwen4_exp_moe], "qwen4_exp")
+        install_hooks([tiny_qwen4_exp_moe], model_type)
         tiny_qwen4_exp_moe(sample_input)
         _, scores, _ = collect_captures([tiny_qwen4_exp_moe])[0][0]
         remove_hooks([tiny_qwen4_exp_moe])
 
         assert np.allclose(scores.sum(axis=-1), 1.0, atol=1e-5)
 
-    def test_hooks_restore_original_class(self, tiny_qwen4_exp_moe):
+    def test_hooks_restore_original_class(self, tiny_qwen4_exp_moe, model_type):
         original = type(tiny_qwen4_exp_moe)
-        install_hooks([tiny_qwen4_exp_moe], "qwen4_exp")
+        install_hooks([tiny_qwen4_exp_moe], model_type)
         assert type(tiny_qwen4_exp_moe) is not original
         remove_hooks([tiny_qwen4_exp_moe])
         assert type(tiny_qwen4_exp_moe) is original
@@ -178,19 +189,19 @@ class TestQwen4ExpObserverHook:
 # ---------------------------------------------------------------------------
 
 class TestQwen4ExpReamHook:
-    def test_ream_hook_preserves_output(self, tiny_qwen4_exp_moe, sample_input):
+    def test_ream_hook_preserves_output(self, tiny_qwen4_exp_moe, sample_input, model_type):
         expected = tiny_qwen4_exp_moe(sample_input)
         mx.eval(expected)
 
-        install_ream_hooks([tiny_qwen4_exp_moe], "qwen4_exp")
+        install_ream_hooks([tiny_qwen4_exp_moe], model_type)
         got = tiny_qwen4_exp_moe(sample_input)
         mx.eval(got)
         remove_ream_hooks([tiny_qwen4_exp_moe])
 
         assert np.allclose(np.array(expected), np.array(got), atol=1e-5)
 
-    def test_ream_hook_captures_full_gate_logits(self, tiny_qwen4_exp_moe, sample_input):
-        install_ream_hooks([tiny_qwen4_exp_moe], "qwen4_exp")
+    def test_ream_hook_captures_full_gate_logits(self, tiny_qwen4_exp_moe, sample_input, model_type):
+        install_ream_hooks([tiny_qwen4_exp_moe], model_type)
         tiny_qwen4_exp_moe(sample_input)
         captures = collect_ream_data([tiny_qwen4_exp_moe])
         remove_ream_hooks([tiny_qwen4_exp_moe])
@@ -205,12 +216,12 @@ class TestQwen4ExpReamHook:
 # ---------------------------------------------------------------------------
 
 class TestQwen4ExpSteering:
-    def test_deactivation_changes_output(self, tiny_qwen4_exp_moe, sample_input):
+    def test_deactivation_changes_output(self, tiny_qwen4_exp_moe, sample_input, model_type):
         original = np.array(tiny_qwen4_exp_moe(sample_input), copy=False).copy()
 
         config = SteeringConfig(deactivate={0: [0, 1]}, mask_value=-1e9)
         install_steering_hooks(
-            [tiny_qwen4_exp_moe], "qwen4_exp", config, num_experts=N_EXPERTS,
+            [tiny_qwen4_exp_moe], model_type, config, num_experts=N_EXPERTS,
         )
         steered = tiny_qwen4_exp_moe(sample_input)
         mx.eval(steered)
@@ -219,11 +230,11 @@ class TestQwen4ExpSteering:
 
         assert not np.allclose(original, steered_np, atol=1e-5)
 
-    def test_empty_config_preserves_output(self, tiny_qwen4_exp_moe, sample_input):
+    def test_empty_config_preserves_output(self, tiny_qwen4_exp_moe, sample_input, model_type):
         original = np.array(tiny_qwen4_exp_moe(sample_input), copy=False).copy()
 
         install_steering_hooks(
-            [tiny_qwen4_exp_moe], "qwen4_exp", SteeringConfig(), num_experts=N_EXPERTS,
+            [tiny_qwen4_exp_moe], model_type, SteeringConfig(), num_experts=N_EXPERTS,
         )
         unsteered = tiny_qwen4_exp_moe(sample_input)
         mx.eval(unsteered)
@@ -232,10 +243,10 @@ class TestQwen4ExpSteering:
 
         assert np.allclose(original, unsteered_np, atol=1e-5)
 
-    def test_install_remove_restores_class(self, tiny_qwen4_exp_moe, sample_input):
+    def test_install_remove_restores_class(self, tiny_qwen4_exp_moe, sample_input, model_type):
         original_cls = type(tiny_qwen4_exp_moe)
         install_steering_hooks(
-            [tiny_qwen4_exp_moe], "qwen4_exp",
+            [tiny_qwen4_exp_moe], model_type,
             SteeringConfig(deactivate={0: [0]}), num_experts=N_EXPERTS,
         )
         assert type(tiny_qwen4_exp_moe) is not original_cls
@@ -249,13 +260,35 @@ class TestQwen4ExpSteering:
 # Safety / domain scan support
 # ---------------------------------------------------------------------------
 
+class TestQwen4ExpAmplifyAndKnockout:
+    def test_amplify_sets_gate_bias(self, tiny_qwen4_exp_moe, sample_input, model_type):
+        """Pre-softmax gate.bias on an nn.Linear(bias=False), as for Qwen3."""
+        from mlx_fun.domain import amplify_gate_weights
+
+        original = np.array(tiny_qwen4_exp_moe(sample_input), copy=False).copy()
+        amplify_gate_weights(
+            [tiny_qwen4_exp_moe], model_type, {0: np.array([0.0, 0.0, 5.0, 0.0])},
+        )
+        assert "bias" in tiny_qwen4_exp_moe.gate
+
+        amplified = np.array(tiny_qwen4_exp_moe(sample_input), copy=False).copy()
+        assert not np.allclose(original, amplified, atol=1e-5)
+
+    def test_knockout_targets_the_gate_bias(self, tiny_qwen4_exp_moe, model_type):
+        from mlx_fun.probe import selection_bias_target
+
+        module, attr = selection_bias_target(tiny_qwen4_exp_moe, model_type)
+        assert module is tiny_qwen4_exp_moe.gate
+        assert attr == "bias"
+
+
 class TestQwen4ExpSafetyTopK:
-    def test_topk_uses_softmax_family(self):
+    def test_topk_uses_softmax_family(self, model_type):
         # Softmax is monotonic in the logits, so top-k by logit == top-k by prob.
         rng = np.random.default_rng(0)
         logits = rng.normal(size=(16, N_EXPERTS)).astype(np.float32)
 
-        inds = compute_top_k_from_logits(logits, "qwen4_exp", TOP_K)
+        inds = compute_top_k_from_logits(logits, model_type, TOP_K)
 
         assert inds.shape == (16, TOP_K)
         expected = np.argsort(-logits, axis=-1)[:, :TOP_K]

@@ -166,6 +166,7 @@ _REAM_HOOK_MAP = {
     "qwen3_next": _qwen3_next_ream_call,
     "gemma4": _gemma4_ream_call,
     "qwen4_exp": _qwen4_exp_ream_call,
+    "qwen3_5_moe": _qwen4_exp_ream_call,
 }
 
 

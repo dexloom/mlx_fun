@@ -265,6 +265,7 @@ _STEERING_HOOK_MAP = {
     "qwen3_next": _qwen3_next_steering_call,
     "gemma4": _gemma4_steering_call,
     "qwen4_exp": _qwen4_exp_steering_call,
+    "qwen3_5_moe": _qwen4_exp_steering_call,
 }
 
 

@@ -65,7 +65,7 @@ def test_domain_probe_command_registered():
     for flag in (
         "--model", "--domain-questions", "--general-questions", "--output",
         "--answer-mode", "--verify-top", "--verify-prune", "--saliency-output",
-        "--min-coverage", "--chat-template-args",
+        "--min-coverage", "--chat-template-args", "--chat-template",
     ):
         assert flag in result.output
 
@@ -81,7 +81,7 @@ def test_refusal_probe_command_registered():
     result = runner.invoke(main, ["refusal-probe", "--help"])
     assert result.exit_code == 0
     for flag in ("--model", "--questions", "--output", "--verify-top",
-                 "--min-flip-rate", "--refusal-markers"):
+                 "--min-flip-rate", "--refusal-markers", "--chat-template"):
         assert flag in result.output
 
 
@@ -89,3 +89,11 @@ def test_refusal_probe_requires_args():
     runner = CliRunner()
     result = runner.invoke(main, ["refusal-probe"])
     assert result.exit_code != 0
+
+
+def test_domain_probe_generate_mode_accepts_vision_models():
+    """The old guard rejected VLMs in generate mode; generation now runs on the
+    unwrapped language stack, so no such option constraint remains."""
+    runner = CliRunner()
+    result = runner.invoke(main, ["domain-probe", "--help"])
+    assert "cannot run the vision-language model" not in result.output

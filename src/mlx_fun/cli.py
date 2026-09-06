@@ -1244,8 +1244,12 @@ def domain_scan(model, domain_dataset, general_dataset, output, domain_name,
 @click.option("--mask-value", default=-1e9, type=float,
               help="Additive selection-score mask used for knockouts.")
 @click.option("--chat-template-args", default=None,
-              help="JSON object of extra chat-template kwargs, e.g. "
-                   "--chat-template-args '{\"enable_thinking\":false}'.")
+              help="JSON object of extra chat-template kwargs. Thinking is off "
+                   "by default; pass '{\"enable_thinking\":true}' to keep it on.")
+@click.option("--chat-template", default=None,
+              help="Override the chat template: a file path, the literal "
+                   "'bundled' for the template bundled for this model_type, or "
+                   "an inline Jinja string. Default: the checkpoint's own.")
 @click.option("--system", default=None, help="Default system prompt for every question.")
 @click.option("--seed", default=None, type=int, help="Random seed.")
 @click.option("--show-questions", is_flag=True, help="Echo each question and answer.")
@@ -1255,7 +1259,7 @@ def domain_probe(model, domain_questions, general_questions, output, saliency_ou
                  verify_top, verify_questions, min_delta, min_valid_fraction, bootstrap,
                  verify_prune, verify_metric, verify_strategy, verify_model_wide,
                  verify_min_experts_per_layer, verify_protect_domain, mask_value,
-                 chat_template_args, system, seed, show_questions):
+                 chat_template_args, chat_template, system, seed, show_questions):
     """Score expert relevance to a domain by asking the model questions.
 
     Traces which experts the model routes to while answering domain questions
@@ -1271,8 +1275,9 @@ def domain_probe(model, domain_questions, general_questions, output, saliency_ou
     from tqdm import tqdm
 
     from .adapters import get_adapter
+    from .chat_template import probe_chat_template_source, resolve_probe_chat_template
     from .domain import identify_domain_experts
-    from .loader import load_model, text_forward, is_vision_model
+    from .loader import load_model, read_config, text_forward, is_vision_model
     from .observer import install_hooks, remove_hooks
     from .probe import (
         DOMAIN, GENERAL, ProbeReport, ProbeStats,
@@ -1302,16 +1307,26 @@ def domain_probe(model, domain_questions, general_questions, output, saliency_ou
     expanded_model = os.path.expanduser(model)
     if os.path.exists(expanded_model):
         model = expanded_model
-    click.echo(f"Loading model: {model}")
-    mlx_model, tokenizer, config = load_model(model)
 
-    if answer_mode == "generate" and is_vision_model(config):
-        raise click.ClickException(
-            f"--answer-mode generate drives mlx-lm's text generation loop, which "
-            f"cannot run the vision-language model '{config.get('model_type')}'. "
-            f"Use --answer-mode teacher, which scores reference answers with a "
-            f"token-only forward pass."
-        )
+    # An override is resolved by model_type, which has to be read before the
+    # weights load. With no override there is nothing to resolve, so the config
+    # is not read twice for the default case.
+    tokenizer_config = None
+    if chat_template is not None:
+        try:
+            pre_model_type = read_config(model).get("model_type", "")
+        except Exception:
+            pre_model_type = ""
+        try:
+            content = resolve_probe_chat_template(chat_template, pre_model_type)
+        except ValueError as e:
+            raise click.BadParameter(str(e), param_hint="--chat-template")
+        if content:
+            tokenizer_config = {"chat_template": content}
+    click.echo(f"Chat template: {probe_chat_template_source(chat_template)}")
+
+    click.echo(f"Loading model: {model}")
+    mlx_model, tokenizer, config = load_model(model, tokenizer_config=tokenizer_config)
 
     adapter = get_adapter(mlx_model, config)
     moe_indices = adapter.moe_layer_indices()
@@ -1322,7 +1337,9 @@ def domain_probe(model, domain_questions, general_questions, output, saliency_ou
     forward = text_forward(mlx_model, config)
 
     click.echo(f"Model type: {model_type}, MoE layers: {len(moe_indices)}, "
-               f"Experts: {n_experts}, top_k: {top_k}")
+               f"Experts: {n_experts}, top_k: {top_k}"
+               + (" (VLM: running on the language stack)"
+                  if is_vision_model(config) else ""))
 
     stats = ProbeStats(num_layers=len(moe_indices), num_experts=n_experts)
     examples = {}
@@ -1347,7 +1364,8 @@ def domain_probe(model, domain_questions, general_questions, output, saliency_ou
         install_hooks(moe_blocks, model_type)
         try:
             examples[label], skipped[label] = trace_question_set(
-                forward, mlx_model, tokenizer, questions, label, stats, moe_blocks,
+                forward, mlx_model, tokenizer, config, questions, label, stats,
+                moe_blocks,
                 num_experts=n_experts,
                 answer_mode=answer_mode,
                 max_answer_tokens=max_answer_tokens,
@@ -1556,8 +1574,12 @@ def domain_probe(model, domain_questions, general_questions, output, saliency_ou
 @click.option("--mask-value", default=-1e9, type=float,
               help="Additive selection-score mask used for knockouts.")
 @click.option("--chat-template-args", default=None,
-              help="JSON object of extra chat-template kwargs, e.g. "
-                   "--chat-template-args '{\"enable_thinking\":false}'.")
+              help="JSON object of extra chat-template kwargs. Thinking is off "
+                   "by default; pass '{\"enable_thinking\":true}' to keep it on.")
+@click.option("--chat-template", default=None,
+              help="Override the chat template: a file path, the literal "
+                   "'bundled' for the template bundled for this model_type, or "
+                   "an inline Jinja string. Default: the checkpoint's own.")
 @click.option("--system", default=None, help="Default system prompt for every question.")
 @click.option("--seed", default=None, type=int, help="Random seed.")
 @click.option("--show-questions", is_flag=True, help="Echo each question and its outcome.")
@@ -1565,7 +1587,7 @@ def refusal_probe(model, questions, output, saliency_output, answers_output,
                   refusal_markers, domain_name, max_questions, max_answer_tokens,
                   threshold_percentile, min_coverage, verify_top, verify_questions,
                   min_flip_rate, bootstrap, stratify_tags, mask_value,
-                  chat_template_args, system, seed, show_questions):
+                  chat_template_args, chat_template, system, seed, show_questions):
     """Find the experts that implement the model's refusal guardrails.
 
     Generates an answer to each question, classifies it as answered / refused /
@@ -1582,8 +1604,9 @@ def refusal_probe(model, questions, output, saliency_output, answers_output,
     from tqdm import tqdm
 
     from .adapters import get_adapter
+    from .chat_template import probe_chat_template_source, resolve_probe_chat_template
     from .domain import identify_domain_experts
-    from .loader import load_model, is_vision_model
+    from .loader import load_model, read_config, is_vision_model
     from .observer import install_hooks, remove_hooks
     from .probe import (
         DOMAIN, GENERAL, ProbeStats,
@@ -1615,8 +1638,26 @@ def refusal_probe(model, questions, output, saliency_output, answers_output,
     expanded_model = os.path.expanduser(model)
     if os.path.exists(expanded_model):
         model = expanded_model
+
+    # An override is resolved by model_type, which has to be read before the
+    # weights load. With no override there is nothing to resolve, so the config
+    # is not read twice for the default case.
+    tokenizer_config = None
+    if chat_template is not None:
+        try:
+            pre_model_type = read_config(model).get("model_type", "")
+        except Exception:
+            pre_model_type = ""
+        try:
+            content = resolve_probe_chat_template(chat_template, pre_model_type)
+        except ValueError as e:
+            raise click.BadParameter(str(e), param_hint="--chat-template")
+        if content:
+            tokenizer_config = {"chat_template": content}
+    click.echo(f"Chat template: {probe_chat_template_source(chat_template)}")
+
     click.echo(f"Loading model: {model}")
-    mlx_model, tokenizer, config = load_model(model)
+    mlx_model, tokenizer, config = load_model(model, tokenizer_config=tokenizer_config)
 
     adapter = get_adapter(mlx_model, config)
     moe_indices = adapter.moe_layer_indices()
@@ -1658,8 +1699,14 @@ def refusal_probe(model, questions, output, saliency_output, answers_output,
     n_answered = sum(1 for o in outcomes if o["outcome"] == ANSWERED)
     n_refused = sum(1 for o in outcomes if o["outcome"] == REFUSED)
     n_partial = sum(1 for o in outcomes if o["outcome"] == PARTIAL)
+    n_unfinished = sum(1 for s in skipped if s.get("unfinished_thinking"))
     click.echo(f"Outcomes: {n_answered} answered, {n_refused} refused, "
-               f"{n_partial} partial ({len(skipped)} skipped)")
+               f"{n_partial} partial ({len(skipped)} skipped, of which "
+               f"{n_unfinished} unfinished thinking)")
+    if n_unfinished:
+        click.echo(f"  {n_unfinished} generations ran out of tokens inside their "
+                   f"reasoning block and count as neither answered nor refused. "
+                   f"Raise --max-answer-tokens to recover them.")
 
     if n_refused == 0:
         click.echo("The model refused none of these questions, so there is no "
@@ -1719,7 +1766,10 @@ def refusal_probe(model, questions, output, saliency_output, answers_output,
         candidate_refusal_experts=candidate_refusal_experts,
         stratified_tags=stratified_tags,
         per_question_outcome=outcomes,
-        skipped_questions={"probed": len(skipped)},
+        skipped_questions={
+            "probed": len(skipped),
+            "unfinished_thinking": n_unfinished,
+        },
     )
 
     refused_examples = examples[DOMAIN]

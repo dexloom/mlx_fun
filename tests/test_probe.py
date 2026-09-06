@@ -193,6 +193,192 @@ class TestBuildProbeTokens:
 
 
 # ---------------------------------------------------------------------------
+# Thinking mode
+# ---------------------------------------------------------------------------
+
+class _ThinkTokenizer:
+    """Chat tokenizer whose generation prompt ends at an open think marker.
+
+    Stands in for Qwen/GLM (whose wrapper defaults ``enable_thinking`` on) and
+    for MiniMax (whose template ignores the flag entirely).
+    """
+
+    has_chat_template = True
+
+    def __init__(self, tail="<|im_start|>assistant\n<think>\n",
+                 think_start="<think>", think_end="</think>",
+                 thinking_kwarg=None):
+        self.think_start = think_start
+        self.think_end = think_end
+        self._tail = tail
+        self.template_kwargs = None
+        self.encoded = []
+        if thinking_kwarg is not None:
+            self._thinking_kwarg = thinking_kwarg
+
+    def apply_chat_template(self, messages, tokenize=True,
+                            add_generation_prompt=True, **kwargs):
+        self.template_kwargs = kwargs
+        return [10, 11, 12]
+
+    def decode(self, ids):
+        return self._tail
+
+    def encode(self, text, add_special_tokens=True):
+        self.encoded.append(text)
+        return [100 + i for i in range(max(len(text.split()), 1))]
+
+
+class TestThinkMarkers:
+    def test_prefers_wrapper_attributes(self):
+        from mlx_fun.probe import think_markers
+
+        class Tok:
+            think_start = "<|channel>thought"
+            think_end = "<channel|>"
+
+        assert think_markers(Tok()) == ("<|channel>thought", "<channel|>")
+
+    def test_falls_back_to_vocab_pair(self):
+        from mlx_fun.probe import think_markers
+
+        class Tok:
+            def get_vocab(self):
+                return {"<think>": 1, "</think>": 2, "hello": 3}
+
+        assert think_markers(Tok()) == ("<think>", "</think>")
+
+    def test_longcat_pair(self):
+        from mlx_fun.probe import think_markers
+
+        class Tok:
+            def get_vocab(self):
+                return {"<longcat_think>": 1, "</longcat_think>": 2}
+
+        assert think_markers(Tok()) == ("<longcat_think>", "</longcat_think>")
+
+    def test_gemma_multi_token_channel(self):
+        from mlx_fun.probe import think_markers
+
+        class Tok:
+            def get_vocab(self):
+                return {"<|channel>": 1, "<channel|>": 2}
+
+        assert think_markers(Tok()) == ("<|channel>thought", "<channel|>")
+
+    def test_no_thinking_returns_none(self):
+        from mlx_fun.probe import think_markers
+
+        class Tok:
+            def get_vocab(self):
+                return {"hello": 1}
+
+        assert think_markers(Tok()) is None
+        assert think_markers(object()) is None
+
+    def test_mock_tokenizer_is_not_mistaken_for_thinking(self):
+        """A MagicMock answers every attribute; none of them are real markers."""
+        from mlx_fun.probe import think_markers
+
+        assert think_markers(_make_tokenizer()) is None
+
+
+class TestThinkingDefaults:
+    def test_disabled_by_default(self):
+        tok = _make_tokenizer()
+        build_probe_tokens(tok, ProbeQuestion(question="one", answer="two"), "teacher")
+        assert tok.apply_chat_template.call_args.kwargs["enable_thinking"] is False
+
+    def test_explicit_true_is_respected(self):
+        tok = _make_tokenizer()
+        build_probe_tokens(
+            tok, ProbeQuestion(question="one", answer="two"), "teacher",
+            chat_template_args={"enable_thinking": True},
+        )
+        assert tok.apply_chat_template.call_args.kwargs["enable_thinking"] is True
+
+    def test_explicit_false_is_respected(self):
+        tok = _make_tokenizer()
+        build_probe_tokens(
+            tok, ProbeQuestion(question="one", answer="two"), "teacher",
+            chat_template_args={"enable_thinking": False},
+        )
+        assert tok.apply_chat_template.call_args.kwargs["enable_thinking"] is False
+
+    def test_model_specific_kwarg_is_respected(self):
+        """A tokenizer that spells the flag 'thinking' must not also get
+        enable_thinking=False injected behind the caller's back."""
+        tok = _ThinkTokenizer(thinking_kwarg="thinking")
+        tokens, prompt_len = build_probe_tokens(
+            tok, ProbeQuestion(question="one", answer="two"), "generate",
+            chat_template_args={"thinking": True},
+        )
+        assert tok.template_kwargs == {"thinking": True}
+        assert "enable_thinking" not in tok.template_kwargs
+        # Thinking was explicitly enabled, so the open marker stays open.
+        assert tokens == [10, 11, 12] and prompt_len == 3
+
+
+class TestForceClosedThinking:
+    def test_dangling_marker_is_closed(self):
+        tok = _ThinkTokenizer()
+        tokens, prompt_len = build_probe_tokens(
+            tok, ProbeQuestion(question="one", answer="two"), "generate",
+        )
+        # The rendered prompt plus the encoded "\n</think>\n\n".
+        assert tokens == [10, 11, 12, 100]
+        assert prompt_len == len(tokens)
+        assert "</think>" in tok.encoded[0]
+
+    def test_prompt_len_covers_the_appended_tokens(self):
+        tok = _ThinkTokenizer()
+        tokens, prompt_len = build_probe_tokens(
+            tok, ProbeQuestion(question="one", answer="a b c"), "teacher",
+        )
+        assert prompt_len == 4                  # 3 rendered + 1 closing
+        assert len(tokens) - prompt_len == 3    # the reference answer
+
+    def test_not_closed_when_caller_enabled_thinking(self):
+        tok = _ThinkTokenizer()
+        tokens, prompt_len = build_probe_tokens(
+            tok, ProbeQuestion(question="one", answer="two"), "generate",
+            chat_template_args={"enable_thinking": True},
+        )
+        assert tokens == [10, 11, 12] and prompt_len == 3
+        assert tok.encoded == []
+
+    def test_not_closed_when_prompt_does_not_dangle(self):
+        tok = _ThinkTokenizer(tail="<|im_start|>assistant\n")
+        tokens, prompt_len = build_probe_tokens(
+            tok, ProbeQuestion(question="one", answer="two"), "generate",
+        )
+        assert tokens == [10, 11, 12] and prompt_len == 3
+
+    def test_not_closed_without_think_markers(self):
+        """A tokenizer with no thinking channel is never touched."""
+        tok = _ThinkTokenizer(think_start=None, think_end=None)
+        tokens, prompt_len = build_probe_tokens(
+            tok, ProbeQuestion(question="one", answer="two"), "generate",
+        )
+        assert tokens == [10, 11, 12] and prompt_len == 3
+
+    def test_logs_once_per_tokenizer(self, caplog):
+        import logging as _logging
+
+        from mlx_fun.probe import _FORCE_CLOSED_THINK
+
+        tok = _ThinkTokenizer()
+        _FORCE_CLOSED_THINK.discard(id(tok))
+        with caplog.at_level(_logging.INFO, logger="root"):
+            for _ in range(3):
+                build_probe_tokens(
+                    tok, ProbeQuestion(question="one", answer="two"), "generate",
+                )
+        notices = [r for r in caplog.records if "force an empty think block" in r.message]
+        assert len(notices) == 1
+
+
+# ---------------------------------------------------------------------------
 # Capture slicing
 # ---------------------------------------------------------------------------
 
@@ -826,7 +1012,8 @@ class TestTraceQuestionSet:
         install_hooks([model.moe], "minimax")
         try:
             examples, skipped = trace_question_set(
-                model, model, _IdTokenizer(), questions, DOMAIN, stats,
+                model, model, _IdTokenizer(), {"model_type": "minimax"},
+                questions, DOMAIN, stats,
                 [model.moe], num_experts=4, **kwargs,
             )
         finally:
@@ -869,7 +1056,7 @@ class TestTraceQuestionSet:
         try:
             with pytest.raises(RuntimeError):
                 trace_question_set(
-                    tiny_model, tiny_model, _IdTokenizer(),
+                    tiny_model, tiny_model, _IdTokenizer(), {"model_type": "minimax"},
                     [ProbeQuestion(question="a b", answer="c")], DOMAIN,
                     ProbeStats(1, 4), [tiny_model.moe], num_experts=4,
                     echo=lambda *a: (_ for _ in ()).throw(RuntimeError("boom")),

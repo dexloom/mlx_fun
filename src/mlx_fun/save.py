@@ -7,6 +7,29 @@ from typing import Dict, List
 import numpy as np
 
 
+def _save_config(config: dict, path):
+    """Write ``config.json``, keeping the vision tower for VLM checkpoints.
+
+    ``mlx_lm.utils.save_config`` is a text-model utility: it drops
+    ``vision_config`` as an unused key (and mutates the dict it is given). For a
+    vision-language checkpoint that key is load-bearing — without it mlx-vlm
+    rebuilds the tower from dataclass defaults and the weights no longer match,
+    so the saved model cannot be loaded at all. Write through upstream, then put
+    it back.
+    """
+    from mlx_lm.utils import save_config as _upstream_save_config
+
+    vision = config.get("vision_config")
+    _upstream_save_config(dict(config), path)
+    if vision is None:
+        return
+    with open(path) as f:
+        written = json.load(f)
+    written["vision_config"] = vision
+    with open(path, "w") as f:
+        json.dump(dict(sorted(written.items())), f, indent=4)
+
+
 def save_pruned_model(
     model,
     tokenizer,
@@ -29,7 +52,7 @@ def save_pruned_model(
         original_num_experts: Expert count before pruning.
         metric: Saliency metric used for pruning.
     """
-    from mlx_lm.utils import save_model, save_config
+    from mlx_lm.utils import save_model
 
     out = Path(output_path)
     out.mkdir(parents=True, exist_ok=True)
@@ -38,7 +61,7 @@ def save_pruned_model(
     save_model(out, model)
 
     # Save config
-    save_config(config, out / "config.json")
+    _save_config(config, out / "config.json")
 
     # Save tokenizer
     tokenizer.save_pretrained(str(out))
@@ -78,13 +101,13 @@ def save_merged_model(
         original_num_experts: Expert count before merging.
         metric: Saliency metric used for merging.
     """
-    from mlx_lm.utils import save_model, save_config
+    from mlx_lm.utils import save_model
 
     out = Path(output_path)
     out.mkdir(parents=True, exist_ok=True)
 
     save_model(out, model)
-    save_config(config, out / "config.json")
+    _save_config(config, out / "config.json")
     tokenizer.save_pretrained(str(out))
 
     # Save REAM metadata
@@ -126,13 +149,13 @@ def save_abliterated_model(
         target: What was targeted ("all", "safety-experts", "dense-only").
         abliterated_layers: Which layers were modified.
     """
-    from mlx_lm.utils import save_model, save_config
+    from mlx_lm.utils import save_model
 
     out = Path(output_path)
     out.mkdir(parents=True, exist_ok=True)
 
     save_model(out, model)
-    save_config(config, out / "config.json")
+    _save_config(config, out / "config.json")
     tokenizer.save_pretrained(str(out))
 
     metadata = {
@@ -170,13 +193,13 @@ def save_amplified_model(
         threshold: Composite score threshold used.
         biases: Per-layer bias arrays that were applied.
     """
-    from mlx_lm.utils import save_model, save_config
+    from mlx_lm.utils import save_model
 
     out = Path(output_path)
     out.mkdir(parents=True, exist_ok=True)
 
     save_model(out, model)
-    save_config(config, out / "config.json")
+    _save_config(config, out / "config.json")
     tokenizer.save_pretrained(str(out))
 
     metadata = {

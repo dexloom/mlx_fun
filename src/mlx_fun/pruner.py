@@ -562,14 +562,16 @@ def prune_moe_layer(
             moe_block.e_score_correction_bias, keep, axis=0
         )
     elif model_type in ("glm4_moe", "glm4_moe_lite", "glm_moe_dsa", "deepseek_v32",
-                         "nemotron_h"):
+                         "nemotron_h", "glm5_next"):
         # MoEGate: raw weight + bias (not nn.Linear, slice manually)
         moe_block.gate.weight = mx.take(moe_block.gate.weight, keep, axis=0)
         moe_block.gate.e_score_correction_bias = mx.take(
             moe_block.gate.e_score_correction_bias, keep, axis=0
         )
         moe_block.gate.n_routed_experts = len(keep_indices)
-    elif model_type in ("qwen3_moe", "qwen3_next"):
+    elif model_type in ("qwen3_moe", "qwen3_next", "qwen3_5_moe", "qwen4_exp"):
+        # Qwen3_5MoeSparseMoeBlock's shared expert is not routed, so it keeps
+        # its full width; only the router and the SwitchGLU shrink.
         _slice_linear(moe_block.gate, keep)
         moe_block.num_experts = len(keep_indices)
     elif model_type == "gemma4":
@@ -577,6 +579,15 @@ def prune_moe_layer(
         _slice_linear(moe_block.router.proj, keep)
         moe_block.router.per_expert_scale = mx.take(
             moe_block.router.per_expert_scale, keep, axis=0
+        )
+    else:
+        # Falling through would slice the experts but leave the router at its
+        # original width — a checkpoint that saves without complaint and then
+        # cannot be loaded. Fail here instead.
+        raise ValueError(
+            f"No expert-pruning support for model_type '{model_type}': "
+            f"the router gate would be left unsliced. Add a branch to "
+            f"prune_moe_layer before pruning this model."
         )
 
 
@@ -621,10 +632,16 @@ def prune_model(
     # Use the count from the first layer's keep set
     first_keep = next(iter(keep_map.values()))
     key = adapter.config_expert_count_key()
-    config[key] = len(first_keep)
-    # Update nested text_config if present (e.g. gemma4)
-    if "text_config" in config and key in config.get("text_config", {}):
-        config["text_config"] = dict(config["text_config"])
+    # Write the new count wherever the checkpoint actually keeps it. Multimodal
+    # configs (qwen3_5_moe, qwen4_exp, gemma4, glm5_next) nest it under
+    # text_config; writing a stray top-level copy there would be a key the
+    # loader does not read and the original config never had.
+    nested = config.get("text_config")
+    in_nested = isinstance(nested, dict) and key in nested
+    if in_nested:
+        config["text_config"] = dict(nested)
         config["text_config"][key] = len(first_keep)
+    if key in config or not in_nested:
+        config[key] = len(first_keep)
 
     return config

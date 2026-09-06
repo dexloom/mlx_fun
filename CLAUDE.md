@@ -211,6 +211,43 @@ src/mlx_fun/
   and `tests/test_vlm_integration.py` are parametrized over both strings so an
   alias that gets missed in one map fails there.
 
+- **Pruning a VLM requires three things upstream does not give you.**
+  `mlx_lm.utils.save_config` drops `vision_config` as an unused key, which makes
+  a saved VLM checkpoint unloadable (mlx-vlm rebuilds the tower from dataclass
+  defaults — depth 32 vs the real 27 — and 60 parameters go missing);
+  `save._save_config` writes through it and puts the key back, and stops
+  upstream mutating the caller's dict. `prune_model` writes the new expert count
+  where the checkpoint actually keeps it (`text_config` for the nested configs)
+  instead of inventing a top-level key. And `prune_moe_layer`'s model-type
+  branch ends in `else: raise`: a type with no branch used to slice the experts,
+  leave the router at its original width, and save without complaint — a corrupt
+  checkpoint that only fails at load. `qwen3_5_moe` / `qwen4_exp` slice the gate
+  like Qwen3; `glm5_next` joins the GLM branch. `tests/test_vlm_prune_save.py`
+  covers all three.
+
+- **Protecting probe `domain_experts` during pruning makes the model worse.**
+  `--domain-map` + `--domain-mode protect` reads `domain_experts`, which the
+  probe fills from a *percentile of a differential*, not a magnitude — so
+  rarely-used experts land in it (on Qwen3.5-35B-A3B, 156 of 1024 fired on under
+  5% of domain questions). Protecting those forces the pruner to remove
+  more-used experts instead: at n_prune=8 the unprotected prune cost nothing
+  (-0.0021 nats/token) while the protected one cost +0.0324; at n_prune=64 it
+  doubled the damage. Experts that actually carry a capability are the
+  *highest*-frequency ones (rank 255-256 of 256 in their layer) and are never
+  pruning candidates to begin with, so protection has nothing to buy on either
+  side. Prefer a plain `--metric freq --strategy bottom` prune and pick the
+  level with `domain-probe --verify-prune`.
+
+- **Pruning sensitivity is concentrated in the earliest layers.** Pruning 64 of
+  256 experts in one layer at a time on Qwen3.5-35B-A3B: layer 1 alone costs
+  +0.0363 nats/token on the security probe, layers 0/2/3 the rest of the damage,
+  and every layer past ~20 is worth less than 0.001 either way. Layer 16 is
+  *negative* on all three question sets. Per-layer effects add up (the sum over
+  40 layers, +0.0327, matches the measured global prune, +0.0369), so a
+  layer-aware allocation beats a uniform one: leaving layers 0-3 whole and
+  pruning 64 elsewhere removes 22% of experts and *improves* both probes, where
+  a uniform 64 removes 25% and degrades security.
+
 - **Probe prompts render with thinking OFF, and dangling think starts are
   force-closed** (`probe.build_probe_tokens`). mlx-lm's `TokenizerWrapper`
   injects `enable_thinking=True` whenever the vocab has think tokens, so every
